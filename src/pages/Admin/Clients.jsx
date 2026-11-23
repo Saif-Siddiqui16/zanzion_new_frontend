@@ -19,7 +19,8 @@ const Clients = () => {
     currentUser,
     subscriptionRequests, fetchSubscriptionRequests, updateSubscriptionRequest,
     generateInvoiceFromOrder, addDelivery, hasMenuPermission, cancelPersonalMembership,
-    accessPlans = [], fetchAccessPlans
+    accessPlans = [], fetchAccessPlans,
+    users = [], fetchStaff
   } = useData();
   const roleNormalized = normalizeRole(currentUser?.role);
   const isSuperAdmin = roleNormalized === 'superadmin';
@@ -114,7 +115,24 @@ const Clients = () => {
 
   React.useEffect(() => {
     if (fetchAccessPlans) fetchAccessPlans();
-  }, [fetchAccessPlans]);
+    if (fetchStaff) fetchStaff();
+  }, [fetchAccessPlans, fetchStaff]);
+
+  const dynamicAccountManagers = React.useMemo(() => {
+    const staff = (users || []).filter(u => {
+      const r = String(u.role?.name || u.role || '').toUpperCase();
+      return ['ADMIN', 'OPERATIONS', 'CONCIERGE', 'SUPER_ADMIN'].includes(r) || u.roleId === 1 || u.roleId === 2;
+    });
+    if (staff.length > 0) {
+      return staff.map(s => ({
+        id: `usr-${s.id}`,
+        name: s.name,
+        role: s.role?.name ? String(s.role.name).replace(/_/g, ' ') : 'Account Manager',
+        email: s.email
+      }));
+    }
+    return DEFAULT_ACCOUNT_MANAGERS;
+  }, [users]);
 
   React.useEffect(() => {
     const timer = setTimeout(() => {
@@ -152,7 +170,7 @@ const Clients = () => {
   const [approvalModal, setApprovalModal] = useState({
     isOpen: false,
     client: null,
-    selectedManager: DEFAULT_ACCOUNT_MANAGERS[0].name
+    selectedManager: ''
   });
 
   React.useEffect(() => {
@@ -326,7 +344,7 @@ const Clients = () => {
 
   const handleOpenApprovalModal = (client) => {
     const existing = getAssignedAccountManager(client, '');
-    const defaultManager = (existing && !existing.includes('Unassigned')) ? existing : DEFAULT_ACCOUNT_MANAGERS[0].name;
+    const defaultManager = (existing && !existing.includes('Unassigned')) ? existing : (dynamicAccountManagers[0]?.name || 'Sophia Vance');
     setApprovalModal({
       isOpen: true,
       client,
@@ -361,7 +379,7 @@ const Clients = () => {
         }
       }
 
-      setApprovalModal({ isOpen: false, client: null, selectedManager: DEFAULT_ACCOUNT_MANAGERS[0].name });
+      setApprovalModal({ isOpen: false, client: null, selectedManager: dynamicAccountManagers[0]?.name || '' });
       await queryClient.invalidateQueries({ queryKey: ['clients'] });
       window.dispatchEvent(new CustomEvent('app:state-changed'));
 
@@ -1661,7 +1679,7 @@ const Clients = () => {
                     onChange={(e) => setApprovalModal(prev => ({ ...prev, selectedManager: e.target.value }))}
                     className="w-full bg-background border border-border rounded-xl px-4 py-3 text-sm text-white focus:outline-none focus:border-accent font-semibold"
                   >
-                    {DEFAULT_ACCOUNT_MANAGERS.map(mgr => (
+                    {dynamicAccountManagers.map(mgr => (
                       <option key={mgr.id} value={mgr.name} className="bg-sidebar text-white">
                         {mgr.name} — {mgr.role}
                       </option>

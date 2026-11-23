@@ -86,7 +86,10 @@ const Invoices = () => {
     const currentClient = (clients || []).find(c => {
         const cId = normalizeId(c.id);
         const uId = normalizeId(currentUser?.clientId || currentUser?.companyId || currentUser?.company_id);
-        return cId && uId && cId === uId;
+        if (cId && uId && cId === uId) return true;
+        if (currentUser?.email && c.email && c.email.toLowerCase() === currentUser.email.toLowerCase()) return true;
+        if (currentUser?.companyName && c.companyName && c.companyName.toLowerCase() === currentUser.companyName.toLowerCase()) return true;
+        return false;
     });
     const isBusinessClient = portalRole === 'client' && (
         rawRoleStr.toLowerCase().includes('business') ||
@@ -126,8 +129,20 @@ const Invoices = () => {
         return fromCustomers ? { ...fromCustomers, name: fromCustomers.name } : null;
     };
 
-    const filteredInvoices = invoices;
-    const currentInvoices = invoices;
+    const isClientOrCustomer = isClient || portalRole === 'customer';
+    const clientNumericId = currentClient?.id ? Number(String(currentClient.id).replace(/\D/g, '')) : null;
+    const clientUserNumericId = currentUser?.id ? Number(currentUser.id) : null;
+    const filteredInvoices = (isClientOrCustomer && !isSuperAdmin)
+        ? invoices.filter(i => {
+            const iClientId = Number(String(i.clientId || i.client_id || '').replace(/\D/g, ''));
+            const iUserId = Number(String(i.userId || i.user_id || '').replace(/\D/g, ''));
+            if (clientNumericId && iClientId === clientNumericId) return true;
+            if (clientUserNumericId && iUserId === clientUserNumericId) return true;
+            if (i.client && clientNumericId && Number(i.client.id) === clientNumericId) return true;
+            return false;
+        })
+        : invoices;
+    const currentInvoices = filteredInvoices;
 
     const handleSubmit = async (e) => {
         e.preventDefault();
@@ -492,11 +507,20 @@ const Invoices = () => {
                                             const val = e.target.value;
                                             const order = orders.find(o => String(o.id) === String(val));
                                             if (order) {
+                                                let resolvedClientId = order.clientId || order.client_id || (order.client && order.client.id);
+                                                const inCompany = clients.find(c => String(c.id) === String(resolvedClientId) || (order.client?.companyName && (c.companyName === order.client.companyName || c.name === order.client.companyName)));
+                                                if (inCompany) {
+                                                    resolvedClientId = inCompany.id;
+                                                } else {
+                                                    const inCustomer = (customerUsers || []).find(u => String(u.id) === String(resolvedClientId) || String(u.id) === String(order.userId || order.user_id));
+                                                    if (inCustomer) resolvedClientId = `user_${inCustomer.id}`;
+                                                }
+
                                                 setFormData({
                                                     ...formData,
                                                     orderId: order.id,
-                                                    clientId: order.clientId,
-                                                    totalAmount: order.total || 0,
+                                                    clientId: resolvedClientId || '',
+                                                    totalAmount: order.totalAmount || order.total || order.estimated_total || 0,
                                                     paidAmount: 0 // Default to 0 when selecting new order
                                                 });
                                             } else {
@@ -561,9 +585,11 @@ const Invoices = () => {
                                         <input
                                             type="number"
                                             className="w-full bg-background border border-border rounded-xl pl-10 pr-4 py-2.5 text-sm focus:border-accent outline-none font-bold"
-                                            value={formData.paidAmount === 0 ? '' : formData.paidAmount}
-                                            onChange={(e) => setFormData({ ...formData, paidAmount: parseFloat(e.target.value) || 0 })}
-                                            required
+                                            value={formData.paidAmount === '' ? '' : formData.paidAmount}
+                                            onChange={(e) => setFormData({ ...formData, paidAmount: e.target.value === '' ? '' : (parseFloat(e.target.value) || 0) })}
+                                            min="0"
+                                            step="0.01"
+                                            placeholder="0.00"
                                         />
                                     </div>
                                 </div>
