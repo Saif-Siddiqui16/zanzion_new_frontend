@@ -4461,7 +4461,7 @@ export const GlobalDataProvider = ({ children }) => {
         permission,
       )
     ) {
-      return normalizedRole === "superadmin";
+      return ["superadmin", "admin", "saas_client"].includes(normalizedRole);
     }
     return true;
   };

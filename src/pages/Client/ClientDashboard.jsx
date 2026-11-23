@@ -148,7 +148,7 @@ const ClientDashboard = () => {
   const isMyOrder = (o) => {
     if (!o) return false;
     const typeStr = String(o.orderType || o.type || '').toUpperCase();
-    if (typeStr === 'PROJECT' || typeStr === 'CHAUFFEUR' || typeStr.includes('CHAUFFEUR')) return false; 
+    if (typeStr === 'PROJECT' || typeStr === 'CHAUFFEUR' || typeStr.includes('CHAUFFEUR')) return false;
     const itemsNames = (o.items || []).map(i => String(i.name || '').toUpperCase());
     if (itemsNames.some(n => n.includes('CHAUFFEUR'))) return false;
 
@@ -195,8 +195,8 @@ const ClientDashboard = () => {
     // 1. Exact match on verified customer user ID
     const reqCustId = (req.customer_id != null && req.customer_id !== '') ? String(req.customer_id) :
       (req.user_id != null && req.user_id !== '') ? String(req.user_id) :
-      (req.userId != null && req.userId !== '') ? String(req.userId) :
-      (req.created_by != null && req.created_by !== '') ? String(req.created_by) : null;
+        (req.userId != null && req.userId !== '') ? String(req.userId) :
+          (req.created_by != null && req.created_by !== '') ? String(req.created_by) : null;
 
     if (myUserId && reqCustId && reqCustId === myUserId) return true;
 
@@ -333,66 +333,7 @@ const ClientDashboard = () => {
           <StatCard label="Warehouses" value={(warehouses || []).length} icon={Building2} color="text-info" bg="bg-info/10" onClick={() => navigate('/dashboard/warehouses')} />
         </div>
 
-        {/* Client Profile Card */}
-        <div className="glass-card p-6 sm:p-10 relative">
-          <button
-            onClick={() => { setProfileForm({ id: clientData.id, business_name: clientData.business_name || '', contact_person: clientData.contact_person || clientData.name || '', email: clientData.email || '', location: clientData.location || '', phone: clientData.phone || '' }); setIsProfileModalOpen(true); }}
-            className="absolute top-6 right-6 p-2 text-white/50 hover:text-accent transition-colors"
-          >
-            <Edit3 size={18} />
-          </button>
-          <div className="flex flex-col md:flex-row gap-8 items-center">
-            <div className="w-24 h-24 bg-white rounded-2xl flex items-center justify-center shrink-0 overflow-hidden">
-              <img src={clientData.logo_url || '/logo.png'} className="w-full h-full object-contain scale-[2.2]" alt={clientData.name} />
-            </div>
-            <div className="grid grid-cols-2 md:grid-cols-5 gap-6 flex-1 w-full">
-              <div className="space-y-1">
-                <p className="text-[10px] text-accent font-black uppercase tracking-widest">Institutional ID</p>
-                <p className="text-lg font-black text-white italic font-heading tracking-tighter">ZN-CLT-{clientData.id?.toString().slice(-4) || 'XXXX'}</p>
-              </div>
-              <div className="space-y-1">
-                <p className="text-[10px] text-muted font-black uppercase tracking-widest">Primary Contact</p>
-                <p className="text-sm font-black text-white italic">{clientData.contact_person || clientData.name}</p>
-              </div>
-              <div className="space-y-1">
-                <p className="text-[10px] text-muted font-black uppercase tracking-widest">Account Email</p>
-                <p className="text-sm font-black text-white italic truncate">{clientData.email}</p>
-              </div>
-              <div className="space-y-1">
-                <p className="text-[10px] text-muted font-black uppercase tracking-widest">Location</p>
-                <p className="text-sm font-black text-white italic truncate">{clientData.location || 'N/A'}</p>
-              </div>
-              <div className="space-y-1">
-                <p className="text-[10px] text-muted font-black uppercase tracking-widest">Total Expenditure</p>
-                <p className="text-sm font-black text-accent italic">${totalExpenditure.toLocaleString()}</p>
-              </div>
-            </div>
-          </div>
-        </div>
 
-        {/* Profile Edit Modal */}
-        <Modal isOpen={isProfileModalOpen} onClose={() => setIsProfileModalOpen(false)}>
-          <div className="p-6">
-            <div className="flex justify-between items-center mb-6">
-              <h3 className="text-lg font-black text-white italic uppercase tracking-tighter">Update Profile</h3>
-              <button onClick={() => setIsProfileModalOpen(false)} className="p-1.5 text-muted hover:text-white"><X size={18} /></button>
-            </div>
-            <div className="space-y-4">
-              {[['business_name', 'Business Name'], ['contact_person', 'Contact Person'], ['email', 'Email'], ['location', 'Location'], ['phone', 'Phone']].map(([field, label]) => (
-                <div key={field} className="space-y-1">
-                  <label className="text-[10px] font-black text-muted uppercase tracking-widest">{label}</label>
-                  <input
-                    type="text"
-                    value={profileForm[field] || ''}
-                    onChange={e => setProfileForm({ ...profileForm, [field]: e.target.value })}
-                    className="w-full bg-background border border-border rounded-xl px-4 py-2.5 text-sm text-white focus:outline-none focus:border-accent"
-                  />
-                </div>
-              ))}
-              <button onClick={handleProfileUpdate} className="w-full btn-primary py-3 mt-2">Save Changes</button>
-            </div>
-          </div>
-        </Modal>
 
         {/* Main 2-column content */}
         <div className="grid grid-cols-1 xl:grid-cols-12 gap-6 sm:gap-8">

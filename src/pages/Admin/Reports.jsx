@@ -16,17 +16,28 @@ const COLORS = ['#C8A96A', '#3B82F6', '#22C55E', '#EF4444', '#FACC15'];
 const Reports = () => {
   const { 
     clients, fleet, inventory, projects, logs, revenueFilter, setRevenueFilter, 
-    invoices, payments, hasPermission, dashboardStats, fetchFinance, fetchDashboardStats 
+    invoices, payments, hasPermission, dashboardStats, fetchFinance, fetchDashboardStats,
+    lossAssessments, fetchLossAssessments, fetchFleet
   } = useData();
 
   React.useEffect(() => {
     fetchFinance();
     fetchDashboardStats();
-  }, [fetchFinance, fetchDashboardStats]);
+    if (fetchLossAssessments) fetchLossAssessments();
+    if (fetchFleet) fetchFleet();
+  }, [fetchFinance, fetchDashboardStats, fetchLossAssessments, fetchFleet]);
   const [isExporting, setIsExporting] = useState(false);
-  const [startDate, setStartDate] = useState('2024-01-01');
-  const [endDate, setEndDate] = useState('2024-12-31');
+  const todayStr = useMemo(() => new Date().toISOString().slice(0, 10), []);
+  const thirtyDaysAgoStr = useMemo(() => {
+    const d = new Date();
+    d.setDate(d.getDate() - 30);
+    return d.toISOString().slice(0, 10);
+  }, []);
+  const [startDate, setStartDate] = useState(thirtyDaysAgoStr);
+  const [endDate, setEndDate] = useState(todayStr);
   const [showFilters, setShowFilters] = useState(false);
+  const [customRangeActive, setCustomRangeActive] = useState(false);
+  const [customChartData, setCustomChartData] = useState([]);
 
   // --- Institutional Permission Guard ---
   if (!hasPermission('financial_reports')) {
@@ -45,14 +56,35 @@ const Reports = () => {
 
   // --- Real Intelligence Calibration (Multi-temporal) ---
   const { totalRevenue, totalPaid, totalOutstanding, avgOrderValue } = useMemo(() => {
+    if (customRangeActive) {
+      const start = new Date(startDate);
+      const end = new Date(endDate + 'T23:59:59');
+      const filteredInvoices = (invoices || []).filter(inv => {
+        const invDate = new Date(inv.invoiceDate || inv.createdAt || inv.date);
+        return invDate >= start && invDate <= end;
+      });
+      const paid = filteredInvoices
+        .filter(inv => String(inv.status || '').toLowerCase() === 'paid')
+        .reduce((acc, inv) => acc + parseFloat(inv.totalAmount || inv.amount || 0), 0);
+      const total = filteredInvoices.reduce((acc, inv) => acc + parseFloat(inv.totalAmount || inv.amount || 0), 0);
+      const outstanding = Math.max(0, total - paid);
+      const avg = filteredInvoices.length > 0 ? total / filteredInvoices.length : 0;
+      return { totalRevenue: total, totalPaid: paid, totalOutstanding: outstanding, avgOrderValue: avg };
+    }
+
     // Priority 1: Use aggregate dashboard stats if available
     if (dashboardStats.relevantRevenue !== undefined) {
-        return {
-            totalRevenue: dashboardStats.relevantRevenue + (dashboardStats.outstandingRevenue || 0),
-            totalPaid: dashboardStats.relevantRevenue,
-            totalOutstanding: dashboardStats.outstandingRevenue || 0,
-            avgOrderValue: dashboardStats.relevantRevenue / (dashboardStats.completedOrders || 1)
-        };
+      const relevant = Number(dashboardStats.relevantRevenue) || 0;
+      const totalRev = Number(dashboardStats.totalRevenue) || relevant;
+      const outstanding = dashboardStats.outstandingRevenue !== undefined 
+        ? Number(dashboardStats.outstandingRevenue) 
+        : Math.max(0, totalRev - relevant);
+      return {
+        totalRevenue: relevant + outstanding,
+        totalPaid: relevant,
+        totalOutstanding: outstanding,
+        avgOrderValue: dashboardStats.completedOrders ? (relevant / dashboardStats.completedOrders) : (relevant || 0)
+      };
     }
 
     const now = new Date();
@@ -68,13 +100,15 @@ const Reports = () => {
     const thresholdDate = new Date(now.getTime() - (days * 24 * 60 * 60 * 1000));
 
     const filteredInvoices = (invoices || []).filter(inv => {
-      const invDate = new Date(inv.createdAt || inv.date);
+      const invDate = new Date(inv.invoiceDate || inv.createdAt || inv.date);
       return invDate >= thresholdDate;
     });
 
-    const paid = filteredInvoices.filter(inv => inv.status === 'paid').reduce((acc, inv) => acc + parseFloat(inv.amount || 0), 0);
-    const total = filteredInvoices.reduce((acc, inv) => acc + parseFloat(inv.amount || 0), 0);
-    const outstanding = total - paid;
+    const paid = filteredInvoices
+      .filter(inv => String(inv.status || '').toLowerCase() === 'paid')
+      .reduce((acc, inv) => acc + parseFloat(inv.totalAmount || inv.amount || 0), 0);
+    const total = filteredInvoices.reduce((acc, inv) => acc + parseFloat(inv.totalAmount || inv.amount || 0), 0);
+    const outstanding = Math.max(0, total - paid);
     const avg = filteredInvoices.length > 0 ? total / filteredInvoices.length : 0;
 
     return {
@@ -83,27 +117,98 @@ const Reports = () => {
       totalOutstanding: outstanding,
       avgOrderValue: avg
     };
-  }, [invoices, revenueFilter, dashboardStats]);
+  }, [customRangeActive, startDate, endDate, invoices, revenueFilter, dashboardStats]);
 
-  // --- Loss Tracking Intelligence ---
-  const getLossReports = () => {
-    // Inventory Losses (Spoilage/Damage/Expiration)
-    const inventoryLoss = inventory.filter(i => i.status === 'Critical' || i.status === 'Warning').map(i => ({
-      item: i.name,
-      qty: Math.floor(i.qty * 0.05) + 1, // Simulated loss qty
-      value: i.price * (Math.floor(i.qty * 0.05) + 1),
-      reason: i.status === 'Critical' ? 'EXPIRED' : 'SPOILAGE'
-    }));
+  // Live Chart Data from backend dashboardStats or custom calibrated range
+  const chartData = useMemo(() => {
+    if (customRangeActive && customChartData.length > 0) {
+      return customChartData;
+    }
+    if (dashboardStats?.revenueChartData && Array.isArray(dashboardStats.revenueChartData) && dashboardStats.revenueChartData.length > 0) {
+      return dashboardStats.revenueChartData;
+    }
+    const filterDays = { 'Daily': 1, 'Weekly': 7, 'Monthly': 30, 'Quarterly': 90, 'Annual': 365 };
+    const days = filterDays[revenueFilter] || 30;
+    const now = new Date();
+    const threshold = new Date(now.getTime() - (days * 24 * 60 * 60 * 1000));
+    const paidInvs = (invoices || []).filter(i => {
+      const d = new Date(i.invoiceDate || i.createdAt || i.date);
+      return String(i.status || '').toLowerCase() === 'paid' && d >= threshold;
+    });
+    if (paidInvs.length > 0) {
+      const map = {};
+      paidInvs.forEach(inv => {
+        const d = new Date(inv.invoiceDate || inv.createdAt || inv.date);
+        const label = days <= 7 ? d.toLocaleDateString(undefined, { weekday: 'short' }) : d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+        map[label] = (map[label] || 0) + parseFloat(inv.totalAmount || inv.amount || 0);
+      });
+      return Object.keys(map).map(k => ({ name: k, revenue: map[k] }));
+    }
+    return (REVENUE_CHART_DATA || []).map(d => ({ name: d.month || d.name, revenue: d.revenue }));
+  }, [customRangeActive, customChartData, dashboardStats?.revenueChartData, invoices, revenueFilter]);
 
-    // Fleet Maintenance Costs
-    const fleetLoss = fleet.filter(f => f.diagnosticStatus !== 'Healthy').map(f => ({
-      asset: f.id,
-      status: f.diagnosticStatus,
-      repairCost: f.diagnosticStatus === 'Maintenance Required' ? 1250 : 350
-    }));
-
-    return { inventoryLoss, fleetLoss };
+  const handleApplyCustomFilter = () => {
+    if (!startDate || !endDate) {
+      swalWarning('Invalid Range', 'Please select both start and end dates.');
+      return;
+    }
+    const start = new Date(startDate);
+    const end = new Date(endDate + 'T23:59:59');
+    if (start > end) {
+      swalError('Invalid Dates', 'Start date cannot be after end date.');
+      return;
+    }
+    setCustomRangeActive(true);
+    const inRange = (invoices || []).filter(inv => {
+      const d = new Date(inv.invoiceDate || inv.createdAt || inv.date);
+      return d >= start && d <= end;
+    });
+    const map = {};
+    inRange.filter(i => String(i.status || '').toLowerCase() === 'paid').forEach(inv => {
+      const d = new Date(inv.invoiceDate || inv.createdAt || inv.date);
+      const label = d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+      map[label] = (map[label] || 0) + parseFloat(inv.totalAmount || inv.amount || 0);
+    });
+    const chart = Object.keys(map).map(k => ({ name: k, revenue: map[k] }));
+    setCustomChartData(chart);
+    swalSuccess('Analysis Calibrated', `Audited ${inRange.length} invoice(s) between ${startDate} and ${endDate}.`);
   };
+
+  const handleResetFilter = () => {
+    setCustomRangeActive(false);
+    setCustomChartData([]);
+  };
+
+  // --- Real Loss Tracking Intelligence (Backend Connected & Tenant Isolated) ---
+  const lossReports = useMemo(() => {
+    // 1. Live Inventory Losses from backend lossAssessments
+    const inventoryLoss = (lossAssessments || []).map(l => ({
+      item: l.item || 'Asset Item',
+      qty: l.quantity || 0,
+      value: parseFloat(l.financialLoss || 0),
+      reason: (l.lossType || 'SPOILAGE').toUpperCase()
+    }));
+
+    // 2. Live Fleet Asset Degradation from backend fleet
+    const fleetLoss = (fleet || []).filter(f => {
+      const diag = String(f.diagnosticStatus || '').toLowerCase();
+      const status = String(f.status || '').toLowerCase();
+      return (diag && !diag.includes('healthy')) || (status.includes('maintenance') || status.includes('service') || status.includes('critical') || status.includes('repair'));
+    }).map(f => {
+      const diag = f.diagnosticStatus || f.status || 'Maintenance Required';
+      const isCritical = String(diag).toLowerCase().includes('critical');
+      return {
+        asset: f.id || `FLT-${f.db_id}`,
+        status: diag,
+        repairCost: isCritical ? 1250 : 350
+      };
+    });
+
+    const totalLossValue = inventoryLoss.reduce((acc, l) => acc + (l.value || 0), 0) +
+      fleetLoss.reduce((acc, l) => acc + (l.repairCost || 0), 0);
+
+    return { inventoryLoss, fleetLoss, totalLossValue };
+  }, [lossAssessments, fleet]);
 
   const pieData = [
     { name: 'Paid Assets', value: totalPaid },
@@ -155,7 +260,14 @@ const Reports = () => {
       let currentY = doc.lastAutoTable.finalY + 15;
       doc.text('II. UNPAID INSTITUTIONAL INVOICES', 14, currentY);
 
-      const unpaidRows = invoices.filter(inv => inv.status !== 'Paid').map(inv => [inv.id, inv.clientId, `$${inv.total.toLocaleString()}`, inv.status, inv.createdAt]);
+      const unpaidRows = (invoices || [])
+        .filter(inv => String(inv.status || '').toLowerCase() !== 'paid')
+        .map(inv => {
+          const invAmount = parseFloat(inv.totalAmount || inv.total || inv.amount || 0);
+          const clientRef = inv.client?.companyName || inv.client?.name || (inv.clientId ? `CLT-${inv.clientId}` : 'Institutional Client');
+          const invDate = inv.invoiceDate || inv.createdAt ? new Date(inv.invoiceDate || inv.createdAt).toLocaleDateString() : 'N/A';
+          return [inv.id, clientRef, `$${invAmount.toLocaleString()}`, (inv.status || 'UNPAID').toUpperCase(), invDate];
+        });
       autoTable(doc, {
         startY: currentY + 5,
         head: [['Invoice ID', 'Client Ref', 'Amount', 'State', 'Issue Date']],
@@ -194,7 +306,10 @@ const Reports = () => {
             <Zap size={14} className="text-accent" />
             <select
               value={revenueFilter}
-              onChange={(e) => setRevenueFilter(e.target.value)}
+              onChange={(e) => {
+                setRevenueFilter(e.target.value);
+                handleResetFilter();
+              }}
               className="bg-transparent text-xs font-bold py-2 focus:outline-none cursor-pointer"
             >
               <option value="Daily">Daily Horizon</option>
@@ -205,10 +320,10 @@ const Reports = () => {
             </select>
           </div>
           <button
-            className={`btn-secondary flex items-center gap-2 ${showFilters ? 'bg-accent text-black' : ''}`}
+            className={`btn-secondary flex items-center gap-2 ${showFilters || customRangeActive ? 'bg-accent text-black' : ''}`}
             onClick={() => setShowFilters(!showFilters)}
           >
-            <Filter size={16} /> Filters
+            <Filter size={16} /> {customRangeActive ? 'Range Active' : 'Filters'}
           </button>
           <button
             className="btn-primary flex items-center gap-2 disabled:opacity-50"
@@ -238,11 +353,19 @@ const Reports = () => {
                 />
               </div>
               <button 
-                onClick={() => swalInfo('Analysis Complete', `Multi-temporal trend analysis from ${startDate} to ${endDate} has calibrated successfully.`)}
+                onClick={handleApplyCustomFilter}
                 className="btn-primary h-11 px-8 rounded-xl font-bold uppercase text-[10px] tracking-widest shadow-lg shadow-accent/20"
               >
                 Analyze Multi-temporal
               </button>
+              {customRangeActive && (
+                <button
+                  onClick={handleResetFilter}
+                  className="btn-secondary h-11 px-6 rounded-xl font-bold uppercase text-[10px] tracking-widest"
+                >
+                  Reset To Preset
+                </button>
+              )}
             </div>
           </div>
         )}
@@ -252,7 +375,7 @@ const Reports = () => {
         {[
           { label: "Total Asset Revenue", val: `$${totalRevenue.toLocaleString()}`, change: "+14.2%", up: true, icon: DollarSign },
           { label: "Accounts Receivable", val: `$${totalOutstanding.toLocaleString()}`, change: "-5.4%", up: false, icon: Activity },
-          { label: "Settlement Rate", val: `${((totalPaid / totalRevenue) * 100).toFixed(1)}%`, change: "+2.1%", up: true, icon: CheckCircle2 },
+          { label: "Settlement Rate", val: `${totalRevenue > 0 ? ((totalPaid / totalRevenue) * 100).toFixed(1) : '100.0'}%`, change: "+2.1%", up: true, icon: CheckCircle2 },
           { label: "Avg. Transaction", val: `$${avgOrderValue.toFixed(0)}`, change: "+4.8%", up: true, icon: Zap },
         ].map((item, i) => (
           <div key={i} className="glass-card p-4 relative overflow-hidden group">
@@ -273,13 +396,13 @@ const Reports = () => {
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
         <div className="glass-card p-6 border-accent/10">
           <h3 className="text-lg font-bold mb-6 flex items-center gap-2">
-            <TrendingUp size={18} className="text-accent" /> {revenueFilter} Transactional Trends
+            <TrendingUp size={18} className="text-accent" /> {customRangeActive ? `${startDate} to ${endDate}` : `${revenueFilter} Sequence`} Transactional Trends
           </h3>
           <div className="h-[300px]">
             <ResponsiveContainer width="100%" height="100%">
-              <LineChart data={REVENUE_CHART_DATA}>
+              <LineChart data={chartData}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#2A2A30" vertical={false} />
-                <XAxis dataKey="month" stroke="#6B7280" tick={{ fontSize: 10 }} />
+                <XAxis dataKey="name" stroke="#6B7280" tick={{ fontSize: 10 }} />
                 <YAxis stroke="#6B7280" tick={{ fontSize: 10 }} />
                 <Tooltip contentStyle={{ backgroundColor: '#1C1C21', border: '1px solid #2A2A30', borderRadius: '12px' }} />
                 <Line type="monotone" dataKey="revenue" stroke="#C8A96A" strokeWidth={4} dot={{ fill: '#C8A96A', r: 4 }} activeDot={{ r: 6 }} />
@@ -333,8 +456,7 @@ const Reports = () => {
             <div className="text-right">
               <p className="text-[9px] font-black text-muted uppercase tracking-widest mb-1">Total Estimated Loss</p>
               <p className="text-xl font-black text-danger italic font-heading">
-                ${(getLossReports().inventoryLoss.reduce((acc, l) => acc + (l.value || 0), 0) +
-                  getLossReports().fleetLoss.reduce((acc, l) => acc + (l.repairCost || 0), 3500)).toLocaleString()}
+                ${lossReports.totalLossValue.toLocaleString()}
               </p>
             </div>
           </div>
@@ -354,7 +476,7 @@ const Reports = () => {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-white/5">
-                  {getLossReports().inventoryLoss.length > 0 ? getLossReports().inventoryLoss.map((loss, idx) => (
+                  {lossReports.inventoryLoss.length > 0 ? lossReports.inventoryLoss.map((loss, idx) => (
                     <tr key={idx} className="hover:bg-white/[0.02] transition-colors">
                       <td className="px-4 py-3 font-bold">{loss.item}</td>
                       <td className="px-4 py-3 text-secondary">{loss.qty}</td>
@@ -383,7 +505,7 @@ const Reports = () => {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-white/5">
-                  {getLossReports().fleetLoss.length > 0 ? getLossReports().fleetLoss.map((loss, idx) => (
+                  {lossReports.fleetLoss.length > 0 ? lossReports.fleetLoss.map((loss, idx) => (
                     <tr key={idx} className="hover:bg-white/[0.02] transition-colors">
                       <td className="px-4 py-3 font-mono font-bold text-accent">{loss.asset}</td>
                       <td className="px-4 py-3">

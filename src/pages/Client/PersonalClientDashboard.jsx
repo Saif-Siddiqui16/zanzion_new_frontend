@@ -408,11 +408,10 @@ const PersonalClientDashboard = () => {
         </div>
 
         {/* KPI Row – Core Operations */}
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
           <StatCard label="Active Orders" value={activeOrders.length} icon={ShoppingCart} color="text-accent" bg="bg-accent/10" onClick={() => navigate('/dashboard/client-orders')} />
           <StatCard label="In‑Transit Deliveries" value={activeDeliveries.length} icon={Truck} color="text-info" bg="bg-info/10" onClick={() => navigate('/dashboard/track-delivery')} />
           <StatCard label="Unpaid Invoices" value={unpaidInvoices.length} icon={CreditCard} color="text-danger" bg="bg-danger/10" onClick={() => navigate('/dashboard/invoices')} />
-          <StatCard label="Vault Assets" value={clientLuxuryItems.length} icon={Gift} color="text-success" bg="bg-success/10" onClick={() => navigate('/dashboard/luxury-items')} />
         </div>
 
         {/* Main content */}
