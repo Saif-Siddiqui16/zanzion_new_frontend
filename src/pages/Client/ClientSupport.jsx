@@ -318,7 +318,7 @@ const ClientSupport = () => {
     }, [refundItemList]);
 
     const roleKey = normalizeRole(currentUser?.role);
-    const isEndCustomerRole = ['customer', 'personal'].includes(roleKey);
+    const isEndCustomerRole = ['customer', 'personal', 'client'].includes(roleKey);
 
     // Filter tickets belonging to the current user
     const myTickets = (supportTickets || []).filter((t) => {

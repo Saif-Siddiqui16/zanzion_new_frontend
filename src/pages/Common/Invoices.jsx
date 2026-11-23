@@ -108,6 +108,8 @@ const Invoices = () => {
     const [actionStatus, setActionStatus] = useState(null);
     const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
     const [invoiceToDelete, setInvoiceToDelete] = useState(null);
+    const [installmentAmount, setInstallmentAmount] = useState('');
+    const [showManualPaidInput, setShowManualPaidInput] = useState(false);
 
     const [formData, setFormData] = useState({
         orderId: '',
@@ -129,7 +131,7 @@ const Invoices = () => {
         return fromCustomers ? { ...fromCustomers, name: fromCustomers.name } : null;
     };
 
-    const isClientOrCustomer = isClient || portalRole === 'customer';
+    const isClientOrCustomer = isClient || isBusinessClient || portalRole === 'customer' || portalRole === 'client';
     const clientNumericId = currentClient?.id ? Number(String(currentClient.id).replace(/\D/g, '')) : null;
     const clientUserNumericId = currentUser?.id ? Number(currentUser.id) : null;
     const filteredInvoices = (isClientOrCustomer && !isSuperAdmin)
@@ -180,6 +182,9 @@ const Invoices = () => {
                 ? Number(rawClient.replace('user_', ''))
                 : (Number(rawClient) || (selectedOrder?.clientId ? Number(selectedOrder.clientId) : (matchedDelivery?.clientId ? Number(matchedDelivery.clientId) : 1)));
 
+            const invoicedTotal = Number(formData.totalAmount) || 0;
+            const finalPaid = Math.min(invoicedTotal, Number(formData.paidAmount) || 0);
+
             setIsModalOpen(false);
             swalLoading("Generating Invoice", "Creating institutional invoice ledger and calculating totals...");
 
@@ -190,7 +195,7 @@ const Invoices = () => {
                     dueDate: isoDueDate,
                     items,
                     clientId: parsedClientId,
-                    paidAmount: Number(formData.paidAmount) || 0
+                    paidAmount: finalPaid
                 });
                 swalClose();
                 const invNum = res?.data?.invoiceNumber || res?.invoiceNumber || 'Created';
@@ -201,6 +206,9 @@ const Invoices = () => {
                 swalError("Invoice Generation Failed", apiErrorMsg || "Please ensure the order/delivery is completed with POD.");
             }
         } else if (modalType === 'edit') {
+            const invoicedTotal = Number(formData.totalAmount) || 0;
+            const finalPaid = Math.min(invoicedTotal, Number(formData.paidAmount) || 0);
+
             setIsModalOpen(false);
             swalLoading("Updating Invoice", "Saving changes to invoice ledger...");
             try {
@@ -210,8 +218,8 @@ const Invoices = () => {
                     invoiceData: {
                         clientId: String(formData.clientId).startsWith('user_') ? Number(String(formData.clientId).replace('user_', '')) : Number(formData.clientId),
                         orderId: Number(formData.orderId),
-                        totalAmount: Number(formData.totalAmount),
-                        paidAmount: Number(formData.paidAmount),
+                        totalAmount: invoicedTotal,
+                        paidAmount: finalPaid,
                         // Pass status only when Cancelled (backend derives all other statuses automatically)
                         ...(formData.status === 'Cancelled' ? { status: 'Cancelled' } : {}),
                         dueDate: formData.dueDate ? new Date(formData.dueDate).toISOString() : undefined
@@ -292,6 +300,8 @@ const Invoices = () => {
     const handleAction = (type, inv) => {
         if (procurementInvoiceReadOnly && (type === 'add' || type === 'edit')) return;
         setModalType(type);
+        setInstallmentAmount('');
+        setShowManualPaidInput(false);
         if (type === 'add') {
             setSelectedInvoice(null);
             setFormData({
@@ -380,7 +390,7 @@ const Invoices = () => {
                                 </motion.div>
                             )}
                         </AnimatePresence>
-                        {!procurementInvoiceReadOnly && (!isClient || isSaaSClient || isBusinessClient) && (hasMenuPermission('Invoices', 'can_add') || isBusinessClient) && (
+                        {!procurementInvoiceReadOnly && !isClientOrCustomer && (hasMenuPermission('Invoices', 'can_add') || isSuperAdmin) && (
                             <button
                                 onClick={() => handleAction('add', {})}
                                 className="btn-primary flex items-center gap-2"
@@ -475,8 +485,8 @@ const Invoices = () => {
                                     setInvoiceToDelete(inv);
                                     setShowDeleteConfirm(true);
                                 }}
-                                canEdit={!procurementInvoiceReadOnly && (hasMenuPermission('Invoices', 'can_edit') || isBusinessClient)}
-                                canDelete={!procurementInvoiceReadOnly && (hasMenuPermission('Invoices', 'can_delete') || isBusinessClient)}
+                                canEdit={!procurementInvoiceReadOnly && !isClientOrCustomer && (hasMenuPermission('Invoices', 'can_edit') || isSuperAdmin)}
+                                canDelete={!procurementInvoiceReadOnly && !isClientOrCustomer && (hasMenuPermission('Invoices', 'can_delete') || isSuperAdmin)}
                             />
                             <div className="mt-6 border-t border-white/5 pt-6">
                                 <Pagination
@@ -573,26 +583,195 @@ const Invoices = () => {
                                             type="number"
                                             className="w-full bg-background border border-border rounded-xl pl-10 pr-4 py-2.5 text-sm focus:border-accent outline-none font-bold"
                                             value={formData.totalAmount === 0 ? '' : formData.totalAmount}
-                                            onChange={(e) => setFormData({ ...formData, totalAmount: parseFloat(e.target.value) || 0 })}
+                                            onChange={(e) => {
+                                                const newTot = parseFloat(e.target.value) || 0;
+                                                setFormData(prev => ({
+                                                    ...prev,
+                                                    totalAmount: newTot,
+                                                    paidAmount: Math.min(newTot, Number(prev.paidAmount) || 0)
+                                                }));
+                                            }}
                                             required
                                         />
                                     </div>
                                 </div>
-                                <div className="space-y-2">
-                                    <label className="text-[10px] font-black text-muted uppercase tracking-widest">Paid Amount</label>
-                                    <div className="relative">
-                                        <DollarSign className="absolute left-3 top-1/2 -translate-y-1/2 text-muted" size={14} />
-                                        <input
-                                            type="number"
-                                            className="w-full bg-background border border-border rounded-xl pl-10 pr-4 py-2.5 text-sm focus:border-accent outline-none font-bold"
-                                            value={formData.paidAmount === '' ? '' : formData.paidAmount}
-                                            onChange={(e) => setFormData({ ...formData, paidAmount: e.target.value === '' ? '' : (parseFloat(e.target.value) || 0) })}
-                                            min="0"
-                                            step="0.01"
-                                            placeholder="0.00"
-                                        />
+
+                                {modalType === 'edit' ? (
+                                    <>
+                                        {/* Institutional Settlement Overview Card */}
+                                        {(() => {
+                                            const invTotal = Number(formData.totalAmount) || 0;
+                                            const prevPaid = Number(selectedInvoice?.paidAmount || 0);
+                                            const remDue = Math.max(0, invTotal - prevPaid);
+                                            const isFullyCovered = remDue <= 0 && invTotal > 0;
+
+                                            return (
+                                                <div className="col-span-1 md:col-span-2 space-y-3">
+                                                    <div className="p-3 bg-white/5 border border-white/10 rounded-xl grid grid-cols-3 gap-2 text-center">
+                                                        <div>
+                                                            <p className="text-[8px] font-black text-muted uppercase tracking-widest">Invoiced Value</p>
+                                                            <p className="text-xs font-bold text-white">${invTotal.toLocaleString(undefined, { minimumFractionDigits: 2 })}</p>
+                                                        </div>
+                                                        <div className="border-x border-white/10">
+                                                            <p className="text-[8px] font-black text-muted uppercase tracking-widest">Paid To Date</p>
+                                                            <p className="text-xs font-bold text-success">${prevPaid.toLocaleString(undefined, { minimumFractionDigits: 2 })}</p>
+                                                        </div>
+                                                        <div>
+                                                            <p className="text-[8px] font-black text-muted uppercase tracking-widest">Remaining Balance</p>
+                                                            <p className={`text-xs font-bold ${remDue <= 0 ? 'text-success' : 'text-danger'}`}>
+                                                                ${remDue.toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                                                            </p>
+                                                        </div>
+                                                    </div>
+
+                                                    {isFullyCovered ? (
+                                                        <div className="p-3 bg-success/10 border border-success/30 rounded-xl flex items-center gap-3">
+                                                            <CheckCircle2 size={16} className="text-success shrink-0" />
+                                                            <div>
+                                                                <p className="text-xs font-bold text-success">Invoice is Fully Settled ($0.00 Outstanding)</p>
+                                                                <p className="text-[10px] text-muted">The total invoiced amount is completely covered. No additional payments can be accepted.</p>
+                                                            </div>
+                                                        </div>
+                                                    ) : (
+                                                        <div className="space-y-1.5">
+                                                            <div className="flex justify-between items-center">
+                                                                <label className="text-[10px] font-black text-accent uppercase tracking-widest flex items-center gap-1">
+                                                                    {!showManualPaidInput ? "+ Add New Payment / Installment" : "Cumulative Total Paid Override"}
+                                                                </label>
+                                                                <button
+                                                                    type="button"
+                                                                    onClick={() => setShowManualPaidInput(!showManualPaidInput)}
+                                                                    className="text-[9px] text-muted hover:text-white underline uppercase font-bold"
+                                                                >
+                                                                    {showManualPaidInput ? "Switch to Installment Mode" : "Manual Cumulative Override"}
+                                                                </button>
+                                                            </div>
+
+                                                            {!showManualPaidInput ? (
+                                                                <div>
+                                                                    <div className="relative">
+                                                                        <DollarSign className="absolute left-3 top-1/2 -translate-y-1/2 text-accent" size={14} />
+                                                                        <input
+                                                                            type="number"
+                                                                            className="w-full bg-background border border-accent/40 rounded-xl pl-10 pr-4 py-2 text-sm focus:border-accent outline-none font-bold text-accent"
+                                                                            value={installmentAmount}
+                                                                            onChange={(e) => {
+                                                                                const valStr = e.target.value;
+                                                                                if (valStr === '') {
+                                                                                    setInstallmentAmount('');
+                                                                                    setFormData(prev => ({
+                                                                                        ...prev,
+                                                                                        paidAmount: prevPaid,
+                                                                                        status: prevPaid >= invTotal ? 'Paid' : prevPaid > 0 ? 'Partially Paid' : 'Unpaid'
+                                                                                    }));
+                                                                                    return;
+                                                                                }
+                                                                                let enteredVal = parseFloat(valStr) || 0;
+                                                                                if (enteredVal < 0) enteredVal = 0;
+                                                                                // Strict overpayment cap: cannot pay more than remaining balance
+                                                                                if (enteredVal > remDue) {
+                                                                                    enteredVal = remDue;
+                                                                                }
+                                                                                setInstallmentAmount(enteredVal);
+                                                                                const newTotalPaid = Math.min(invTotal, prevPaid + enteredVal);
+                                                                                setFormData(prev => ({
+                                                                                    ...prev,
+                                                                                    paidAmount: newTotalPaid,
+                                                                                    status: newTotalPaid >= invTotal ? 'Paid' : newTotalPaid > 0 ? 'Partially Paid' : 'Unpaid'
+                                                                                }));
+                                                                            }}
+                                                                            min="0"
+                                                                            max={remDue}
+                                                                            step="0.01"
+                                                                            placeholder={`Enter payment (max: $${remDue.toLocaleString()})`}
+                                                                        />
+                                                                    </div>
+                                                                    <div className="flex justify-between text-[9px] text-muted font-bold tracking-wider mt-1">
+                                                                        <span>Max payable: ${remDue.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
+                                                                        <span className="text-white">
+                                                                            New Total Paid: ${(prevPaid + (parseFloat(installmentAmount) || 0)).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                                                                        </span>
+                                                                    </div>
+                                                                </div>
+                                                            ) : (
+                                                                <div>
+                                                                    <div className="relative">
+                                                                        <DollarSign className="absolute left-3 top-1/2 -translate-y-1/2 text-muted" size={14} />
+                                                                        <input
+                                                                            type="number"
+                                                                            className="w-full bg-background border border-border rounded-xl pl-10 pr-4 py-2 text-sm focus:border-accent outline-none font-bold"
+                                                                            value={formData.paidAmount === '' ? '' : formData.paidAmount}
+                                                                            onChange={(e) => {
+                                                                                const valStr = e.target.value;
+                                                                                if (valStr === '') {
+                                                                                    setFormData(prev => ({ ...prev, paidAmount: '' }));
+                                                                                    return;
+                                                                                }
+                                                                                let val = parseFloat(valStr) || 0;
+                                                                                if (val < 0) val = 0;
+                                                                                if (val > invTotal) val = invTotal; // Capped at total amount
+                                                                                setFormData(prev => ({
+                                                                                    ...prev,
+                                                                                    paidAmount: val,
+                                                                                    status: val >= invTotal ? 'Paid' : val > 0 ? 'Partially Paid' : 'Unpaid'
+                                                                                }));
+                                                                            }}
+                                                                            min="0"
+                                                                            max={invTotal}
+                                                                            step="0.01"
+                                                                            placeholder="0.00"
+                                                                        />
+                                                                    </div>
+                                                                    <p className="text-[9px] text-muted font-bold tracking-wider mt-1">
+                                                                        Direct Override (Max allowed: ${invTotal.toLocaleString(undefined, { minimumFractionDigits: 2 })})
+                                                                    </p>
+                                                                </div>
+                                                            )}
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            );
+                                        })()}
+                                    </>
+                                ) : (
+                                    <div className="space-y-2">
+                                        <label className="text-[10px] font-black text-muted uppercase tracking-widest">Initial Paid Amount (Optional)</label>
+                                        <div className="relative">
+                                            <DollarSign className="absolute left-3 top-1/2 -translate-y-1/2 text-muted" size={14} />
+                                            <input
+                                                type="number"
+                                                className="w-full bg-background border border-border rounded-xl pl-10 pr-4 py-2.5 text-sm focus:border-accent outline-none font-bold"
+                                                value={formData.paidAmount === '' ? '' : formData.paidAmount}
+                                                onChange={(e) => {
+                                                    const valStr = e.target.value;
+                                                    if (valStr === '') {
+                                                        setFormData(prev => ({ ...prev, paidAmount: '' }));
+                                                        return;
+                                                    }
+                                                    let val = parseFloat(valStr) || 0;
+                                                    if (val < 0) val = 0;
+                                                    const maxTot = Number(formData.totalAmount) || 0;
+                                                    if (maxTot > 0 && val > maxTot) {
+                                                        val = maxTot; // Cannot exceed invoiced total
+                                                    }
+                                                    setFormData(prev => ({
+                                                        ...prev,
+                                                        paidAmount: val,
+                                                        status: val >= maxTot && maxTot > 0 ? 'Paid' : val > 0 ? 'Partially Paid' : 'Unpaid'
+                                                    }));
+                                                }}
+                                                min="0"
+                                                max={Number(formData.totalAmount) || 0}
+                                                step="0.01"
+                                                placeholder="0.00"
+                                            />
+                                        </div>
+                                        <p className="text-[9px] text-muted/60 font-bold uppercase tracking-widest">
+                                            Max payable: ${Number(formData.totalAmount || 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                                        </p>
                                     </div>
-                                </div>
+                                )}
+
                                 {/* Live Due Amount — auto-calculated, read-only */}
                                 <div className="space-y-2">
                                     <label className="text-[10px] font-black text-muted uppercase tracking-widest">Due Amount (Auto-Calculated)</label>
@@ -605,7 +784,7 @@ const Invoices = () => {
                                                 ? 'border-success/40 text-success'
                                                 : 'border-danger/40 text-danger'
                                                 }`}
-                                            value={`${Math.max(0, Number(formData.totalAmount) - Number(formData.paidAmount)).toLocaleString()}`}
+                                            value={`${Math.max(0, Number(formData.totalAmount) - Number(formData.paidAmount)).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
                                         />
                                     </div>
                                     <p className="text-[9px] text-muted/60 font-bold uppercase tracking-widest">

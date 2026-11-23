@@ -632,7 +632,10 @@ const PersonalClientDashboard = () => {
                 ))}
               </div>
               <div className="space-y-3 overflow-x-auto pb-2 custom-scrollbar">
-                {clientInvoices.filter(inv => invoiceTab === 'paid' ? inv.status === 'Paid' : inv.status !== 'Paid').map((inv, idx) => (
+                {clientInvoices.filter(inv => {
+                  const isPaid = String(inv.status || '').toLowerCase() === 'paid';
+                  return invoiceTab === 'paid' ? isPaid : !isPaid;
+                }).map((inv, idx) => (
                   <div key={idx} className="group bg-white/[0.02] border border-white/5 rounded-2xl p-5 hover:border-accent/30 hover:bg-white/[0.04] transition-all duration-300 min-w-[440px]">
                     <div className="flex items-center justify-between gap-6">
                       <div className="flex items-center gap-4 flex-1 min-w-0">
@@ -649,7 +652,7 @@ const PersonalClientDashboard = () => {
                         </div>
                         <div className="flex items-center gap-2">
                           <button onClick={() => { setViewingInvoice(inv); setIsInvoiceModalOpen(true); }} className="w-10 h-10 bg-white/5 border border-white/10 rounded-xl flex items-center justify-center hover:bg-accent hover:text-accent transition-all flex-shrink-0"><Eye size={18} /></button>
-                          {inv.status !== 'Paid' && (
+                          {String(inv.status || '').toLowerCase() !== 'paid' && (
                             <button onClick={() => handlePayment(inv)} className="px-5 h-10 bg-accent text-black rounded-xl text-[10px] font-black uppercase tracking-widest hover:shadow-lg transition-all flex-shrink-0">Settle</button>
                           )}
                         </div>
@@ -657,32 +660,10 @@ const PersonalClientDashboard = () => {
                     </div>
                   </div>
                 ))}
-                {clientInvoices.filter(inv => invoiceTab === 'paid' ? inv.status === 'Paid' : inv.status !== 'Paid').length === 0 && (<EmptyState text="No invoices found" />)}
-              </div>
-            </SectionCard>
-
-            {/* Luxury Asset Vault */}
-            <SectionCard title="Luxury Asset Vault" icon={Gift} viewAllPath="/dashboard/luxury-items" navigate={navigate}>
-              <div className="space-y-3">
-                {clientLuxuryItems.slice(0, 3).map((item, idx) => (
-                  <div key={idx} className="p-4 bg-white/[0.02] border border-white/5 rounded-xl flex items-center justify-between hover:border-accent/20 transition-all">
-                    <div>
-                      <p className="text-sm font-black text-white italic">{item.item || item.name}</p>
-                      <p className="text-[10px] text-accent font-black uppercase tracking-widest mt-1">
-                        {item.vault || 'Vault Alpha'} • {item.status || 'Stored'}
-                      </p>
-                    </div>
-                    <span className="text-xs font-mono font-bold text-success">${Number(item.value || item.price || 0).toLocaleString()}</span>
-                  </div>
-                ))}
-                {clientLuxuryItems.length === 0 && (
-                  <div className="py-6 text-center border border-dashed border-white/5 rounded-2xl">
-                    <p className="text-[10px] font-black uppercase tracking-[0.3em] text-muted italic">No private luxury assets in vault.</p>
-                  </div>
-                )}
-                <button onClick={() => navigate('/dashboard/luxury-items')} className="w-full mt-4 py-3 bg-white/5 border border-white/10 text-white rounded-xl text-[9px] font-black uppercase tracking-[0.2em] hover:bg-accent hover:text-black hover:border-accent transition-all">
-                  Open Vault Registry
-                </button>
+                {clientInvoices.filter(inv => {
+                  const isPaid = String(inv.status || '').toLowerCase() === 'paid';
+                  return invoiceTab === 'paid' ? isPaid : !isPaid;
+                }).length === 0 && (<EmptyState text="No invoices found" />)}
               </div>
             </SectionCard>
 
