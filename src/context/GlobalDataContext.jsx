@@ -1,0 +1,8767 @@
+
+import React, { createContext, useContext, useState, useEffect, useCallback } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+import api from "../services/api/setupAxios.js";
+import { io } from "socket.io-client";
+import {
+  normalizeRole,
+  roleCanCreateInstitutionalOrder,
+  roleCanUpdateOrderStatus,
+  vendorVisibleInSharedLists,
+  menuPathGrantsAccess,
+} from "../utils/authUtils";
+import { swalInfo, swalSuccess, swalError } from "../utils/swal";
+import {
+  isoDateSlice,
+  localDateISO,
+  normalizeOrderStatusForApi,
+  displayOrderStatus,
+} from "../utils/orderWorkflow";
+import {
+  canonicalMarketplaceCategory,
+  PERSONAL_MEMBERSHIP_FEE_USD,
+} from "../utils/constants";
+import { INVENTORY, VENDORS, ACCESS_PLANS, DEFAULT_MARKETPLACE_TEST_ITEMS, getAutoSyncedMarketplaceVendors } from "../utils/data";
+
+import { notifyStateChanged, getDeletedChauffeurIds, addDeletedChauffeurId, getUpdatedChauffeurMap, setUpdatedChauffeurItem } from "../utils/stateSyncHelper";
+import { formatClientDisplayName, BACKEND_ORIGIN, compareOrdersNewestFirst } from "../utils/apiHelpers";
+
+const GlobalDataContext = createContext();
+
+/** Shallow merge: overlay keys only if value !== undefined (keeps false / 0 / ''). */
+function mergeUserFields(base, ...overlays) {
+  const out = { ...(base && typeof base === "object" ? base : {}) };
+  for (const o of overlays) {
+    if (!o || typeof o !== "object") continue;
+    for (const [k, v] of Object.entries(o)) {
+      if (v !== undefined) out[k] = v;
+    }
+  }
+  return out;
+}
+
+function withoutPassword(obj) {
+  if (!obj || typeof obj !== "object") return {};
+  const { password, password_confirm, current_password, ...rest } = obj;
+  return rest;
+}
+
+function normalizeCompanyIdForApi(value) {
+  if (value == null) return undefined;
+  if (typeof value === "string" && value.trim() === "") return undefined;
+  const numeric = Number(value);
+  if (!Number.isNaN(numeric) && Number.isFinite(numeric) && numeric > 0)
+    return numeric;
+  return undefined;
+}
+
+/** First usable image URL from GET /inventory row (snake/camel + common aliases). */
+function inventoryImageFromApiRow(i) {
+  if (!i || typeof i !== "object") return "";
+  const candidates = [
+    i.image_url,
+    i.imageUrl,
+    i.image,
+    i.item?.image_url,
+    i.item?.imageUrl,
+    i.item?.image,
+    i.photo_url,
+    i.photoUrl,
+    i.photo,
+    i.item?.photo_url,
+    i.item?.photoUrl,
+    i.item?.photo,
+    i.product_image,
+    i.productImage,
+    i.picture_url,
+    i.pictureUrl,
+    i.thumbnail_url,
+    i.thumbnailUrl,
+    i.media_url,
+    i.mediaUrl,
+    i.cover_image,
+    i.coverImage,
+    Array.isArray(i.images) && i.images[0]
+      ? typeof i.images[0] === "string"
+        ? i.images[0]
+        : i.images[0]?.url
+      : null,
+    Array.isArray(i.item?.images) && i.item.images[0]
+      ? typeof i.item.images[0] === "string"
+        ? i.item.images[0]
+        : i.item.images[0]?.url
+      : null,
+  ];
+  for (const c of candidates) {
+    if (c == null || c === "") continue;
+    if (typeof c === "string") return c;
+    if (typeof c === "object" && typeof c.url === "string") return c.url;
+  }
+  return "";
+}
+
+/** POST/PUT inventory: treat 2xx + body as success when `success` flag is omitted (some APIs only return `data`). */
+function inventoryWriteResponseOk(res) {
+  if (!res || res.status < 200 || res.status >= 300) return false;
+  if (res.data?.success === false) return false;
+  if (res.data?.success === true) return true;
+  const payload = res.data?.data ?? res.data;
+  if (payload == null) return false;
+  if (typeof payload !== "object" || Array.isArray(payload)) return true;
+  return Object.keys(payload).length > 0;
+}
+
+/** Multipart inventory: only append FK fields when they are positive integers — `warehouse_id=""` often causes DB 500s. */
+function appendInventoryFk(formData, key, raw) {
+  if (raw === undefined || raw === null) return;
+  const s = String(raw).trim();
+  if (s === "" || s === "undefined" || s === "null") return;
+  const n = Number(s);
+  if (!Number.isFinite(n) || n < 0) return;
+  formData.append(key, String(Math.trunc(n)));
+}
+
+function nullablePositiveInt(raw) {
+  if (raw === undefined || raw === null) return null;
+  const s = String(raw).trim();
+  if (s === "" || s === "undefined" || s === "null") return null;
+  const n = Number(s);
+  if (!Number.isFinite(n) || n < 0) return null;
+  return Math.trunc(n);
+}
+
+/** Many inventory INSERTs require `company_id`; superadmin often has none — fall back to env or HQ `1`. */
+function resolveInventoryCompanyId(user, rowCompanyId) {
+  const fromRow = normalizeCompanyIdForApi(rowCompanyId);
+  if (fromRow != null) return fromRow;
+  const fromUser = normalizeCompanyIdForApi(
+    user?.company_id ?? user?.companyId,
+  );
+  if (fromUser != null) return fromUser;
+  const env = Number(import.meta.env?.VITE_DEFAULT_COMPANY_ID);
+  if (Number.isFinite(env) && env > 0) return env;
+  return 1;
+}
+
+function normalizeApiUserPayload(data) {
+  if (!data || typeof data !== "object") return null;
+  if (data.user && typeof data.user === "object") return data.user;
+  if (Array.isArray(data))
+    return data[0] && typeof data[0] === "object" ? data[0] : null;
+  return data;
+}
+
+function normalizeUserForUi(user) {
+  if (!user || typeof user !== "object") return user;
+  const bankName =
+    user.bank_name ?? user.bankName ?? user.bankingInfo?.bank ?? "";
+  const accountNumber =
+    user.account_number ??
+    user.accountNumber ??
+    user.bankingInfo?.account ??
+    "";
+  const routingNumber =
+    user.routing_number ??
+    user.routingNumber ??
+    user.bankingInfo?.routing ??
+    "";
+  const rawBanking = (user.bankingInfo && typeof user.bankingInfo === 'object') ? user.bankingInfo : {};
+  let rawBalance = user.vacation_balance ?? user.vacationBalance;
+  const storedDedicated = user.id ? localStorage.getItem(`dedicated_vacation_${user.id}`) : null;
+
+  // Filter out any 10,000-based artifacts (e.g. 10000, 9928, 9856)
+  const isCorruptVal = (v) => v === undefined || v === null || isNaN(Number(v)) || Number(v) >= 5000 || Number(v) <= 0;
+
+  let vacationQuota = 80;
+  if (!isCorruptVal(rawBanking.vacationQuota)) {
+    vacationQuota = Number(rawBanking.vacationQuota);
+  } else if (!isCorruptVal(storedDedicated)) {
+    vacationQuota = Number(storedDedicated);
+  } else if (!isCorruptVal(rawBalance)) {
+    vacationQuota = Number(rawBalance);
+  }
+
+  let finalBalance = !isCorruptVal(rawBalance) ? Number(rawBalance) : vacationQuota;
+  if (finalBalance === undefined || isNaN(finalBalance)) finalBalance = vacationQuota || 0;
+
+  return {
+    ...user,
+    bank_name: bankName,
+    bankName,
+    account_number: accountNumber,
+    accountNumber,
+    routing_number: routingNumber,
+    routingNumber,
+    vacation_balance: finalBalance,
+    vacationBalance: finalBalance,
+    vacationQuota,
+    bankingInfo: {
+      ...rawBanking,
+      bank: bankName,
+      account: accountNumber,
+      routing: routingNumber,
+      method: rawBanking.method || "Direct Deposit",
+      vacationQuota,
+    },
+  };
+}
+
+/** API route id: numeric or first digits from VND-123 style. */
+function poNumericId(id) {
+  if (id == null || id === "") return "";
+  const s = String(id).trim();
+  if (/^\d+$/.test(s)) return s;
+  const m = s.match(/(\d+)/);
+  return m ? m[1] : s;
+}
+
+function quotePathId(id) {
+  return poNumericId(id);
+}
+
+/** Backend may return [] or wrap rows in { clients, items, data }. */
+function normalizeClientsResponseBody(body) {
+  if (body == null) return [];
+  if (Array.isArray(body)) return body;
+  if (typeof body !== "object") return [];
+  if (Array.isArray(body.data)) return body.data;
+  for (const k of ["clients", "items", "records", "results", "rows"]) {
+    if (Array.isArray(body[k])) return body[k];
+  }
+  return [];
+}
+
+function mapClientFromApi(c) {
+  if (!c || typeof c !== "object") return null;
+  const roleRaw = String(c.role || c.user_role || "")
+    .trim()
+    .toLowerCase();
+  const clientTypeRaw =
+    c.client_type ??
+    c.clientType ??
+    c.type ??
+    c.client_kind ??
+    c.clientKind ??
+    c.account_type ??
+    c.accountType ??
+    (roleRaw === "saas_client" ? "SaaS" : null) ??
+    (roleRaw === "business_client" || roleRaw === "client" ? "Business" : null) ??
+    (roleRaw === "customer" ? "Personal" : null) ??
+    null;
+  const tenantTypeRaw = c.tenant_type ?? c.tenantType ?? c.tenant ?? null;
+  return {
+    ...c,
+    companyName: c.business_name || c.companyName || c.name,
+    location: c.location || c.address || "",
+    address: c.address || c.location || "",
+    client_type: clientTypeRaw ?? c.client_type,
+    clientType: c.clientType ?? clientTypeRaw,
+    tenant_type: tenantTypeRaw ?? c.tenant_type,
+    tenantType: c.tenantType ?? tenantTypeRaw,
+  };
+}
+
+function normalizeClientTypeValue(value) {
+  const raw = String(value || "")
+    .trim()
+    .toLowerCase();
+  if (!raw) return "";
+  if (
+    raw === "saas" ||
+    raw === "saas_client" ||
+    raw === "saas client" ||
+    raw === "subscription"
+  )
+    return "SaaS";
+  if (
+    raw === "business" ||
+    raw === "client" ||
+    raw === "business_client" ||
+    raw === "business client"
+  )
+    return "Business";
+  if (
+    raw === "personal" ||
+    raw === "customer" ||
+    raw === "individual" ||
+    raw === "direct"
+  )
+    return "Personal";
+  return String(value || "").trim();
+}
+
+function clientMatchesTypeFilter(client, requestedType) {
+  if (!requestedType) return true;
+  const desired = normalizeClientTypeValue(requestedType);
+  const actual = normalizeClientTypeValue(
+    client?.client_type ??
+    client?.clientType ??
+    client?.account_type ??
+    client?.accountType ??
+    client?.role ??
+    client?.user_role ??
+    (String(client?.plan || "").toLowerCase() !== "free" &&
+      String(client?.plan || "").trim()
+      ? "saas"
+      : ""),
+  );
+  if (!desired) return true;
+  return desired.toLowerCase() === actual.toLowerCase();
+}
+
+function vendorPathId(id) {
+  if (id == null || id === "") return "";
+  const s = String(id).trim();
+  if (/^\d+$/.test(s)) return s;
+  const rest = s.replace(/^VND-?/i, "");
+  if (/^\d+$/.test(rest)) return rest;
+  const m = s.match(/(\d+)/);
+  return m ? m[1] : s;
+}
+
+function buildVendorApiBody(vendor, companyId) {
+  const name = String(
+    vendor.name ||
+    vendor.vendor_name ||
+    vendor.business_name ||
+    vendor.company_name ||
+    "",
+  ).trim();
+  if (!name) {
+    const err = new Error("Vendor name is required.");
+    err.code = "VALIDATION";
+    throw err;
+  }
+  // Edit form writes `contact`; prefer it over stale API-backed contact_name/contact_person.
+  const contactName = (
+    vendor.contact ||
+    vendor.contact_name ||
+    vendor.contactPerson ||
+    ""
+  ).trim();
+  const body = {
+    name,
+    // Some backends only read vendor_name for the directory label
+    vendor_name: name,
+    email: (vendor.email || "").trim() || undefined,
+    phone: (vendor.phone || "").trim() || undefined,
+    category: (vendor.category || "").trim() || undefined,
+    address: (vendor.address || "").trim() || undefined,
+  };
+  if (contactName) {
+    body.contact_name = contactName;
+    body.contact_person = contactName;
+  }
+
+  const r = vendor.rating;
+  const d = vendor.delivery;
+  if (r !== "" && r != null && !Number.isNaN(Number(r))) {
+    body.rating = Math.min(100, Math.max(0, Math.round(Number(r))));
+  }
+  if (d !== "" && d != null && !Number.isNaN(Number(d))) {
+    body.delivery = Math.min(100, Math.max(0, Math.round(Number(d))));
+  }
+
+  if (companyId != null && companyId !== "") {
+    const n = Number(companyId);
+    body.company_id = Number.isFinite(n) && !Number.isNaN(n) ? n : companyId;
+  }
+
+  const st = String(vendor.status || "").toLowerCase();
+  if (["active", "inactive", "blacklisted"].includes(st)) {
+    body.status = st;
+  }
+
+  const out = {};
+  for (const [k, v] of Object.entries(body)) {
+    if (v === undefined || v === "") continue;
+    out[k] = v;
+  }
+  return out;
+}
+
+/**
+ * API rows: only explicit status strings (or numeric 0/1) count as active/inactive.
+ * We do not treat bare `is_active: true` as marketplace-approved — many backends default it on INSERT;
+ * HQ workflow requires an explicit `status: active` (or equivalent string) from the API.
+ */
+function mapVendorStatusFromApi(v) {
+  if (!v || typeof v !== "object") return "inactive";
+  const raw = v.status ?? v.vendor_status ?? v.approval_status ?? v.state;
+  if (raw != null && String(raw).trim() !== "") {
+    const s = String(raw).trim().toLowerCase();
+    if (["active", "inactive", "blacklisted"].includes(s)) return s;
+    if (
+      s === "pending" ||
+      s === "awaiting_approval" ||
+      s === "awaitingapproval"
+    )
+      return "inactive";
+    if (s === "1" || s === "true") return "active";
+    if (s === "0" || s === "false") return "inactive";
+    return "inactive";
+  }
+  const ia = v.is_active ?? v.isActive ?? v.active;
+  if (
+    ia === 0 ||
+    ia === false ||
+    ia === "0" ||
+    String(ia).toLowerCase() === "false"
+  )
+    return "inactive";
+  return "inactive";
+}
+
+/** POST /vendors response shapes vary — extract the created row for follow-up PUT. */
+function normalizeVendorCreateResponse(resBody) {
+  if (resBody == null || typeof resBody !== "object") return null;
+  const payload = Object.prototype.hasOwnProperty.call(resBody, "data")
+    ? resBody.data
+    : resBody;
+  if (payload == null) return null;
+  if (Array.isArray(payload)) {
+    const row = payload[0];
+    return row && typeof row === "object" ? row : null;
+  }
+  if (typeof payload === "object") {
+    if (payload.vendor && typeof payload.vendor === "object")
+      return payload.vendor;
+    if (payload.id != null) return payload;
+  }
+  return null;
+}
+
+const PENDING_VENDOR_OVERRIDE_KEY = "pending_vendor_overrides_v1";
+const PENDING_VENDOR_DRAFTS_KEY = "pending_vendor_drafts_v1";
+const CUSTOMER_ORDER_STATUS_OVERRIDE_KEY = "customer_order_status_overrides_v1";
+const SHIPPING_MODE_PRICING_KEY = "zz_shipping_mode_pricing_v1";
+
+function readPendingVendorOverrides() {
+  try {
+    const raw = localStorage.getItem(PENDING_VENDOR_OVERRIDE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed)
+      ? parsed.map((x) => String(x)).filter(Boolean)
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function writePendingVendorOverrides(ids) {
+  try {
+    const list = Array.from(
+      new Set((ids || []).map((x) => String(x)).filter(Boolean)),
+    );
+    localStorage.setItem(PENDING_VENDOR_OVERRIDE_KEY, JSON.stringify(list));
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function readPendingVendorDrafts() {
+  try {
+    const raw = localStorage.getItem(PENDING_VENDOR_DRAFTS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((x) => x && typeof x === "object" && x.id != null);
+  } catch {
+    return [];
+  }
+}
+
+function writePendingVendorDrafts(rows) {
+  try {
+    const list = Array.isArray(rows)
+      ? rows.filter((x) => x && typeof x === "object" && x.id != null)
+      : [];
+    localStorage.setItem(PENDING_VENDOR_DRAFTS_KEY, JSON.stringify(list));
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function readCustomerOrderStatusOverrides() {
+  try {
+    const raw = localStorage.getItem(CUSTOMER_ORDER_STATUS_OVERRIDE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed)
+      ? parsed.map((x) => String(x)).filter(Boolean)
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeCustomerOrderStatusOverrides(ids) {
+  try {
+    const list = Array.from(
+      new Set((ids || []).map((x) => String(x)).filter(Boolean)),
+    );
+    localStorage.setItem(
+      CUSTOMER_ORDER_STATUS_OVERRIDE_KEY,
+      JSON.stringify(list),
+    );
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function readShippingModePricing() {
+  try {
+    const raw = localStorage.getItem(SHIPPING_MODE_PRICING_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    return {
+      Road: Number(parsed?.Road) >= 0 ? Number(parsed.Road) : 0,
+      Sea: Number(parsed?.Sea) >= 0 ? Number(parsed.Sea) : 150,
+      Air: Number(parsed?.Air) >= 0 ? Number(parsed.Air) : 300,
+    };
+  } catch {
+    return { Road: 0, Sea: 150, Air: 300 };
+  }
+}
+
+function writeShippingModePricing(pricing) {
+  try {
+    localStorage.setItem(SHIPPING_MODE_PRICING_KEY, JSON.stringify(pricing));
+  } catch {
+    // ignore storage errors
+  }
+}
+
+/** Vendors table / directory: Super Admin sees all; admin & procurement see non-blacklisted; others see HQ-approved only. */
+function vendorsVisibleInDirectory(mapped, viewerRole) {
+  const key = normalizeRole(viewerRole);
+  if (key === "superadmin") return mapped;
+  if (["admin", "saas_client", "procurement"].includes(key)) {
+    return mapped.filter(
+      (v) => String(v.status || "").toLowerCase() !== "blacklisted",
+    );
+  }
+  return mapped.filter((v) => vendorVisibleInSharedLists(v, viewerRole));
+}
+
+/** DB expects integers — frontend often sends "ORD-12", "CLT-5", or "user_9". */
+function parseInvoiceOrderIdForApi(orderId) {
+  if (orderId == null || orderId === "") return null;
+  if (typeof orderId === "number" && Number.isFinite(orderId)) return orderId;
+  const digits = String(orderId).replace(/\D/g, "");
+  if (!digits) return null;
+  const n = parseInt(digits, 10);
+  return Number.isNaN(n) ? null : n;
+}
+
+/** Personal customers use value "user_<id>" — same as checkout: numeric id as client_id for API. */
+function parseInvoiceClientIdForApi(clientId) {
+  if (clientId == null || clientId === "") return null;
+  if (typeof clientId === "number" && Number.isFinite(clientId))
+    return clientId;
+  const s = String(clientId).trim();
+  if (s.startsWith("user_")) {
+    const n = parseInt(s.slice(5), 10);
+    return Number.isNaN(n) ? null : n;
+  }
+  const digits = s.replace(/\D/g, "");
+  if (!digits) return null;
+  const n = parseInt(digits, 10);
+  return Number.isNaN(n) ? null : n;
+}
+
+function mapInvoiceStatusForApi(status) {
+  const x = String(status || "unpaid")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "_")
+    .replace(/-/g, "_");
+  const map = {
+    unpaid: "unpaid",
+    partially_paid: "partially_paid",
+    paid: "paid",
+    overdue: "overdue",
+    cancelled: "cancelled",
+    pending: "pending",
+    proforma: "pro_forma",
+    pro_forma: "pro_forma",
+  };
+  return map[x] || "unpaid";
+}
+
+/** Body for POST /finance/invoices (snake_case, numeric FKs). */
+function buildFinanceInvoiceCreatePayload(invoice) {
+  const order_id = parseInvoiceOrderIdForApi(
+    invoice.orderId ?? invoice.order_id,
+  );
+  const client_id = parseInvoiceClientIdForApi(
+    invoice.clientId ?? invoice.client_id,
+  );
+  let amount = parseFloat(invoice.totalAmount ?? invoice.amount ?? 0);
+  if (!Number.isFinite(amount)) amount = 0;
+  let paid_amount = parseFloat(invoice.paidAmount ?? invoice.paid_amount ?? 0);
+  if (!Number.isFinite(paid_amount)) paid_amount = 0;
+  let due_date = invoice.dueDate || invoice.due_date || invoice.date;
+  due_date = due_date
+    ? String(due_date).split("T")[0]
+    : new Date(Date.now() + 7 * 864e5).toISOString().split("T")[0];
+  const status = mapInvoiceStatusForApi(invoice.status);
+
+  const body = {
+    client_id,
+    amount,
+    due_date,
+    status,
+  };
+  if (Number.isFinite(paid_amount) && paid_amount > 0)
+    body.paid_amount = paid_amount;
+  if (order_id != null) body.order_id = order_id;
+  return body;
+}
+
+/** GET /orders row → UI `total`: use API money fields when > 0, else sum items (qty × unit price). */
+function mapOrderDisplayTotal(o, parsedItemsArr) {
+  const toNum = (v) => {
+    if (v == null || v === "") return NaN;
+    return typeof v === "number" && Number.isFinite(v)
+      ? v
+      : parseFloat(String(v).replace(/,/g, ""));
+  };
+
+  const meta = typeof o?.metadata === "string"
+    ? (() => { try { return JSON.parse(o.metadata); } catch { return {}; } })()
+    : (o?.metadata || {});
+
+  const candidates = [
+    o?.total_amount,
+    o?.totalAmount,
+    o?.amount,
+    o?.total,
+    o?.grand_total,
+    o?.grandTotal,
+    o?.order_total,
+    o?.orderTotal,
+    o?.chauffeurFee,
+    o?.chauffeur_fee,
+    meta.chauffeurFee,
+    meta.chauffeur_fee,
+    meta.total_amount,
+    meta.totalAmount,
+    meta.customItems?.[0]?.chauffeurFee,
+    meta.customItems?.[0]?.chauffeur_fee,
+    meta.customItems?.[0]?.total_amount,
+  ];
+  for (const c of candidates) {
+    const n = toNum(c);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  const lines = Array.isArray(parsedItemsArr) ? parsedItemsArr : [];
+  let sum = 0;
+  for (const line of lines) {
+    const lineTot = toNum(
+      line.total ?? line.line_total ?? line.lineTotal ?? line.subtotal ?? line.chauffeurFee ?? line.chauffeur_fee,
+    );
+    if (Number.isFinite(lineTot) && lineTot > 0) {
+      sum += lineTot;
+      continue;
+    }
+    const q = toNum(line.qty ?? line.quantity ?? 1);
+    const p = toNum(
+      line.price ?? line.unit_price ?? line.unitPrice ?? line.amount ?? line.chauffeurFee ?? line.chauffeur_fee ?? 0,
+    );
+    sum += (Number.isFinite(q) ? q : 1) * (Number.isFinite(p) ? p : 0);
+  }
+  if (Number.isFinite(sum) && sum > 0) return sum;
+  const z = toNum(o?.total_amount ?? o?.totalAmount ?? o?.amount ?? o?.total ?? 0);
+  return Number.isFinite(z) ? z : 0;
+}
+
+function normalizeTransportMode(value) {
+  const raw = String(value || "")
+    .trim()
+    .toLowerCase();
+  if (raw === "road" || raw === "land" || raw === "ground") return "Road";
+  if (raw === "sea" || raw === "boat" || raw === "marine") return "Sea";
+  if (raw === "air" || raw === "flight" || raw === "plane") return "Air";
+  return "";
+}
+
+function extractTransportModeFromOrder(row) {
+  if (!row || typeof row !== "object") return "Road";
+
+  const notesMatch = String(row.notes || row.order_notes || "").match(
+    /delivery_mode\s*:\s*([^;\]\n]+)/i,
+  );
+  const fromNotes = normalizeTransportMode(notesMatch?.[1]);
+  if (fromNotes) return fromNotes;
+
+  let meta = {};
+  if (typeof row.metadata === "string") {
+    try { meta = JSON.parse(row.metadata); } catch (e) { }
+  } else if (row.metadata && typeof row.metadata === "object") {
+    meta = row.metadata;
+  }
+
+  // Prioritize non-road transport mode if explicitly set anywhere
+  const candidates = [
+    meta.delivery_mode,
+    meta.deliveryMode,
+    meta.deliveryType,
+    meta.transportMode,
+    meta.transport_mode,
+    meta.mode,
+    row.transportMode,
+    row.transport_mode,
+    row.delivery_mode,
+    row.deliveryMode,
+    row.deliveryType,
+    row.mode
+  ];
+  for (const c of candidates) {
+    const norm = normalizeTransportMode(c);
+    if (norm && norm !== "Road") return norm;
+  }
+
+  const direct = normalizeTransportMode(
+    row.transportMode ?? row.transport_mode ?? row.delivery_mode ?? row.deliveryMode ?? row.deliveryType ?? row.mode ?? meta.transportMode ?? meta.transport_mode ?? meta.deliveryType ?? meta.delivery_mode ?? meta.mode,
+  );
+  if (direct) return direct;
+
+  const category = String(
+    row.custom_request_category || row.customRequestCategory || row.type || "",
+  ).toLowerCase();
+  if (category.includes("sea")) return "Sea";
+  if (category.includes("air")) return "Air";
+  if (category.includes("road") || category.includes("land")) return "Road";
+  return "Road";
+}
+
+export const GlobalDataProvider = ({ children }) => {
+  const queryClient = useQueryClient();
+  const [saasRequests, setSaasRequests] = useState([]);
+  const [subscriptionRequests, setSubscriptionRequests] = useState([]);
+  const [securityEvents, setSecurityEvents] = useState([]);
+  const [clients, setClients] = useState(() => {
+    try {
+      const cached = localStorage.getItem('app_clients_cache');
+      return cached ? JSON.parse(cached) : [];
+    } catch {
+      return [];
+    }
+  });
+  const [vendors, setVendors] = useState([]);
+  const [inventory, setInventory] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const [accessPlans, setAccessPlans] = useState([]);
+  const [pendingVendorOverrideIds, setPendingVendorOverrideIds] = useState(() =>
+    readPendingVendorOverrides(),
+  );
+  const [pendingVendorDrafts, setPendingVendorDrafts] = useState(() =>
+    readPendingVendorDrafts(),
+  );
+  const [customerOrderStatusOverrides, setCustomerOrderStatusOverrides] =
+    useState(() => readCustomerOrderStatusOverrides());
+
+  const [currentUser, setCurrentUser] = useState(() => {
+    const savedUser = localStorage.getItem("user");
+    if (savedUser) {
+      try {
+        return normalizeUserForUi(JSON.parse(savedUser));
+      } catch (e) {
+        console.error("Failed to parse saved user", e);
+      }
+    }
+    return null;
+  });
+
+  // FETCH REAL PROFILE ON MOUNT (PHASE 11 INTEGRATION) & POLL PERIODICALLY
+  useEffect(() => {
+    const fetchProfile = async () => {
+      const token = localStorage.getItem('token');
+      if (token) {
+        try {
+          const res = await api.get('/auth/profile');
+          const rawUser = res.data?.data || res.data;
+          if (rawUser) {
+            const realUser = normalizeUserForUi(rawUser);
+            setCurrentUser((prev) => JSON.stringify(prev) === JSON.stringify(realUser) ? prev : realUser);
+            localStorage.setItem('user', JSON.stringify(realUser));
+            if (realUser.role?.name) {
+              localStorage.setItem('userRole', realUser.role.name.toLowerCase());
+            }
+            if (realUser.menuPermissions) {
+              setMenuPermissions((prev) => JSON.stringify(prev) === JSON.stringify(realUser.menuPermissions) ? prev : realUser.menuPermissions);
+              localStorage.setItem('menuPermissions', JSON.stringify(realUser.menuPermissions));
+
+              // Auto-kick out if on a restricted page
+              const path = window.location.pathname;
+              const search = window.location.search;
+
+              const isDashboardIndexWithoutTab = (path === '/dashboard' || path === '/dashboard/') && !search.includes('tab=');
+
+              if (path.startsWith('/dashboard') && !isDashboardIndexWithoutTab && !['/dashboard/settings', '/dashboard/profile'].includes(path)) {
+                const hasPermission = realUser.menuPermissions.some(p =>
+                  p.can_view &&
+                  p.path &&
+                  menuPathGrantsAccess(path, search, p.path)
+                );
+
+                const role = normalizeRole(realUser.role);
+                const isPrivileged = ['superadmin', 'admin', 'saas_client', 'staff', 'customer', 'client', 'concierge', 'inventory', 'logistics'].includes(role);
+
+                if (!hasPermission && !isPrivileged) {
+                  window.location.href = '/dashboard';
+                }
+              }
+            }
+          }
+        } catch (error) {
+          console.error('Failed to fetch real profile:', error);
+          if (error.response?.status === 401) {
+            localStorage.removeItem('token');
+            localStorage.removeItem('user');
+            localStorage.removeItem('menuPermissions');
+            setCurrentUser(null);
+          }
+        }
+      }
+    };
+
+    fetchProfile();
+
+    // Poll every 10 seconds to detect real-time permissions changes
+    const interval = setInterval(fetchProfile, 10000);
+
+    // Refresh when user returns to/focuses the window
+    window.addEventListener('focus', fetchProfile);
+
+    return () => {
+      clearInterval(interval);
+      window.removeEventListener('focus', fetchProfile);
+    };
+  }, []);
+
+  const [menuPermissions, setMenuPermissions] = useState(() => {
+    const saved = localStorage.getItem("menuPermissions");
+    if (saved) {
+      try {
+        return JSON.parse(saved);
+      } catch (e) {
+        return [];
+      }
+    }
+    return [];
+  });
+
+  /** Core procurement screens: DB role menus sometimes omit can_add; procurement staff should manage these. */
+  const PROCUREMENT_FULL_CRUD_MENUS = new Set([
+    "quotes",
+    "purchase requests",
+    "vendors",
+    "purchase orders",
+  ]);
+
+  /** Inventory role: warehouses & stock ledger are core duties; RBAC rows sometimes omit create. */
+  const INVENTORY_FULL_CRUD_MENUS = new Set(["warehouses", "inventory"]);
+  /** Logistics role: delivery ops screens should always support standard CRUD actions. */
+  const LOGISTICS_FULL_CRUD_MENUS = new Set([
+    "fleet",
+    "deliveries",
+    "tracking",
+    "routes",
+    "urgent",
+  ]);
+  const CONCIERGE_FULL_CRUD_MENUS = new Set([
+    "orders",
+    "events",
+    "guest requests",
+    "luxury items",
+    "chauffeur",
+  ]);
+
+  const hasMenuPermission = (menuName, action = "can_view") => {
+    const role = normalizeRole(currentUser?.role);
+    if (
+      role === "super_admin" ||
+      role === "superadmin" ||
+      role === "admin" ||
+      role === "saas_client"
+    )
+      return true;
+
+    const key = String(menuName || "")
+      .trim()
+      .toLowerCase();
+
+    // Staff role bypasses for core operational screens
+    if (role === "procurement" && PROCUREMENT_FULL_CRUD_MENUS.has(key)) return true;
+    if (role === "inventory" && INVENTORY_FULL_CRUD_MENUS.has(key)) return true;
+    if (role === "logistics" && LOGISTICS_FULL_CRUD_MENUS.has(key)) return true;
+    if (role === "concierge" && CONCIERGE_FULL_CRUD_MENUS.has(key)) return true;
+
+    // If no permissions loaded, deny by default (secure fallback)
+    if (!menuPermissions || menuPermissions.length === 0) return false;
+    const perm = menuPermissions.find(
+      (p) =>
+        String(p.name || "")
+          .trim()
+          .toLowerCase() === key,
+    );
+    return perm ? !!perm[action] : false;
+  };
+
+  const [users, setUsers] = useState([]);
+  const [roles, setRoles] = useState([]);
+  const [purchaseRequests, setPurchaseRequests] = useState([]);
+  const [purchaseOrders, setPurchaseOrders] = useState([]);
+  const [quotes, setQuotes] = useState([]);
+  const [orders, setOrders] = useState([]);
+  const [invoices, setInvoices] = useState([]);
+  const [payments, setPayments] = useState([]);
+  const [deliveries, setDeliveries] = useState([]);
+  const [chauffeurRequests, setChauffeurRequests] = useState([]);
+  const [logs, setLogs] = useState([]);
+  const [fleet, setFleet] = useState([]);
+  const [supportTickets, setSupportTickets] = useState([]);
+  const [rawSupportTickets, setRawSupportTickets] = useState([]);
+  const [projects, setProjects] = useState([]);
+  const [missions, setMissions] = useState([]);
+  const [staffAssignments, setStaffAssignments] = useState([]);
+  const [payHistory, setPayHistory] = useState([]);
+  const [teams, setTeams] = useState([]);
+  const [audits, setAudits] = useState([]);
+  const [warehouses, setWarehouses] = useState([]);
+  const [guestRequests, setGuestRequests] = useState([]);
+  const [rawGuestRequests, setRawGuestRequests] = useState([]);
+  const [events, setEvents] = useState([]);
+  const [rawEvents, setRawEvents] = useState([]);
+  const [routes, setRoutes] = useState([]);
+  const [urgentTasks, setUrgentTasks] = useState([]);
+  const [tracking, setTracking] = useState([]);
+  // Backend in some deployments doesn't expose tracking/urgent endpoints.
+  const trackingApiUnavailableRef = React.useRef(false);
+  const urgentApiUnavailableRef = React.useRef(false);
+  const lastFetchedUserIdRef = React.useRef(null);
+  const [stockMovements, setStockMovements] = useState([]);
+  const [lossAssessments, setLossAssessments] = useState([]);
+  const [cart, setCart] = useState([]);
+  const [leaveRequests, setLeaveRequests] = useState([]);
+  const [revenueFilter, setRevenueFilter] = useState("Weekly");
+  const [activePlan, setActivePlan] = useState("Institutional Premium");
+  const [dashboardStats, setDashboardStats] = useState({});
+  const [systemSettings, setSystemSettings] = useState({});
+  const [inventoryAlerts, setInventoryAlerts] = useState([]);
+  const [notifications, setNotifications] = useState([]);
+  const [unreadCount, setUnreadCount] = useState(0);
+
+  useEffect(() => {
+    // Determine the base URL for the socket connection from the dynamic backend origin
+    const socketURL = BACKEND_ORIGIN;
+
+    const socket = io(socketURL, {
+      transports: ['websocket', 'polling']
+    });
+
+    socket.on('connect', () => {
+      console.log('🔗 Connected to Socket.io real-time server');
+    });
+
+    socket.on('delivery_update', (updatedDelivery) => {
+      if (!updatedDelivery || !updatedDelivery.id) return;
+      setDeliveries(prev => prev.map(d => d.id === updatedDelivery.id ? { ...d, ...updatedDelivery } : d));
+    });
+
+    socket.on('support_update', (updatedTicket) => {
+      if (!updatedTicket || (!updatedTicket.id && !updatedTicket.ticketId)) return;
+      const targetId = updatedTicket.ticketId || updatedTicket.id;
+      const targetDbId = updatedTicket.db_id || (typeof updatedTicket.id === 'number' ? updatedTicket.id : null);
+
+      const matchId = (t) => {
+        if (!t) return false;
+        const tId = t.ticketId || t.id;
+        if (targetId && tId && String(tId) === String(targetId)) return true;
+        if (targetDbId && t.db_id && String(t.db_id) === String(targetDbId)) return true;
+        return false;
+      };
+
+      const formatStatus = (s) => {
+        if (!s) return "Open";
+        return String(s)
+          .split(/[_\s]+/)
+          .map((p) => p.charAt(0).toUpperCase() + p.slice(1))
+          .join(" ");
+      };
+      const formattedStatus = updatedTicket.status ? formatStatus(updatedTicket.status) : undefined;
+      const patchedTicket = { ...updatedTicket, ...(formattedStatus ? { status: formattedStatus } : {}) };
+
+      if (updatedTicket.deleted) {
+        setSupportTickets(prev => prev.filter(t => !matchId(t)));
+        setRawSupportTickets(prev => prev.filter(t => !matchId(t)));
+      } else {
+        setSupportTickets(prev => prev.map(t => matchId(t) ? { ...t, ...patchedTicket } : t));
+        setRawSupportTickets(prev => prev.map(t => matchId(t) ? { ...t, ...patchedTicket } : t));
+      }
+      fetchTickets();
+      window.dispatchEvent(new CustomEvent('app:state-changed'));
+    });
+
+    socket.on('event_update', (updatedEvent) => {
+      if (!updatedEvent || (!updatedEvent.id && !updatedEvent.eventId)) return;
+      const matchId = (e) =>
+        String(e.id) === String(updatedEvent.id) ||
+        String(e.eventId) === String(updatedEvent.id) ||
+        String(e.db_id) === String(updatedEvent.id) ||
+        (updatedEvent.eventId && String(e.id) === String(updatedEvent.eventId)) ||
+        (updatedEvent.eventId && String(e.eventId) === String(updatedEvent.eventId));
+
+      if (updatedEvent.deleted) {
+        setEvents(prev => prev.filter(e => !matchId(e)));
+        setRawEvents(prev => prev.filter(e => !matchId(e)));
+      } else {
+        setEvents(prev => prev.map(e => matchId(e) ? { ...e, ...updatedEvent, status: updatedEvent.status || e.status } : e));
+        setRawEvents(prev => prev.map(e => matchId(e) ? { ...e, ...updatedEvent, status: updatedEvent.status || e.status } : e));
+      }
+      fetchTickets();
+      window.dispatchEvent(new CustomEvent('app:state-changed'));
+    });
+
+    socket.on('guest_request_update', (updatedReq) => {
+      if (!updatedReq || (!updatedReq.id && !updatedReq.requestId)) return;
+      const matchId = (r) =>
+        String(r.id) === String(updatedReq.id) ||
+        String(r.requestId) === String(updatedReq.id) ||
+        String(r.db_id) === String(updatedReq.id) ||
+        (updatedReq.requestId && String(r.id) === String(updatedReq.requestId)) ||
+        (updatedReq.requestId && String(r.requestId) === String(updatedReq.requestId));
+
+      const normalizedStatus = updatedReq.status ? String(updatedReq.status).toLowerCase() : undefined;
+      const patchedReq = { ...updatedReq, ...(normalizedStatus ? { status: normalizedStatus } : {}) };
+
+      if (updatedReq.deleted) {
+        setGuestRequests(prev => prev.filter(r => !matchId(r)));
+        setRawGuestRequests(prev => prev.filter(r => !matchId(r)));
+      } else {
+        setGuestRequests(prev => prev.map(r => matchId(r) ? { ...r, ...patchedReq } : r));
+        setRawGuestRequests(prev => prev.map(r => matchId(r) ? { ...r, ...patchedReq } : r));
+      }
+      fetchTickets();
+      window.dispatchEvent(new CustomEvent('app:state-changed'));
+    });
+
+    return () => {
+      socket.disconnect();
+    };
+  }, []);
+
+
+  const filterDataForCurrentUser = React.useCallback(
+    (dataArray) => {
+      if (!Array.isArray(dataArray)) return [];
+      if (!currentUser) return dataArray;
+
+      const role = normalizeRole(currentUser.role);
+      // Super Admin, HQ staff, and SaaS Admin (tenant scoped by backend) see everything returned
+      if (["super_admin", "superadmin", "admin", "concierge", "operations", "logistics", "saas_client"].includes(role)) {
+        return dataArray;
+      }
+
+      // Determine user's scoping IDs
+      const myCompanyId =
+        currentUser.company_id ||
+        currentUser.companyId ||
+        currentUser.clientId ||
+        currentUser.client_id;
+      const myUserId = currentUser.id;
+
+      // If the user has a specific company scope, filter by that company
+      if (myCompanyId && String(myCompanyId) !== "1") {
+        return dataArray.filter((item) => {
+          const itemCompany =
+            item.company_id ||
+            item.companyId ||
+            item.client_id ||
+            item.clientId ||
+            item.customer_id;
+          const itemUser =
+            item.user_id ||
+            item.userId ||
+            item.created_by ||
+            item.requested_by ||
+            item.manager_id ||
+            item.submitted_by;
+
+          // If it belongs to their company OR if they created it OR if it belongs to their tenant
+          return (
+            (itemCompany && String(itemCompany) === String(myCompanyId)) ||
+            (itemUser && String(itemUser) === String(myUserId)) ||
+            (currentUser.tenantId && (item.tenantId || item.tenant_id) && String(item.tenantId || item.tenant_id) === String(currentUser.tenantId))
+          );
+        });
+      }
+
+      // For regular customers, filter strictly by their user_id, client profile, or email
+      if (role === "customer") {
+        return dataArray.filter((item) => {
+          const itemCompany =
+            item.company_id ||
+            item.companyId ||
+            item.client_id ||
+            item.clientId;
+          const itemUser =
+            item.user_id ||
+            item.userId ||
+            item.created_by ||
+            item.requested_by ||
+            item.manager_id ||
+            item.submitted_by;
+          const itemEmail =
+            item.email ||
+            item.client_email ||
+            item.customer_email ||
+            item.clientEmail ||
+            item.customerEmail ||
+            item.metadata?.email;
+          return (
+            (itemUser && String(itemUser) === String(myUserId)) ||
+            (myCompanyId && itemCompany && String(itemCompany) === String(myCompanyId)) ||
+            (currentUser.email && itemEmail && String(itemEmail).toLowerCase().trim() === String(currentUser.email).toLowerCase().trim())
+          );
+        });
+      }
+
+      return dataArray;
+    },
+    [currentUser],
+  );
+
+  // Re-apply filtering for fetched tickets when user becomes available
+  React.useEffect(() => {
+    if (!Array.isArray(rawSupportTickets)) return;
+    if (!currentUser) return; // keep existing state — don't wipe on null user
+    setSupportTickets(filterDataForCurrentUser(rawSupportTickets));
+  }, [currentUser, rawSupportTickets, filterDataForCurrentUser]);
+
+  // Re-apply filtering for events when user becomes available
+  React.useEffect(() => {
+    if (!Array.isArray(rawEvents)) return;
+    if (!currentUser) return;
+    setEvents(filterDataForCurrentUser(rawEvents));
+  }, [currentUser, rawEvents, filterDataForCurrentUser]);
+
+  // Re-apply filtering for guest requests when user becomes available
+  React.useEffect(() => {
+    if (!Array.isArray(rawGuestRequests)) return;
+    if (!currentUser) return;
+    setGuestRequests(filterDataForCurrentUser(rawGuestRequests));
+  }, [currentUser, rawGuestRequests, filterDataForCurrentUser]);
+
+  const addLog = (log) => {
+    setLogs((prev) =>
+      [
+        {
+          ...log,
+          id: Date.now(),
+          time: new Date().toLocaleTimeString([], {
+            hour: "2-digit",
+            minute: "2-digit",
+          }),
+        },
+        ...prev,
+      ].slice(0, 50),
+    );
+  };
+
+  /** Personal (customer) portal membership — same flags as Concierge Lifestyle on Plans; local profile until PSP wiring */
+  const activatePersonalMembership = React.useCallback(async (planName = "Premium", planFee = PERSONAL_MEMBERSHIP_FEE_USD) => {
+    try {
+      const memberSince = new Date().toISOString().slice(0, 10);
+      const chosenPlan = planName || "Premium";
+      const feeNum = parseFloat(planFee) || PERSONAL_MEMBERSHIP_FEE_USD;
+      const next = {
+        ...currentUser,
+        concierge_member: true,
+        conciergeMembership: true,
+        concierge_membership_since: memberSince,
+        concierge_fee_usd: feeNum,
+        plan: chosenPlan,
+        is_upgraded: true,
+      };
+
+      // 1. Update Backend — save membership fields to users table
+      if (currentUser?.id) {
+        await api.put(`/users/${currentUser.id}`, {
+          plan: chosenPlan,
+          is_upgraded: true,
+          concierge_member: true,
+          concierge_membership_since: memberSince,
+        });
+      }
+
+      // 2. Update Local State
+      setCurrentUser(next);
+      try {
+        localStorage.setItem("user", JSON.stringify(next));
+      } catch (_) {
+        /* ignore */
+      }
+
+      addLog({
+        action: "Membership upgrade",
+        detail: `Personal portal membership activated (${chosenPlan} - $${feeNum}/mo subscription fee).`,
+        type: "system",
+      });
+    } catch (error) {
+      console.error("Failed to activate membership on backend:", error);
+      // Fallback to local update if backend fails (optimistic)
+      setCurrentUser((prev) => ({
+        ...prev,
+        plan: planName || "Premium",
+        is_upgraded: true,
+        concierge_member: true,
+      }));
+    }
+  }, [currentUser]);
+
+  const cancelPersonalMembership = React.useCallback(
+    async (targetUserId) => {
+      try {
+        const next = {
+          ...currentUser,
+          concierge_member: false,
+          concierge_membership_since: null,
+          concierge_fee_usd: 0,
+          plan: "Basic",
+          is_upgraded: false,
+        };
+
+        // 1. Update Backend
+        if (targetUserId) {
+          await api.put(`/users/${targetUserId}`, {
+            plan: "Basic",
+            is_upgraded: false,
+            concierge_member: false,
+          });
+        } else if (currentUser?.id) {
+          await api.put(`/users/${currentUser.id}`, {
+            plan: "Basic",
+            is_upgraded: false,
+            concierge_member: false,
+          });
+        }
+
+        // 2. Update Local State (only if target is self)
+        if (!targetUserId || targetUserId === currentUser?.id) {
+          setCurrentUser(next);
+          try {
+            localStorage.setItem("user", JSON.stringify(next));
+          } catch (_) {
+            /* ignore */
+          }
+        }
+
+        addLog({
+          action: "Membership cancelled",
+          detail: `Personal portal membership was cancelled. Access to premium features restricted.`,
+          type: "system",
+        });
+
+        return true;
+      } catch (error) {
+        console.error("Failed to cancel membership:", error);
+        throw error;
+      }
+    },
+    [currentUser],
+  );
+
+  const formatDateTime = (date, time) => {
+    if (!date) date = new Date().toISOString().split("T")[0];
+    if (!time) return `${date} 00:00:00`;
+
+    // Attempt to parse time string (e.g., "11:20 PM", "23:20", "11:20")
+    let hours = 0,
+      minutes = 0,
+      seconds = 0;
+    const timeRegex = /(\d+):(\d+)(?::(\d+))?\s*(AM|PM)?/i;
+    const match = String(time).match(timeRegex);
+
+    if (match) {
+      hours = parseInt(match[1], 10);
+      minutes = parseInt(match[2], 10);
+      seconds = match[3] ? parseInt(match[3], 10) : 0;
+      const ampm = match[4];
+
+      if (ampm) {
+        if (ampm.toUpperCase() === "PM" && hours < 12) hours += 12;
+        if (ampm.toUpperCase() === "AM" && hours === 12) hours = 0;
+      }
+    }
+
+    const h = String(hours).padStart(2, "0");
+    const m = String(minutes).padStart(2, "0");
+    const s = String(seconds).padStart(2, "0");
+
+    return `${date} ${h}:${m}:${s}`;
+  };
+
+  const addToCart = (item) => {
+    if (!item) return;
+    const itemId = item.id ?? item.itemId ?? item._id ?? item.item_id;
+    if (itemId == null) return;
+    const idStr = String(itemId);
+    setCart((prev) => {
+      const existing = prev.find(
+        (i) =>
+          String(i.id ?? i.itemId ?? i._id ?? i.item_id) === idStr,
+      );
+      if (existing) {
+        return prev.map((i) =>
+          String(i.id ?? i.itemId ?? i._id ?? i.item_id) === idStr
+            ? { ...i, qty: Number(i.qty || 1) + 1 }
+            : i,
+        );
+      }
+      return [...prev, { ...item, id: itemId, qty: 1 }];
+    });
+    addLog({
+      action: "Cart Update",
+      detail: `Added ${item.name || "Item"} to the procurement queue.`,
+      type: "system",
+    });
+  };
+
+  const removeFromCart = (id, forceRemove = false) => {
+    if (id == null) return;
+    const targetId = typeof id === "object" ? (id.id ?? id.itemId ?? id._id ?? id.item_id) : id;
+    if (targetId == null) return;
+    const idStr = String(targetId);
+    setCart((prev) => {
+      const item = prev.find(
+        (i) =>
+          String(i.id ?? i.itemId ?? i._id ?? i.item_id) === idStr,
+      );
+      if (!forceRemove && item && Number(item.qty) > 1) {
+        return prev.map((i) =>
+          String(i.id ?? i.itemId ?? i._id ?? i.item_id) === idStr
+            ? { ...i, qty: Number(i.qty) - 1 }
+            : i,
+        );
+      }
+      return prev.filter(
+        (i) =>
+          String(i.id ?? i.itemId ?? i._id ?? i.item_id) !== idStr,
+      );
+    });
+  };
+  const clearCart = () => setCart([]);
+
+  const fetchClients = React.useCallback(
+    async (options = {}) => {
+      try {
+        const params = new URLSearchParams();
+        params.append("limit", "1000");
+        if (options.search) params.append("search", options.search);
+        if (options.client_type)
+          params.append("client_type", options.client_type);
+        const url = `/clients${params.toString() ? "?" + params.toString() : ""}`;
+        const res = await api.get(url);
+        let raw = res.data?.success ? res.data.data : res.data;
+        const arr = normalizeClientsResponseBody(raw);
+        const mapped = arr.map(mapClientFromApi).filter(Boolean);
+        setClients(mapped);
+        try { localStorage.setItem('app_clients_cache', JSON.stringify(mapped)); } catch {}
+      } catch (e) {
+        console.error("Fetch clients failed", e);
+        setClients([]);
+      }
+    },
+    [],
+  );
+
+  const fetchVendors = React.useCallback(async () => {
+    try {
+      const res = await api.get("/vendors");
+      const raw = res.data?.success
+        ? res.data.data
+        : Array.isArray(res.data)
+          ? res.data
+          : [];
+      const safeRaw = Array.isArray(raw) ? raw : (raw?.vendors && Array.isArray(raw.vendors) ? raw.vendors : (raw?.data && Array.isArray(raw.data) ? raw.data : []));
+      const mapped = safeRaw.map((v) => ({
+        ...v,
+        name:
+          v.name ||
+          v.vendor_name ||
+          v.business_name ||
+          v.companyName ||
+          v.company_name ||
+          v.title ||
+          "Partner",
+        status: mapVendorStatusFromApi(v),
+        contact: v.contact_name || v.contact || v.contact_person || "",
+        delivery:
+          (v.delivery ??
+            v.delivery_performance ??
+            Math.round((v.rating || 0) * 100)) ||
+          90,
+      }));
+      // Server status is source of truth (pending/inactive until super-admin approval).
+      // SaaS tenants must NOT have hardcoded seed vendors injected into their vendor state
+      const _rawRole = typeof currentUser?.role === 'string' ? currentUser.role : (currentUser?.role?.name || currentUser?.roleName || '');
+      const _normRole = _rawRole.toLowerCase().replace(/[-\s]/g, '_');
+      const _isSaas = (currentUser?.tenantId && Number(currentUser.tenantId) !== 1)
+        || _normRole === 'saas_client'
+        || _normRole === 'saas_admin'
+        || (currentUser?.company_id && (clients || []).some(c => String(c.id) === String(currentUser.company_id) && (c.clientType === 'SaaS' || c.client_type === 'SaaS')));
+      if (!_isSaas) {
+        const autoMarketplace = getAutoSyncedMarketplaceVendors();
+        autoMarketplace.forEach((mv) => {
+          if (!mapped.some(v => (v.name || v.companyName || '').toLowerCase() === (mv.name || '').toLowerCase())) {
+            mapped.push(mv);
+          }
+        });
+      }
+      setVendors(vendorsVisibleInDirectory(mapped, currentUser?.role));
+    } catch (e) {
+      console.error("Fetch vendors failed", e);
+      const seed = VENDORS.map((v) => ({
+        ...v,
+        name:
+          v.name ||
+          v.vendor_name ||
+          v.business_name ||
+          v.companyName ||
+          v.company_name ||
+          v.title ||
+          "Partner",
+        status: mapVendorStatusFromApi(v),
+        contact: v.contact_name || v.contact || v.contact_person || "",
+        delivery:
+          (v.delivery ??
+            v.delivery_performance ??
+            Math.round((v.rating || 0) * 100)) ||
+          90,
+      }));
+      const _rawRole = typeof currentUser?.role === 'string' ? currentUser.role : (currentUser?.role?.name || currentUser?.roleName || '');
+      const _normRole = _rawRole.toLowerCase().replace(/[-\s]/g, '_');
+      const _isSaas = (currentUser?.tenantId && Number(currentUser.tenantId) !== 1)
+        || _normRole === 'saas_client'
+        || _normRole === 'saas_admin'
+        || (currentUser?.company_id && (clients || []).some(c => String(c.id) === String(currentUser.company_id) && (c.clientType === 'SaaS' || c.client_type === 'SaaS')));
+      if (!_isSaas) {
+        const autoMarketplace = getAutoSyncedMarketplaceVendors();
+        autoMarketplace.forEach((mv) => {
+          if (!seed.some(v => (v.name || v.companyName || '').toLowerCase() === (mv.name || '').toLowerCase())) {
+            seed.push(mv);
+          }
+        });
+      }
+      setVendors(vendorsVisibleInDirectory(seed, currentUser?.role));
+    }
+  }, [currentUser?.role, currentUser?.id, currentUser?.tenantId, currentUser?.company_id, clients]);
+
+  const [bulkDataVersion, setBulkDataVersion] = React.useState(0);
+
+  React.useEffect(() => {
+    const handleSync = () => {
+      setBulkDataVersion((v) => v + 1);
+    };
+    window.addEventListener('app:state-changed', handleSync);
+    window.addEventListener('storage', handleSync);
+    return () => {
+      window.removeEventListener('app:state-changed', handleSync);
+      window.removeEventListener('storage', handleSync);
+    };
+  }, []);
+
+  const marketplaceVendors = React.useMemo(() => {
+    const list = (vendors || []).filter(
+      (v) => String(v?.status || "").trim().toLowerCase() === "active",
+    );
+    // SaaS clients and SaaS customers must NOT see hardcoded seed/demo vendors in any dropdown
+    const rawRole = typeof currentUser?.role === 'string'
+      ? currentUser.role
+      : (currentUser?.role?.name || currentUser?.roleName || '');
+    const normRole = rawRole.toLowerCase().replace(/[-\s]/g, '_');
+    const isSaasUser = (currentUser?.tenantId && Number(currentUser.tenantId) !== 1)
+      || normRole === 'saas_client'
+      || normRole === 'saas_admin'
+      || (currentUser?.company_id && (clients || []).some(c => String(c.id) === String(currentUser.company_id) && (c.clientType === 'SaaS' || c.client_type === 'SaaS')));
+    if (!isSaasUser) {
+      try {
+        const autoStores = getAutoSyncedMarketplaceVendors();
+        autoStores.forEach(s => {
+          if (!list.some(v => (v.name || v.companyName || '').toLowerCase() === s.name.toLowerCase())) {
+            list.push(s);
+          }
+        });
+      } catch { }
+    }
+    return list;
+  }, [vendors, bulkDataVersion, currentUser?.role, currentUser?.tenantId, currentUser?.company_id, clients]);
+
+  const fetchInventory = React.useCallback(async () => {
+    let itemsArr = [];
+    try {
+      const params = { limit: 500 };
+      if (currentUser?.tenantId && Number(currentUser.tenantId) !== 1) {
+        params.tenantId = currentUser.tenantId;
+      }
+      const itemsRes = await api.get("/items", { params });
+      const rawItems = itemsRes.data?.data;
+      itemsArr = Array.isArray(rawItems) ? rawItems : (Array.isArray(rawItems?.items) ? rawItems.items : []);
+    } catch (e) {
+      console.warn("Fetch /items failed:", e.message);
+    }
+
+    let stockArr = [];
+    try {
+      const res = await api.get("/stock", { params: { limit: 500 } });
+      const raw = res.data?.data;
+      stockArr = Array.isArray(raw) ? raw : (Array.isArray(raw?.stock) ? raw.stock : []);
+    } catch (e) {
+      console.warn("Fetch real stock API failed:", e.message);
+    }
+
+    let inventoryData = [];
+
+    if (itemsArr.length > 0) {
+      inventoryData = itemsArr.map((i) => {
+        let totalQty = i.qty ?? i.quantity ?? 0;
+        if (i.inventoryStock && Array.isArray(i.inventoryStock) && i.inventoryStock.length > 0) {
+          totalQty = i.inventoryStock.reduce((sum, stock) => sum + (stock.quantity || 0), 0);
+        }
+        return {
+          ...i,
+          id: i.id,
+          name: i.name || "",
+          image: inventoryImageFromApiRow(i) || "",
+          qty: totalQty,
+          quantity: totalQty,
+          location: i.location || i.warehouse_name || (i.inventoryStock?.[0]?.warehouseId ? `Warehouse ${i.inventoryStock[0].warehouseId}` : "General Storage"),
+          inventoryType: i.inventoryType === 'MARKETPLACE' ? 'Marketplace' : (i.inventoryType || (i.clientId ? "Client" : "Marketplace")),
+          clientId: i.clientId || i.client_id || null,
+          clientName: i.client_name || i.clientName || "",
+          vendor_id: i.vendor_id ?? i.vendorId ?? null,
+          vendorName: i.vendor_name || i.vendorName || i.vendor || "",
+          category: canonicalMarketplaceCategory(i.category?.name || i.category || ""),
+          sku: i.sku || "",
+          price: parseFloat(i.price ?? i.unit_price ?? i.unitPrice ?? 0) || 0,
+          description: i.description || "",
+          status: totalQty <= 0 ? "Critical" : (i.status || "Normal"),
+        };
+      });
+    }
+
+    if (stockArr.length > 0) {
+      const stockMapped = stockArr.map((i) => {
+        const actualItemId = i.item?.id || i.itemId || i.item_id || i.id;
+        return {
+          ...i,
+          id: actualItemId,
+          itemId: actualItemId,
+          stockId: i.id,
+          name: i.item?.name || i.name || "",
+          image: inventoryImageFromApiRow(i) || "",
+          qty: i.quantity ?? i.qty ?? 0,
+          quantity: i.quantity ?? i.qty ?? 0,
+          location: i.warehouse?.name || i.warehouse_name || i.location || "",
+          warehouse_name: i.warehouse?.name || i.warehouse_name || "",
+          warehouseId: i.warehouseId || i.warehouse_id || null,
+          inventoryType: i.item?.inventoryType || i.inventory_type || i.inventoryType || "Marketplace",
+          clientId: i.item?.clientId || i.client_id || i.clientId || null,
+          clientName: i.item?.client?.companyName || i.client_name || i.clientName || "",
+          vendor_id: i.vendor_id ?? i.vendorId ?? null,
+          vendorName: i.vendor_name || i.vendorName || i.vendor || "",
+          category: canonicalMarketplaceCategory(
+            i.item?.category?.name || i.category?.name || i.category || ""
+          ),
+          sku: i.item?.sku || i.sku || "",
+          price: parseFloat(i.item?.price || i.price || 0) || 0,
+          description: i.item?.description || i.description || "",
+          status: i.quantity <= 0 ? "Critical" : (i.status || "Normal"),
+        };
+      });
+
+      stockMapped.forEach(sItem => {
+        if (!inventoryData.some(existing => existing.id === sItem.id || existing.name?.toLowerCase() === sItem.name?.toLowerCase())) {
+          inventoryData.push(sItem);
+        }
+      });
+    }
+
+    if (inventoryData.length === 0) {
+      try {
+        const res2 = await api.get("/inventory");
+        const data = res2.data?.success ? res2.data.data : (Array.isArray(res2.data) ? res2.data : []);
+        inventoryData = data.map((i) => ({
+          ...i,
+          image: inventoryImageFromApiRow(i) || "",
+          qty: i.quantity ?? i.qty ?? 0,
+          location: i.warehouse_name || i.location || "",
+          inventoryType: i.inventory_type || i.inventoryType || "Marketplace",
+          clientId: i.client_id || i.clientId || null,
+          clientName: i.client_name || i.clientName || "",
+          vendor_id: i.vendor_id ?? i.vendorId ?? null,
+          vendorName: i.vendor_name || i.vendorName || i.vendor || "",
+          category: canonicalMarketplaceCategory(i.category),
+          price: parseFloat(i.price || 0) || 0,
+          description: i.description || "",
+          status: i.status || "Normal",
+        }));
+      } catch (e) {
+        console.error("Fetch /inventory fallback failed, using default mock data", e);
+        inventoryData = INVENTORY;
+      }
+    }
+
+    const rawRole = typeof currentUser?.role === 'string'
+      ? currentUser.role
+      : (currentUser?.role?.name || currentUser?.roleName || '');
+    const normRole = rawRole.toLowerCase().replace(/[-\s]/g, '_');
+    const isSaasUser = (currentUser?.tenantId && Number(currentUser.tenantId) !== 1)
+      || normRole === 'saas_client'
+      || normRole === 'saas_admin'
+      || (currentUser?.company_id && (clients || []).some(c => String(c.id) === String(currentUser.company_id) && (c.clientType === 'SaaS' || c.client_type === 'SaaS')));
+
+    if (!isSaasUser) {
+      try {
+        let savedBulk = [];
+        try {
+          savedBulk = JSON.parse(localStorage.getItem('bulk_uploaded_marketplace_items') || '[]');
+        } catch {
+          savedBulk = [];
+        }
+        // Filter out any seed items that start with 'bulk-seed-'
+        if (Array.isArray(savedBulk)) {
+          savedBulk = savedBulk.filter(bItem => !String(bItem.id || bItem.itemId || '').startsWith('bulk-seed-'));
+        } else {
+          savedBulk = [];
+        }
+
+        // Filter out deleted items from savedBulk
+        try {
+          const deletedRaw = JSON.parse(localStorage.getItem('deleted_inventory_item_ids') || '[]');
+          if (Array.isArray(deletedRaw) && deletedRaw.length > 0) {
+            const deletedSet = new Set(deletedRaw.map(x => String(x).toLowerCase().trim()));
+            savedBulk = savedBulk.filter(bItem => {
+              const idStr = String(bItem.id ?? bItem.itemId ?? '').trim().toLowerCase();
+              const nameStr = `name:${(bItem.name || bItem.item || '').trim().toLowerCase()}`;
+              return !(idStr && deletedSet.has(idStr)) && !(nameStr && deletedSet.has(nameStr));
+            });
+          }
+        } catch { }
+
+        if (Array.isArray(savedBulk) && savedBulk.length > 0) {
+          savedBulk.forEach(bItem => {
+            const matchIdx = inventoryData.findIndex(existing => String(existing.id) === String(bItem.id) || (existing.name || '').toLowerCase() === (bItem.name || '').toLowerCase());
+            const formattedBulkItem = {
+              ...bItem,
+              id: bItem.id || bItem.itemId,
+              itemId: bItem.id || bItem.itemId,
+              qty: Number(bItem.qty || bItem.quantity || 1),
+              quantity: Number(bItem.qty || bItem.quantity || 1),
+              price: Number(bItem.price || 0),
+              unitPrice: Number(bItem.price || 0),
+              unit_price: Number(bItem.price || 0),
+              image: bItem.image || bItem.image_url || bItem.imageUrl || '',
+              image_url: bItem.image || bItem.image_url || bItem.imageUrl || '',
+              store: bItem.store || bItem.vendorName || "Solomon's Fresh Market",
+              vendorName: bItem.store || bItem.vendorName || "Solomon's Fresh Market",
+              vendor_name: bItem.store || bItem.vendorName || "Solomon's Fresh Market",
+              vendor_group_key: bItem.vendor_group_key || `name:${(bItem.store || bItem.vendorName || '').toLowerCase()}`,
+              category: canonicalMarketplaceCategory(bItem.category || 'Grocery'),
+              location: bItem.warehouse || bItem.location || 'General Storage',
+              warehouse_name: bItem.warehouse || bItem.location || 'General Storage',
+              inventoryType: 'Marketplace',
+              type: 'Marketplace',
+              status: bItem.status || 'Normal',
+            };
+            if (matchIdx >= 0) {
+              inventoryData[matchIdx] = { ...inventoryData[matchIdx], ...formattedBulkItem };
+            } else {
+              inventoryData.unshift(formattedBulkItem);
+            }
+          });
+        }
+      } catch (e) {
+        console.warn('Failed parsing bulk_uploaded_marketplace_items in fetchInventory', e);
+      }
+    }
+
+    // Filter out decommissioned/deleted items from inventoryData
+    try {
+      const deletedRaw = JSON.parse(localStorage.getItem('deleted_inventory_item_ids') || '[]');
+      if (Array.isArray(deletedRaw) && deletedRaw.length > 0) {
+        const deletedSet = new Set(deletedRaw.map(x => String(x).toLowerCase().trim()));
+        inventoryData = inventoryData.filter(i => {
+          const idStr = String(i.id ?? i.itemId ?? '').trim().toLowerCase();
+          const nameStr = `name:${(i.name || i.item || '').trim().toLowerCase()}`;
+          if (idStr && deletedSet.has(idStr)) return false;
+          if (nameStr && deletedSet.has(nameStr)) return false;
+          return true;
+        });
+      }
+    } catch (delErr) {
+      console.warn('Failed filtering deleted_inventory_item_ids in fetchInventory', delErr);
+    }
+
+    setInventory(inventoryData);
+  }, [currentUser?.role, currentUser?.tenantId, currentUser?.company_id, clients]);
+
+  const fetchStockMovements = React.useCallback(async () => {
+    try {
+      const res = await api.get("/stock/movements");
+      const movementsData = res.data?.success ? (res.data.data?.movements || res.data.data) : [];
+      if (Array.isArray(movementsData)) {
+        setStockMovements(
+          movementsData.map((m) => {
+            let typeLabel = "ADJUSTMENT";
+            const mType = String(m.movementType || '').toUpperCase();
+            const rType = String(m.referenceType || '').toUpperCase();
+
+            if (rType === 'LOSS' || mType === 'LOSS' || rType === 'ASSET_LOSS' || mType === 'ASSET_LOSS') {
+              typeLabel = 'ASSET_LOSS';
+            } else if (mType === 'IN' || rType === 'GRN') {
+              typeLabel = 'STOCK_ENTRY';
+            } else if (mType === 'OUT' || rType === 'TRANSFER_OUT') {
+              typeLabel = 'STOCK_ISSUE';
+            }
+
+            return {
+              id: m.id,
+              item: m.item?.name || m.item_name || "Deleted Asset",
+              type: typeLabel,
+              quantity: m.quantity,
+              reason: m.remarks || m.reason || "Routine Adjustment",
+              issuedBy: m.performerName || m.performed_by_name || "System User",
+              date: (m.createdAt || m.created_at || new Date().toISOString()).split("T")[0],
+              time: (m.createdAt || m.created_at || "").split("T")[1]?.slice(0, 5) || "",
+              referenceType: m.referenceType,
+              movementType: m.movementType,
+              remarks: m.remarks
+            };
+          }),
+        );
+      }
+    } catch (e) {
+      console.error("Fetch stock movements failed", e);
+    }
+  }, []);
+
+  const fetchLossAssessments = React.useCallback(async () => {
+    try {
+      const res = await api.get("/inventory/loss");
+      const lossesData = res.data?.success ? (res.data.data?.losses || res.data.data) : [];
+      if (Array.isArray(lossesData)) {
+        setLossAssessments(
+          lossesData.map((l) => ({
+            id: l.id,
+            item: l.item?.name || l.item_name || "Deleted Asset",
+            quantity: l.quantity,
+            lossType: l.lossType,
+            explanation: l.explanation,
+            reportedBy: l.reportedBy,
+            status: l.investigationStatus || "Pending",
+            evidenceUrl: l.evidenceUrl || "",
+            date: (l.createdAt || new Date().toISOString()).split("T")[0],
+            time: (l.createdAt || "").split("T")[1]?.slice(0, 5) || "",
+            financialLoss: (parseFloat(l.item?.price || 0) * parseFloat(l.quantity || 0))
+          })),
+        );
+      }
+    } catch (e) {
+      console.error("Fetch loss assessments failed", e);
+    }
+  }, []);
+
+  const fetchAccessPlans = React.useCallback(async () => {
+    try {
+      const token = localStorage.getItem("token");
+      const url = token ? "/plans" : "/plans/public";
+      const res = await api.get(url);
+      let rawData = res.data?.success
+        ? res.data.data
+        : Array.isArray(res.data)
+          ? res.data
+          : [];
+      if (rawData && !Array.isArray(rawData) && typeof rawData === 'object') {
+        rawData = rawData.data || rawData.items || rawData.orders || rawData.missions || rawData.invoices || rawData.projects || Object.values(rawData).find(Array.isArray) || [];
+      }
+      if (!Array.isArray(rawData) || rawData.length === 0) {
+        setAccessPlans([]);
+        return;
+      }
+      const mapped = rawData.map((row) => {
+        let featureObj = {};
+        if (row.features != null) {
+          try {
+            featureObj = typeof row.features === "string" ? JSON.parse(row.features) : row.features;
+          } catch {
+            featureObj = {};
+          }
+        }
+
+        let featureList = [];
+        let tier = row.billingCycle || row.billing_cycle || "Monthly";
+        let yearlyPriceNum = 0;
+        let commitment = `${tier} subscription.`;
+
+        if (Array.isArray(featureObj)) {
+          featureList = featureObj;
+        } else if (featureObj && typeof featureObj === 'object') {
+          featureList = featureObj.list || [];
+          if (featureObj.tier) tier = featureObj.tier;
+          if (featureObj.yearlyPrice) yearlyPriceNum = parseFloat(featureObj.yearlyPrice);
+          if (featureObj.commitment) commitment = featureObj.commitment;
+        }
+
+        const priceNum = parseFloat(row.price || 0);
+        const cycle = row.billing_cycle || row.billingCycle || "Monthly";
+        const isAnnual = String(cycle).toLowerCase() === "annually" || String(cycle).toLowerCase() === "yearly";
+
+        if (!yearlyPriceNum) {
+          yearlyPriceNum = isAnnual ? priceNum : Math.round(priceNum * 12 * 0.8);
+        }
+
+        return {
+          id: row.id,
+          name: row.name,
+          tier: tier,
+          planType: featureObj?.planType || row.planType || row.category || (String(row.name || '').toLowerCase().includes('personal') ? 'Personal' : 'SaaS'),
+          price: `$${priceNum.toLocaleString(undefined, { minimumFractionDigits: priceNum % 1 ? 2 : 0, maximumFractionDigits: 2 })}`,
+          period: isAnnual ? "per year" : "per month",
+          yearlyPrice: `$${yearlyPriceNum.toLocaleString(undefined, { minimumFractionDigits: yearlyPriceNum % 1 ? 2 : 0, maximumFractionDigits: 2 })}`,
+          description: row.description || "",
+          features: featureList,
+          commitment: commitment,
+          billing_cycle: cycle,
+          max_users: row.maxUsers || row.max_orders,
+          max_orders: row.maxOrders || row.max_orders,
+          status: row.isActive ? "Active" : row.status || "Inactive",
+        };
+      }).filter(p => p && !String(p.name || '').toLowerCase().includes('gold') && !String(p.tier || '').toLowerCase().includes('gold'));
+      setAccessPlans(mapped);
+    } catch (e) {
+      console.error("Fetch access plans failed", e);
+      setAccessPlans([]);
+    }
+  }, []);
+
+  const fetchSubscriptionRequests = React.useCallback(async (operationId) => {
+    try {
+      // The backend /api/saas/requests already filters by logged-in user if role is operations
+      const res = await api.get("/saas/requests");
+      let rawData = res.data?.success
+        ? res.data.data
+        : Array.isArray(res.data)
+          ? res.data
+          : [];
+      if (rawData && !Array.isArray(rawData) && typeof rawData === 'object') {
+        rawData = rawData.data || rawData.items || rawData.orders || rawData.missions || rawData.invoices || rawData.projects || Object.values(rawData).find(Array.isArray) || [];
+      }
+      setSubscriptionRequests(rawData);
+    } catch (e) {
+      console.error("Fetch subscription requests failed", e);
+    }
+  }, []);
+
+  const fetchLeaveRequests = React.useCallback(async () => {
+    try {
+      const res = await api.get("/staff/leave");
+      if (res.data?.success) {
+        setLeaveRequests(res.data.data);
+      }
+    } catch (error) {
+      console.error("Fetch leave requests failed", error);
+    }
+  }, []);
+
+  const fetchStaff = React.useCallback(async (filters = {}) => {
+    try {
+      const params = { limit: 1000 };
+      if (filters?.status) params.status = String(filters.status).toLowerCase();
+      if (filters?.search) params.search = String(filters.search).trim();
+      const res = await api.get("/users", { params });
+      if (res.data?.success) {
+        let rawUsers = Array.isArray(res.data.data) ? res.data.data : (res.data.data?.users || []);
+        let list = rawUsers.map((u) => normalizeUserForUi(u));
+
+        // Fallback filtering in case backend doesn't yet support these query params.
+        if (filters?.status) {
+          const want = String(filters.status).toLowerCase();
+          list = list.filter(
+            (u) => String(u?.status || "").toLowerCase() === want,
+          );
+        }
+        if (filters?.search) {
+          const q = String(filters.search).toLowerCase();
+          list = list.filter(
+            (u) =>
+              String(u?.name || "")
+                .toLowerCase()
+                .includes(q) ||
+              String(u?.email || "")
+                .toLowerCase()
+                .includes(q),
+          );
+        }
+
+        setUsers(list);
+        return list;
+      }
+    } catch (e) {
+      console.error("Fetch staff failed", e);
+      setUsers([]);
+    }
+    return null;
+  }, []);
+
+  const [customerUsers, setCustomerUsers] = React.useState([]);
+  const fetchCustomerUsers = React.useCallback(async (options = {}) => {
+    try {
+      const params = new URLSearchParams();
+      params.append("include_all", "1");
+      params.append("include_client_role", "1");
+      if (options.search) params.append("search", options.search);
+      const url = `/users/customers?${params.toString()}`;
+      const res = await api.get(url);
+      if (res.data?.success) {
+        const usersArray = Array.isArray(res.data.data) ? res.data.data : (res.data.data?.users || []);
+        setCustomerUsers(usersArray);
+        return usersArray;
+      }
+    } catch (e) {
+      console.error("Fetch customer users failed", e);
+    }
+    return [];
+  }, []);
+
+  const fetchFleet = React.useCallback(async () => {
+    try {
+      const res = await api.get("/vehicles");
+      if (res.data && res.data.success) {
+        setFleet(
+          res.data.data.map((v) => ({
+            id: v.vehicleId,
+            db_id: v.id,
+            type: v.type,
+            model: v.model,
+            fuel: v.fuel || '100%',
+            status: v.status || 'Active',
+            capacity: v.capacity,
+            location: v.location,
+            insurancePolicy: v.insurancePolicy,
+            registrationExpiry: v.registrationExpiry || '',
+            inspectionDate: v.inspectionDate || '',
+            diagnosticStatus: v.diagnosticStatus,
+          }))
+        );
+      }
+    } catch (e) {
+      console.error("Fetch fleet failed", e);
+    }
+  }, []);
+
+  const fetchDeliveries = React.useCallback(async () => {
+    try {
+      const [resLogistics, resChauffeur] = await Promise.all([
+        api.get("/deliveries"),
+        api.get("/orders", { params: { orderType: 'CHAUFFEUR', limit: 100 } })
+      ]);
+
+      const combined = [];
+
+      const logisticsRaw = resLogistics.data?.data;
+      const logisticsArr = Array.isArray(logisticsRaw)
+        ? logisticsRaw
+        : Array.isArray(logisticsRaw?.deliveries)
+          ? logisticsRaw.deliveries
+          : Array.isArray(logisticsRaw?.data)
+            ? logisticsRaw.data
+            : [];
+
+      if (logisticsArr.length > 0 || (resLogistics.data && resLogistics.data.success)) {
+        combined.push(...logisticsArr.map((d) => {
+          // Real DB uses camelCase; mock API uses snake_case. Support both.
+          const dbItems = Array.isArray(d.items) ? d.items : [];
+          let items = [];
+          if (dbItems.length > 0) {
+            // Real DB response: d.items = [{ item: { name: '...' }, quantity: N, itemId: N }]
+            items = dbItems.map(di => ({
+              name: di.item?.name || di.name || 'Item',
+              qty: di.quantity,
+              quantity: di.quantity,
+              itemId: di.itemId,
+            }));
+          } else if (d.package_details) {
+            try { items = JSON.parse(d.package_details); } catch { items = []; }
+          }
+          if (!Array.isArray(items)) items = [];
+
+          const transportMode = extractTransportModeFromOrder(d);
+          // Support both real DB (orderId) and mock (order_id)
+          const rawOrderId = d.orderId ?? d.order_id ?? null;
+          const orderRef = d.order?.orderNumber || (rawOrderId ? `ORD-${String(rawOrderId).padStart(3, "0")}` : null);
+          const rawClientId = d.clientId ?? d.client_id ?? d.customer_id ?? null;
+          const rawMissionType = d.missionType ?? d.mission_type ?? null;
+          const rawDriverName = d.driverName ?? d.driver_name ?? (d.assignee ? `${d.assignee.firstName || ''} ${d.assignee.lastName || ''}`.trim() : null) ?? d.driver ?? null;
+          const rawPlate = d.plateNumber ?? d.plate_number ?? d.vehicleRef ?? d.vehicle_ref ?? null;
+          const rawPickup = d.pickupLocation ?? d.pickup_location ?? null;
+          const rawDrop = d.dropLocation ?? d.drop_location ?? null;
+          const rawRoute = d.route ?? null;
+          const rawEta = d.etaSchedule ?? d.delivery_date ?? null;
+          const rawFee = d.deliveryFee ?? d.delivery_fee ?? d.total_amount ?? d.amount ?? 0;
+          const rawDriverId = d.driverId ?? d.assigned_driver ?? d.driver_id ?? d.assigned_to ?? d.assignedTo ?? d.assignee?.userId ?? null;
+
+          return {
+            id: `DEL-${String(d.id).padStart(3, "0")}`,
+            db_id: d.id,
+            deliveryNumber: d.deliveryNumber || `DEL-${String(d.id).padStart(3, "0")}`,
+            orderId: orderRef,
+            order_id_raw: rawOrderId,
+            tenantId: d.tenantId ?? d.tenant_id ?? d.companyId ?? d.company_id ?? 1,
+            company_id: d.companyId ?? d.company_id ?? d.tenantId ?? d.tenant_id ?? null,
+            client_id: rawClientId,
+            customer_id: d.customerId ?? d.customer_id ?? null,
+            clientId: rawClientId,
+            client: formatClientDisplayName(d, clients, [...(users || []), ...(customerUsers || [])]),
+            clientName: formatClientDisplayName(d, clients, [...(users || []), ...(customerUsers || [])]),
+            mission_type: rawMissionType,
+            item: items.length > 0
+              ? items[0].name
+              : rawMissionType === "Chauffeur"
+                ? "VIP Chauffeur Service"
+                : orderRef
+                  ? `Order ${orderRef}`
+                  : "Internal Mission",
+            items: items,
+            package_details: d.package_details,
+            order_instructions: d.orderInstructions ?? d.order_instructions ?? null,
+            status: d.status,
+            driverId: rawDriverId,
+            assigned_driver: rawDriverId,
+            assignedTo: d.assignedTo ?? d.assigned_to ?? rawDriverId,
+            driver: rawDriverName,
+            driverName: rawDriverName,
+            vehicleId: rawPlate,
+            vehicle: rawPlate,
+            vehicleRef: rawPlate,
+            plateNumber: rawPlate,
+            pickupLocation: rawPickup,
+            drop_location: rawDrop,
+            dropLocation: rawDrop,
+            warehouseId: d.warehouseId ?? d.warehouse_id ?? null,
+            warehouse: d.warehouse?.name ?? d.warehouse_name ?? null,
+            route: rawRoute,
+            location: rawDrop || rawRoute || rawPickup || "In Transit",
+            mode: rawMissionType === "Chauffeur" ? "Road" : transportMode,
+            deliveryDate: rawEta ? rawEta.split("T")[0] : null,
+            eta: rawEta ? rawEta.split("T")[0] : "TBD",
+            delivery_instructions: d.deliveryInstructions ?? d.delivery_instructions ?? d.order_instructions ?? d.order_notes ?? "",
+            delivery_fee: parseFloat(rawFee) || 0,
+            route_distance: d.routeDistance != null ? parseFloat(d.routeDistance) : (d.route_distance != null ? parseFloat(d.route_distance) : null),
+            staff_pay_rate: d.staffPayRate != null ? parseFloat(d.staffPayRate) : (d.staff_pay_rate != null ? parseFloat(d.staff_pay_rate) : null),
+            clientConfirmed: !!(d.signature),
+            signature: d.signature,
+            payout_status: (d.status === 'delivered' || d.status === 'Delivered') ? 'held' : null,
+            payout_ready_at: (d.status === 'delivered' || d.status === 'Delivered') ? new Date(new Date(d.updatedAt || Date.now()).getTime() + 48 * 60 * 60 * 1000).toISOString() : null,
+          };
+        }));
+      }
+
+      if (resChauffeur.data && resChauffeur.data.success) {
+        const chauffeurOrders = Array.isArray(resChauffeur.data.data)
+          ? resChauffeur.data.data
+          : (resChauffeur.data.data?.orders || []);
+
+        chauffeurOrders.forEach((order) => {
+          let meta = order.metadata;
+          if (typeof meta === 'string') {
+            try { meta = JSON.parse(meta); } catch { meta = {}; }
+          }
+          meta = meta || {};
+          const customItem = meta.customItems?.[0] || meta.custom_items?.[0] || {};
+          const orderItem = order.items?.[0] || {};
+          const detail = { ...orderItem, ...meta, ...customItem };
+
+          const compId = order.companyId ?? order.company_id ?? order.clientId ?? order.client_id ?? detail.companyId ?? detail.company_id ?? detail.clientId ?? null;
+          const usrId = order.createdById ?? order.created_by ?? order.userId ?? order.user_id ?? detail.userId ?? detail.created_by ?? null;
+
+          const resolvedPickup =
+            order.pickup_location ||
+            order.pickupLocation ||
+            meta.pickup_location ||
+            meta.pickupLocation ||
+            customItem.pickupLocation ||
+            customItem.pickup_location ||
+            detail.pickupLocation ||
+            detail.pickup_location ||
+            '';
+
+          const resolvedDrop =
+            order.location ||
+            order.delivery_address ||
+            order.deliveryAddress ||
+            order.dropLocation ||
+            order.drop_location ||
+            meta.location ||
+            meta.delivery_address ||
+            meta.deliveryAddress ||
+            meta.dropLocation ||
+            meta.drop_location ||
+            customItem.dropLocation ||
+            customItem.drop_location ||
+            customItem.location ||
+            detail.dropLocation ||
+            detail.drop_location ||
+            detail.location ||
+            '';
+
+          const resolvedVehicle =
+            order.plateNumber ||
+            order.vehicleId ||
+            order.vehicle ||
+            order.vehicleRef ||
+            meta.plateNumber ||
+            meta.vehicleId ||
+            meta.vehicle ||
+            meta.vehicleRef ||
+            customItem.plateNumber ||
+            customItem.vehicleId ||
+            customItem.vehicle ||
+            detail.plateNumber ||
+            detail.vehicleId ||
+            '';
+
+          const resolvedDriverName =
+            order.driverName ||
+            order.driver ||
+            meta.driverName ||
+            meta.driver ||
+            customItem.driverName ||
+            customItem.driver ||
+            detail.driverName ||
+            detail.driver ||
+            '';
+
+          const resolvedDriverId =
+            order.driver_user_id ||
+            order.driverId ||
+            meta.driver_user_id ||
+            meta.driverId ||
+            customItem.driver_user_id ||
+            customItem.driverId ||
+            detail.driver_user_id ||
+            detail.driverId ||
+            null;
+
+          const resolvedFee = parseFloat(
+            customItem.chauffeurFee ||
+            customItem.chauffeur_fee ||
+            meta.chauffeurFee ||
+            meta.chauffeur_fee ||
+            order.totalAmount ||
+            order.total ||
+            detail.chauffeurFee ||
+            detail.chauffeur_fee ||
+            120
+          ) || 120;
+
+          const chauffeurObj = {
+            id: `CH-ORD-${String(order.id).padStart(3, "0")}`,
+            db_id: order.id,
+            orderId: order.orderNumber || `ORD-${String(order.id).padStart(3, "0")}`,
+            orderNumber: order.orderNumber || `ORD-${String(order.id).padStart(3, "0")}`,
+            order_id_raw: order.id,
+            company_id: compId,
+            companyId: compId,
+            client_id: order.clientId ?? order.client_id ?? detail.clientId ?? null,
+            customer_id: order.customerId ?? order.customer_id ?? usrId,
+            clientId: order.clientId ?? order.client_id ?? detail.clientId ?? null,
+            created_by: usrId,
+            user_id: usrId,
+            userId: usrId,
+            client: formatClientDisplayName(order, clients, users),
+            clientName: formatClientDisplayName(order, clients, users),
+            mission_type: "Chauffeur",
+            missionType: "Chauffeur",
+            orderType: "CHAUFFEUR",
+            isDirectChauffeurOrder: true,
+            item: "VIP Chauffeur Service",
+            items: [{ name: "VIP Chauffeur Service", qty: 1 }],
+            package_details: JSON.stringify(detail),
+            order_instructions: detail.instructions || null,
+            status: order.status,
+            chauffeur_status: order.status,
+            driverId: resolvedDriverId,
+            driver_user_id: resolvedDriverId,
+            driver: resolvedDriverName,
+            driverName: resolvedDriverName,
+            vehicleId: resolvedVehicle,
+            vehicle: resolvedVehicle,
+            plateNumber: resolvedVehicle,
+            pickupLocation: resolvedPickup || "Pickup Point",
+            drop_location: resolvedDrop || "Destination",
+            dropLocation: resolvedDrop || "Destination",
+            route: detail.route || "",
+            location: resolvedDrop || "Destination",
+            mode: "Road",
+            deliveryDate: detail.eta || detail.dueDate || null,
+            dueDate: detail.eta || detail.dueDate || null,
+            pickupTime: detail.pickupTime || null,
+            eta: detail.eta || detail.dueDate || "TBD",
+            delivery_instructions: detail.delivery_instructions || "",
+            delivery_fee: resolvedFee,
+            chauffeurFee: resolvedFee,
+            chauffeur_fee: resolvedFee,
+            numberOfPassengers: detail.numberOfPassengers || detail.passengers || 1,
+            passengerName: detail.passengerName || detail.guestName || formatClientDisplayName(order, clients, users),
+            luggage: detail.luggage || "No",
+            bags: detail.bags || 0,
+            stops: detail.stops || "No",
+            stopLocations: detail.stopLocations || "",
+            amenities: detail.amenities || [],
+            serviceType: detail.serviceType || "One Way",
+            route_distance: null,
+            staff_pay_rate: null,
+            clientConfirmed: false,
+            signature: null,
+            payout_status: (order.status === 'Delivered' || order.status === 'Completed' || order.status === 'completed') ? 'held' : null,
+            payout_ready_at: (order.status === 'Delivered' || order.status === 'Completed' || order.status === 'completed') ? new Date(new Date(order.updatedAt || Date.now()).getTime() + 48 * 60 * 60 * 1000).toISOString() : null,
+            remarks: JSON.stringify(detail)
+          };
+
+          // Find if this order is already in combined (from deliveries table)
+          const existingIdx = combined.findIndex(ex => {
+            const exRawId = String(ex.order_id_raw || '').trim();
+            const exOrdNum = String(ex.orderId || ex.orderNumber || '').trim().toLowerCase();
+            const ordNum = String(order.orderNumber || '').trim().toLowerCase();
+            const ordIdStr = String(order.id).trim();
+            return (exRawId && ordIdStr && exRawId === ordIdStr) ||
+                   (ordNum && exOrdNum && (ordNum === exOrdNum || exOrdNum.endsWith(ordIdStr) || ordNum.endsWith(exRawId)));
+          });
+
+          if (existingIdx !== -1) {
+            // Deduplicate: merge onto existing entry without duplicating
+            combined[existingIdx] = {
+              ...chauffeurObj,
+              ...combined[existingIdx],
+              status: order.status || combined[existingIdx].status,
+              chauffeur_status: order.status || combined[existingIdx].chauffeur_status,
+              orderId: order.orderNumber || combined[existingIdx].orderId,
+              orderNumber: order.orderNumber || combined[existingIdx].orderNumber,
+              order_id_raw: order.id,
+              driverName: resolvedDriverName || combined[existingIdx].driverName,
+              driver: resolvedDriverName || combined[existingIdx].driver,
+              driverId: resolvedDriverId || combined[existingIdx].driverId,
+              driver_user_id: resolvedDriverId || combined[existingIdx].driver_user_id,
+              vehicle: resolvedVehicle || combined[existingIdx].vehicle,
+              vehicleId: resolvedVehicle || combined[existingIdx].vehicleId,
+              plateNumber: resolvedVehicle || combined[existingIdx].plateNumber,
+              pickupLocation: resolvedPickup || combined[existingIdx].pickupLocation,
+              dropLocation: resolvedDrop || combined[existingIdx].dropLocation
+            };
+          } else {
+            combined.push(chauffeurObj);
+          }
+        });
+      }
+
+      setDeliveries(combined);
+    } catch (e) {
+      console.error("Fetch deliveries failed", e);
+    }
+  }, []);
+
+  const parsePOItems = (raw) => {
+    let items = raw;
+    if (typeof items === "string") {
+      try {
+        items = JSON.parse(items);
+      } catch {
+        items = [];
+      }
+    }
+    if (!Array.isArray(items)) return [];
+    return items.map((item, idx) => {
+      const orderedQty = item.orderedQty ?? item.quantity ?? item.qty ?? 0;
+      const price = item.price ?? item.unit_price ?? item.unitPrice ?? 0;
+      const receivedQty = item.receivedQty ?? item.received_qty ?? 0;
+      const pendingReceiveQty = item.pending_receive_qty ?? 0;
+      return {
+        ...item,
+        id: item.id ?? idx,
+        orderedQty,
+        price,
+        receivedQty,
+        pending_receive_qty: pendingReceiveQty,
+        pendingQty: Math.max(0, orderedQty - receivedQty - pendingReceiveQty),
+      };
+    });
+  };
+
+  const mapPurchaseRequest = React.useCallback((r) => {
+    let parsedItems = r.items;
+    if (typeof parsedItems === "string") {
+      try {
+        parsedItems = JSON.parse(parsedItems);
+      } catch {
+        parsedItems = [];
+      }
+    }
+    const itemsArray = (() => {
+      if (Array.isArray(parsedItems) && parsedItems.length) return parsedItems;
+      if (r.item_name) {
+        return [
+          {
+            name: r.item_name,
+            category: r.category || "",
+            qty: r.quantity ?? 0,
+            price: parseFloat(r.estimated_cost) || 0,
+          },
+        ];
+      }
+      return [];
+    })();
+
+    const mappedItems = itemsArray.map((item, idx) => ({
+      ...item,
+      name: item.name || r.item_name || "",
+      qty: item.qty ?? item.quantity ?? r.quantity ?? 1,
+      price: parseFloat(item.price ?? item.estimated_cost ?? r.estimated_cost ?? 0),
+    }));
+
+    const computedTotal = mappedItems.reduce((acc, item) => acc + (item.price * item.qty), 0);
+    const finalTotal = parseFloat(r.estimated_cost || r.total || computedTotal || 0);
+
+    return {
+      ...r,
+      requestId: r.request_id ?? r.requestId ?? (r.id ? `REQ-${r.id}` : `REQ-${Date.now()}`),
+      id: r.id ?? r.request_id ?? r.requestId,
+      items: mappedItems,
+      item: r.item_name || (mappedItems[0]?.name || ""),
+      total: finalTotal,
+      date: r.created_at || r.date,
+    };
+  }, []);
+
+  const fetchProcurement = React.useCallback(async () => {
+    try {
+      const [reqs, quotes, pos] = await Promise.all([
+        api.get("/purchase-requests").catch((e) => ({ data: [] })),
+        api.get("/quotations").catch((e) => ({ data: [] })),
+        api.get("/purchase-orders").catch((e) => ({ data: [] })),
+      ]);
+      if (reqs.data?.success || Array.isArray(reqs.data?.data) || Array.isArray(reqs.data?.data?.purchaseRequests)) {
+        const reqData = Array.isArray(reqs.data?.data) ? reqs.data.data : (reqs.data?.data?.purchaseRequests || []);
+        setPurchaseRequests(reqData.map(mapPurchaseRequest));
+      }
+      if (quotes.data?.success || Array.isArray(quotes.data?.data) || Array.isArray(quotes.data?.data?.quotations)) {
+        const quoteData = Array.isArray(quotes.data?.data) ? quotes.data.data : (quotes.data?.data?.quotations || []);
+        setQuotes(
+          quoteData.map((q) => {
+            const vName = typeof q.vendor === 'object' && q.vendor !== null
+              ? (q.vendor.companyName || q.vendor.business_name || q.vendor.name || q.vendor.vendor_name || '')
+              : (q.vendor_name || (typeof q.vendorName === 'string' ? q.vendorName : '') || (typeof q.vendor === 'string' ? q.vendor : ''));
+            return {
+              ...q,
+              vendorId: q.vendor_id ?? q.vendorId ?? null,
+              vendor: vName,
+              vendorName: vName,
+              date: q.created_at || q.date,
+              total: parseFloat(q.amount || q.totalAmount || q.total_amount || q.total || 0),
+              validity: q.validity_date || q.validity,
+            };
+          })
+        );
+      }
+      if (pos.data?.success || Array.isArray(pos.data?.data) || Array.isArray(pos.data?.data?.purchaseOrders)) {
+        const poData = Array.isArray(pos.data?.data) ? pos.data.data : (pos.data?.data?.purchaseOrders || []);
+        setPurchaseOrders(
+          poData.map((po) => {
+            const vName = typeof po.vendor === 'object' && po.vendor !== null
+              ? (po.vendor.companyName || po.vendor.business_name || po.vendor.name || po.vendor.vendor_name || 'Vendor')
+              : (po.vendor_name || (typeof po.vendorName === 'string' ? po.vendorName : '') || (typeof po.vendor === 'string' ? po.vendor : 'Vendor'));
+            return {
+              ...po,
+              vendorId: po.vendor_id ?? po.vendorId ?? null,
+              vendor: vName,
+              vendorName: vName,
+              date: po.created_at || po.date,
+              total: parseFloat(po.amount || po.totalAmount || po.total_amount || po.total || 0),
+            };
+          })
+        );
+      }
+    } catch (e) {
+      console.error("fetchProcurement error", e);
+    }
+  }, [mapPurchaseRequest]);
+
+  const fetchQuotes = React.useCallback(async (params = {}) => {
+    try {
+      const res = await api.get("/quotations", { params });
+      if (res.data?.success) {
+        const quoteList = Array.isArray(res.data.data)
+          ? res.data.data
+          : (res.data.data?.quotations || []);
+        setQuotes(
+          quoteList.map((q) => {
+            const vName = typeof q.vendor === 'object' && q.vendor !== null
+              ? (q.vendor.companyName || q.vendor.business_name || q.vendor.name || q.vendor.vendor_name || '')
+              : (q.vendor_name || (typeof q.vendorName === 'string' ? q.vendorName : '') || (typeof q.vendor === 'string' ? q.vendor : ''));
+            return {
+              ...q,
+              vendorId: q.vendor_id ?? q.vendorId ?? null,
+              vendor: vName,
+              vendorName: vName,
+              date: q.created_at || q.createdAt || q.date,
+              total: parseFloat(q.amount || q.total_amount || q.total || 0),
+              validity: q.validity_date || q.validity,
+            };
+          }),
+        );
+      }
+    } catch (e) {
+      console.error("Fetch quotes failed", e);
+    }
+  }, []);
+
+  const fetchPurchaseRequests = React.useCallback(async (params = {}) => {
+    try {
+      const res = await api.get("/purchase-requests", { params });
+      if (res.data?.success) {
+        const data = res.data.data;
+        const list = Array.isArray(data) ? data : (data?.purchaseRequests || []);
+        setPurchaseRequests(list.map(mapPurchaseRequest));
+      }
+    } catch (e) {
+      console.error("Fetch purchase requests failed", e);
+    }
+  }, [mapPurchaseRequest]);
+
+  const fetchPurchaseOrders = React.useCallback(async (params = {}) => {
+    try {
+      const res = await api.get("/purchase-orders", { params });
+      if (res.data?.success) {
+        const data = res.data.data;
+        const list = Array.isArray(data) ? data : (data?.purchaseOrders || []);
+        setPurchaseOrders(
+          list.map((po) => ({
+            ...po,
+            vendorName: po.vendor?.companyName || po.vendor_name || po.vendorName,
+            date: po.createdAt || po.created_at || po.date,
+            total: parseFloat(po.totalAmount || po.total_amount || po.total || 0),
+            paymentTerms: po.payment_terms || po.paymentTerms,
+            items: parsePOItems(po.items),
+          })),
+        );
+      }
+    } catch (e) {
+      console.error("Fetch purchase orders failed", e);
+    }
+  }, []);
+
+  const fetchOrders = React.useCallback(async () => {
+    try {
+      const res = await api.get("/orders", { params: { limit: 500 } });
+      let rawData = res.data?.success
+        ? res.data.data
+        : Array.isArray(res.data)
+          ? res.data
+          : [];
+      if (rawData && !Array.isArray(rawData) && typeof rawData === 'object') {
+        rawData = rawData.data || rawData.items || rawData.orders || rawData.missions || rawData.invoices || rawData.projects || Object.values(rawData).find(Array.isArray) || [];
+      }
+      const mappedOrders = rawData.map((o) => {
+        let meta = {};
+        if (typeof o.metadata === "string") {
+          try { meta = JSON.parse(o.metadata); } catch (e) { }
+        } else if (o.metadata && typeof o.metadata === "object") {
+          meta = o.metadata;
+        }
+
+        let parsedItems = o.items;
+        if (typeof parsedItems === "string") {
+          try {
+            parsedItems = JSON.parse(parsedItems);
+          } catch {
+            parsedItems = [];
+          }
+        }
+        let itemsArr = Array.isArray(parsedItems) ? parsedItems : [];
+        if (itemsArr.length === 0) {
+          const candidates = meta.customItems || meta.custom_items || meta.manifestItems || meta.items || meta.package_details || [];
+          itemsArr = Array.isArray(candidates) ? candidates : [];
+        }
+        const totalVal = mapOrderDisplayTotal(o, itemsArr);
+        const createdDay = isoDateSlice(o.created_at);
+        const orderDay = isoDateSlice(o.order_date);
+        const dueDay = isoDateSlice(o.due_date);
+        const displayDate = orderDay || createdDay;
+        const statusForUi = o.status;
+        const transportMode = extractTransportModeFromOrder(o);
+
+        const clientEmail = (typeof o.client === 'object' && o.client?.email) || o.customer_email || o.client_email || meta.email || meta.customer_email || null;
+        const clientNameStr = typeof o.client === 'string' ? o.client : (o.customer_name || o.client_name || o.client?.companyName || o.client?.name || "");
+
+        const normalizeOrd = (val) => {
+          if (!val) return '';
+          const s = String(val).trim();
+          const d = s.replace(/\D/g, '');
+          const w = d.replace(/^202[0-9]/, '');
+          const c = (w || d).replace(/^0+/, '');
+          return c || d;
+        };
+        const oNorm = normalizeOrd(o.id || o.rawId || o.orderNumber);
+        const matchingTicket = (rawSupportTickets || supportTickets || []).find(t => {
+          if (!t) return false;
+          const tCandidates = [
+            t.order_id,
+            t.orderId,
+            t.dispute_data?.orderId,
+            t.dispute_data?.orderNumber,
+            t.orderNumber
+          ];
+          let isMatch = tCandidates.some(c => c && normalizeOrd(c) === oNorm);
+          if (!isMatch && (t.description || t.subject)) {
+            const desc = `${t.description || ''} ${t.subject || ''}`;
+            const m = desc.match(/Order:\s*([A-Za-z0-9-]+)/i) || desc.match(/ORD-[A-Za-z0-9-]+/i);
+            if (m && normalizeOrd(m[1] || m[0]) === oNorm) isMatch = true;
+          }
+          if (!isMatch) return false;
+
+          const dispSt = String(t.dispute_status || '').toLowerCase().trim();
+          const tSt = String(t.status || '').toLowerCase().trim();
+          const isAccepted = dispSt === 'accepted' || 
+                             ((tSt === 'resolved' || tSt === 'accepted') && (Number(t.refund_amount) > 0 || String(t.category || '').toLowerCase().includes('refund')));
+          return isAccepted;
+        });
+        const ticketRefund = matchingTicket ? parseFloat(matchingTicket.refund_amount || matchingTicket.dispute_data?.requestedRefundAmount || 0) : 0;
+        const refundAmt = Math.max(parseFloat(o.refunded_amount ?? meta.refunded_amount ?? 0) || 0, ticketRefund);
+        const refundSt = (refundAmt >= totalVal && totalVal > 0)
+          ? 'FULL'
+          : (refundAmt > 0 ? 'PARTIAL' : (o.refund_status || meta.refund_status || null));
+        const effectiveSt = refundSt === 'FULL'
+          ? 'Refunded'
+          : (refundSt === 'PARTIAL' ? 'Partially Refunded' : (statusForUi || o.status));
+
+        return {
+          ...meta,
+          ...o,
+          items: itemsArr,
+          refunded_amount: refundAmt,
+          refund_status: refundSt,
+          clientId: o.customer_id || o.client_id || o.clientId,
+          client_id: o.customer_id || o.client_id || o.clientId,
+          companyId: o.company_id || o.tenantId,
+          vendorId: o.vendor_id || o.vendorId,
+          client: clientNameStr,
+          client_name: clientNameStr,
+          clientName: clientNameStr,
+          email: clientEmail || o.email,
+          client_email: clientEmail,
+          clientEmail: clientEmail,
+          customer_email: clientEmail,
+          clientObj: typeof o.client === 'object' ? o.client : null,
+          vendor: o.vendor_name || o.vendor?.name || "",
+          total: totalVal,
+          total_amount: totalVal,
+          amount: totalVal,
+          date: displayDate,
+          order_date: orderDay || o.order_date,
+          createdAt: o.created_at || o.createdAt,
+          requestDate: displayDate,
+          dueDate: dueDay,
+          due_date: dueDay || o.due_date,
+          status: effectiveSt,
+          statusLabel: displayOrderStatus(effectiveSt),
+          delivery_instructions:
+            o.delivery_instructions || o.deliveryInstructions || meta.delivery_instructions || meta.deliveryInstructions || null,
+          location: o.delivery_address || o.location || o.deliveryAddress || meta.delivery_address || meta.location || meta.deliveryAddress || "",
+          pickupLocation: o.pickup_location || o.pickupLocation || meta.pickup_location || meta.pickupLocation || "",
+          pickup_location: o.pickup_location || o.pickupLocation || meta.pickup_location || meta.pickupLocation || null,
+          deliveryType: transportMode,
+          deliveryMode: transportMode,
+          delivery_mode: transportMode,
+          mode: transportMode,
+          transportAsset: o.transportAsset || o.transport_asset || meta.transportAsset || meta.transport_asset || null,
+          transport_asset: o.transport_asset || o.transportAsset || meta.transport_asset || meta.transportAsset || null,
+          transportAssetCustom: o.transportAssetCustom || o.transport_asset_custom || meta.transportAssetCustom || meta.transport_asset_custom || null,
+          transport_asset_custom: o.transport_asset_custom || o.transportAssetCustom || meta.transport_asset_custom || meta.transportAssetCustom || null,
+          islandLocation: o.islandLocation || o.island_location || meta.islandLocation || meta.island_location || null,
+          island_location: o.island_location || o.islandLocation || meta.island_location || meta.islandLocation || null,
+        };
+      });
+      mappedOrders.sort(compareOrdersNewestFirst);
+      setOrders(mappedOrders);
+      return mappedOrders;
+    } catch (e) {
+      console.error("Fetch orders failed", e);
+      return null;
+    }
+  }, []);
+
+  const fetchMissions = React.useCallback(async () => {
+    try {
+      const res = await api.get("/missions");
+      let rawData = res.data?.success
+        ? res.data.data
+        : Array.isArray(res.data)
+          ? res.data
+          : [];
+      if (rawData && !Array.isArray(rawData) && typeof rawData === 'object') {
+        rawData = rawData.data || rawData.items || rawData.orders || rawData.missions || rawData.invoices || rawData.projects || Object.values(rawData).find(Array.isArray) || [];
+      }
+      setMissions(
+        rawData.map((m) => {
+          let meta = m.metadata;
+          if (typeof meta === 'string') {
+            try { meta = JSON.parse(meta); } catch { meta = {}; }
+          }
+          meta = meta || {};
+
+          const driverNameResolved = meta.driverName || (m.assignee ? `${m.assignee.firstName || ''} ${m.assignee.lastName || ''}`.trim() : '') || m.driver_name || m.driverName || '';
+          const plateResolved = meta.plateNumber || meta.vehicleId || (m.assignee && m.assignee.vehiclePlate) || m.plate_number || m.plateNumber || '';
+
+          const deliveryNumberResolved = m.delivery?.deliveryNumber || meta.deliveryNumber || (String(m.orderId || '').startsWith('DEL-') ? m.orderId : '') || '';
+
+          let actualOrderId = m.orderId || m.order_id || m.delivery?.orderId || meta.orderId || meta.order_id || meta.orderRef || null;
+          if (typeof actualOrderId === 'string' && actualOrderId.startsWith('DEL-')) {
+            actualOrderId = m.delivery?.orderId || meta.orderId || meta.orderRef || null;
+          }
+
+          const clientNameResolved = m.client?.companyName || m.client?.name || m.delivery?.client?.companyName || m.delivery?.client?.name || m.order?.client?.companyName || m.order?.client?.name || meta.clientName || meta.client || '';
+
+          const pickupResolved = m.delivery?.pickupLocation || meta.pickupLocation || meta.pickup_location || '';
+          const dropResolved = m.delivery?.dropLocation || meta.dropLocation || meta.destination || meta.location || m.destination_type || meta.destination_type || 'Client Site';
+          const itemsResolved = (m.delivery?.items && m.delivery.items.length > 0) ? m.delivery.items : ((m.order?.items && m.order.items.length > 0) ? m.order.items : (Array.isArray(meta.items) ? meta.items : []));
+          const payoutResolved = m.delivery?.deliveryFee || (m.delivery?.routeDistance ? (m.delivery.routeDistance * (m.delivery.staffPayRate || 0)) : meta.payout) || null;
+
+          return {
+            ...m,
+            orderId: actualOrderId,
+            order_id: actualOrderId,
+            orderNumber: m.order?.orderNumber || meta.orderNumber || (actualOrderId && !String(actualOrderId).startsWith('DEL-') ? actualOrderId : null),
+            deliveryNumber: deliveryNumberResolved,
+            deliveryId: m.deliveryId || m.delivery?.id || meta.deliveryId || null,
+            clientName: clientNameResolved,
+            pickupLocation: pickupResolved,
+            dropLocation: dropResolved,
+            items: itemsResolved,
+            payout: payoutResolved,
+            driverId: m.assignedEmployeeId || m.assigned_driver || m.driverId || meta.driverId || null,
+            driverName: driverNameResolved,
+            vehicleId: plateResolved,
+            plateNumber: plateResolved,
+            missionType: m.mission_type || m.missionType || meta.missionType || 'LOGISTICS',
+            destinationType: dropResolved,
+            date: m.event_date
+              ? m.event_date.split("T")[0]
+              : m.created_at || m.createdAt
+                ? (m.created_at || m.createdAt).split("T")[0]
+                : "",
+            id: m.missionNumber || m.id,
+            db_id: m.id,
+          };
+        }),
+      );
+    } catch (e) {
+      console.error("Fetch missions failed", e);
+    }
+  }, []);
+
+  const fetchFinance = React.useCallback(async () => {
+    try {
+      const res = await api.get("/invoices");
+      let rawData = res.data?.success
+        ? (res.data.data?.invoices || res.data.data)
+        : Array.isArray(res.data)
+          ? res.data
+          : (res.data?.invoices || []);
+      if (rawData && !Array.isArray(rawData) && typeof rawData === 'object') {
+        rawData = rawData.data || rawData.items || rawData.orders || rawData.missions || rawData.invoices || rawData.projects || Object.values(rawData).find(Array.isArray) || [];
+      }
+      setInvoices(
+        rawData.map((i) => {
+          const paidAmount = i.paidAmount || (i.payments ? i.payments.reduce((sum, p) => sum + p.amount, 0) : 0);
+          return {
+            ...i,
+            orderId: i.orderId || i.order_id,
+            clientId: i.clientId || i.client_id,
+            totalAmount: parseFloat(i.totalAmount || i.amount || 0),
+            paidAmount: parseFloat(paidAmount),
+            date: i.invoiceDate || i.date || i.created_at || i.createdAt ? (i.invoiceDate || i.date || i.created_at || i.createdAt).split("T")[0] : "",
+            dueDate: i.dueDate || i.due_date ? (i.dueDate || i.due_date).split("T")[0] : "",
+            clientName: i.clientName || i.client_name || i.client?.companyName || i.client?.name || "",
+          };
+        }),
+      );
+    } catch (e) {
+      console.error("Fetch finance failed", e);
+    }
+  }, []);
+
+  const fetchProjects = React.useCallback(async () => {
+    const mapStatusToFrontend = (status) => {
+      switch (status?.toLowerCase()) {
+        case "planned":
+          return "Pending";
+        case "in_progress":
+          return "In Progress";
+        case "completed":
+          return "Completed";
+        case "on_hold":
+          return "Cancelled";
+        default:
+          return status || "Pending";
+      }
+    };
+
+    try {
+      const res = await api.get(`/orders/projects/all?_t=${Date.now()}`);
+      let rawData = res.data?.success
+        ? res.data.data
+        : Array.isArray(res.data)
+          ? res.data
+          : [];
+      if (rawData && !Array.isArray(rawData) && typeof rawData === 'object') {
+        rawData = rawData.data || rawData.items || rawData.orders || rawData.missions || rawData.invoices || rawData.projects || Object.values(rawData).find(Array.isArray) || [];
+      }
+      setProjects(
+        rawData.map((p) => ({
+          ...p,
+          orderId: p.order_id || p.orderId,
+          managerId: p.manager_id || p.managerId,
+          companyId: p.company_id || p.companyId,
+          customerId: p.customer_id || p.customerId,
+          clientId: p.clientId || p.customer_id || p.company_id,
+          client: p.client || p.client_name,
+          status: mapStatusToFrontend(p.status),
+          start: p.start || (p.start_date ? (() => {
+            const d = new Date(p.start_date);
+            if (isNaN(d.getTime())) return p.start_date.split("T")[0];
+            const year = d.getFullYear();
+            const month = String(d.getMonth() + 1).padStart(2, '0');
+            const day = String(d.getDate()).padStart(2, '0');
+            return `${year}-${month}-${day}`;
+          })() : ""),
+          end: p.end || (p.end_date ? (() => {
+            const d = new Date(p.end_date);
+            if (isNaN(d.getTime())) return p.end_date.split("T")[0];
+            const year = d.getFullYear();
+            const month = String(d.getMonth() + 1).padStart(2, '0');
+            const day = String(d.getDate()).padStart(2, '0');
+            return `${year}-${month}-${day}`;
+          })() : ""),
+          deliveryType: p.deliveryType || p.delivery_type || "Road",
+        })),
+      );
+    } catch (e) {
+      console.error("Fetch projects failed", e);
+    }
+  }, []);
+
+  const fetchSupportingDocs = React.useCallback(async () => {
+    try {
+      const [assignments, leave] = await Promise.all([
+        api
+          .get("/missions")
+          .catch((e) => ({ data: { success: false, data: [] } })),
+        api
+          .get("/staff/leave")
+          .catch((e) => ({ data: { success: false, data: [] } })),
+      ]);
+
+      if (assignments.data?.success) {
+        // Map backend missions to frontend staffAssignments structure
+        const mapped = (assignments.data.data.missions || assignments.data.data || []).map(m => ({
+          id: m.missionNumber || m.id,
+          rawId: m.id,
+          source: 'mission',
+          task: m.metadata?.task || m.missionType,
+          location: m.metadata?.location || m.delivery?.dropLocation || m.delivery?.pickupLocation || (m.delivery?.client?.address ? [m.delivery.client.address, m.delivery.client.city, m.delivery.client.country].filter(Boolean).join(', ') : '') || 'N/A',
+          assignee: m.assignee ? [m.assignee.firstName, m.assignee.lastName].filter(Boolean).join(' ').trim() : 'System',
+          assigneeId: m.assignee?.userId || m.assignedEmployeeId,
+          employeeId: m.assignedEmployeeId,
+          priority: m.metadata?.priority || 'Normal',
+          status: m.status
+        }));
+        setStaffAssignments(mapped);
+      } else if (Array.isArray(assignments.data)) {
+        setStaffAssignments(assignments.data);
+      }
+
+      if (leave.data?.success) {
+        setLeaveRequests(leave.data.data);
+      } else if (Array.isArray(leave.data)) {
+        setLeaveRequests(leave.data);
+      }
+    } catch (e) {
+      console.error("Fetch supporting docs failed", e);
+    }
+  }, [currentUser?.id]);
+
+  const fetchWarehouses = React.useCallback(async () => {
+    try {
+      const res = await api.get("/warehouses");
+      if (res.data?.success) {
+        const data = res.data.data;
+        setWarehouses(data?.warehouses ? data.warehouses : (Array.isArray(data) ? data : []));
+      }
+    } catch (e) {
+      console.error("Fetch warehouses failed", e);
+    }
+  }, []);
+
+  const fetchTickets = React.useCallback(async () => {
+    try {
+      const [tickets, eventsData, guestReqs] = await Promise.all([
+        api.get(`/support/tickets?_t=${Date.now()}`).catch((e) => ({ data: [] })),
+        api.get(`/support/events?_t=${Date.now()}`).catch((e) => ({ data: [] })),
+        api.get(`/support/guest-requests?_t=${Date.now()}`).catch((e) => ({ data: [] })),
+      ]);
+      if (tickets.data?.success) {
+        const formatStatus = (s) => {
+          if (!s) return "Open";
+          return String(s)
+            .split(/[_\s]+/)
+            .map((p) => p.charAt(0).toUpperCase() + p.slice(1))
+            .join(" ");
+        };
+
+        const mapped = tickets.data.data.map((t) => {
+          let msgs = [];
+          if (t.messages) {
+            try {
+              msgs =
+                typeof t.messages === "string"
+                  ? JSON.parse(t.messages)
+                  : t.messages;
+            } catch (e) {
+              msgs = [];
+            }
+          }
+          if (!Array.isArray(msgs) || msgs.length === 0) {
+            msgs = [
+              {
+                sender: "client",
+                text: t.description || "No description provided.",
+                time: new Date(t.created_at).toLocaleTimeString([], {
+                  hour: "2-digit",
+                  minute: "2-digit",
+                }),
+              },
+            ];
+          }
+
+          const uniqueTicketId = t.ticketId || (String(t.id).startsWith("TKT-") ? t.id : `TKT-${String(t.id).padStart(3, "0")}`);
+          const dbId = t.db_id || (typeof t.id === "number" ? t.id : null);
+
+          return {
+            ...t,
+            id: uniqueTicketId,
+            ticketId: uniqueTicketId,
+            db_id: dbId,
+            tenantId: t.tenantId ?? t.tenant_id ?? null,
+            tenant_id: t.tenantId ?? t.tenant_id ?? null,
+            order_id: t.order_id || t.orderId || t.dispute_data?.orderId || null,
+            orderId: t.order_id || t.orderId || t.dispute_data?.orderId || null,
+            dispute_data: typeof t.dispute_data === 'string' ? (() => { try { return JSON.parse(t.dispute_data); } catch { return null; } })() : (t.dispute_data || null),
+            description: t.description || "",
+            // preserve original backend identification fields to satisfy global filters
+            submitted_by: t.submitted_by ?? t.createdById ?? null,
+            created_by: t.submitted_by ?? t.created_by ?? t.createdById ?? null,
+            user_id: t.submitted_by ?? t.user_id ?? t.createdById ?? null,
+            clientName: t.submitted_by_name || t.createdByName || t.clientName || "System User",
+            clientId: t.client_id ?? t.company_id ?? t.clientId ?? null,
+            createdById: t.created_by ?? t.user_id ?? t.createdById ?? null,
+            createdByEmail: t.created_by_email || t.email || t.createdByEmail || null,
+            createdByName: t.submitted_by_name || t.created_by_name || t.createdByName || null,
+            subject: t.subject || t.title,
+            category: t.category || "General",
+            priority: t.priority
+              ? t.priority.charAt(0).toUpperCase() + t.priority.slice(1)
+              : "Medium",
+            status: formatStatus(t.status),
+            date: t.created_at ? t.created_at.split("T")[0] : (t.createdAt ? t.createdAt.split("T")[0] : new Date().toISOString().split("T")[0]),
+            dispute_status: t.dispute_status || "none",
+            refund_amount: Number(t.refund_amount) || 0,
+            messages: msgs,
+          };
+        });
+        setRawSupportTickets(mapped);
+        // Always apply filter immediately if user is available; otherwise the
+        // useEffect above will re-apply once currentUser resolves (no wipe).
+        if (currentUser) setSupportTickets(filterDataForCurrentUser(mapped));
+      }
+      if (eventsData.data?.success) {
+        const eventsList = Array.isArray(eventsData.data.data) ? eventsData.data.data : [];
+        let mappedEvents = eventsList.map((e) => {
+          const isGeneric = (str) => !str || ['person', 'personal client', 'personal', 'guest', 'client', 'null', 'undefined'].includes(String(str).trim().toLowerCase());
+
+          let clientCandidate = null;
+          if (!isGeneric(e.client?.contactPerson)) clientCandidate = e.client.contactPerson;
+          else if (!isGeneric(e.manager?.name)) clientCandidate = e.manager.name;
+          else if (!isGeneric(e.client?.companyName)) clientCandidate = e.client.companyName;
+          else if (!isGeneric(e.client_name)) clientCandidate = e.client_name;
+          else if (!isGeneric(e.client?.name)) clientCandidate = e.client.name;
+          else if (!isGeneric(e.manager?.email)) clientCandidate = e.manager.email;
+
+          const rawClient = clientCandidate || "Personal Client";
+          return {
+            ...e,
+            id: e.eventId || e.id,
+            eventId: e.eventId || e.id,
+            db_id: e.db_id || e.id,
+            title: e.name || e.title,
+            client_name: rawClient,
+            client: rawClient,
+            date: e.event_date ? e.event_date.split("T")[0] : e.date ? e.date.split("T")[0] : "",
+            imageUrl: e.image_url || e.imageUrl,
+            plannerName: e.planner_name || e.plannerName,
+            specialRequests: e.special_requests || e.specialRequests,
+            guestCount: e.guest_count || e.guestCount,
+            moodBoardUrl: e.mood_board_url || e.moodBoardUrl,
+            client_id: e.client_id || e.clientId,
+            manager_id: e.manager_id || e.managerId,
+            status: e.status || "planned",
+          };
+        });
+        // Store raw events so the filter-effect can re-apply when user loads
+        setRawEvents(mappedEvents);
+        if (currentUser) setEvents(filterDataForCurrentUser(mappedEvents));
+      }
+      if (guestReqs.data?.success) {
+        const capitalizePriority = (p) =>
+          p ? p.charAt(0).toUpperCase() + p.slice(1).toLowerCase() : "Medium";
+        const reqsList = Array.isArray(guestReqs.data.data) ? guestReqs.data.data : [];
+        const mappedGuest = reqsList.map((r) => {
+          let parsedDate = "";
+          let parsedTime = "";
+          if (r.delivery_time) {
+            try {
+              const dt = new Date(r.delivery_time);
+              if (!isNaN(dt.getTime())) {
+                const year = dt.getFullYear();
+                const month = String(dt.getMonth() + 1).padStart(2, "0");
+                const day = String(dt.getDate()).padStart(2, "0");
+                parsedDate = `${year}-${month}-${day}`;
+
+                let hours = dt.getHours();
+                const ampm = hours >= 12 ? "PM" : "AM";
+                hours = hours % 12;
+                hours = hours ? hours : 12;
+                const minutes = String(dt.getMinutes()).padStart(2, "0");
+                parsedTime = `${String(hours).padStart(2, "0")}:${minutes} ${ampm}`;
+              }
+            } catch (err) {
+              parsedDate = String(r.delivery_time).split("T")[0];
+              parsedTime = String(r.delivery_time).split("T")[1]?.substring(0, 5) || "";
+            }
+          }
+          return {
+            ...r,
+            id: r.requestId || r.id,
+            requestId: r.requestId || r.id,
+            db_id: r.db_id || r.id,
+            request: r.request_details || r.request || r.requestType || r.request_type || "Concierge Service Request",
+            requestedBy: r.requested_by || r.requestedBy || r.guestName || r.guest || "Client",
+            time: parsedTime || r.delivery_time || r.time || "",
+            date: parsedDate || (r.created_at ? r.created_at.split("T")[0] : r.date || ""),
+            guest: r.guest || r.guestName || r.client_name || r.room || "VIP Suite",
+            priority: capitalizePriority(r.priority),
+            status: (r.status || "pending").toLowerCase(),
+          };
+        });
+
+        // Store raw guest requests so the filter-effect can re-apply when user loads
+        setRawGuestRequests(mappedGuest);
+        if (currentUser) setGuestRequests(filterDataForCurrentUser(mappedGuest));
+      }
+    } catch (e) {
+      console.error("Fetch tickets failed", e);
+    }
+  }, [currentUser, filterDataForCurrentUser]);
+
+  const fetchLuxuryItems = React.useCallback(async () => {
+    try {
+      // Query both platform vault assets (tenantId=1) and current tenant assets to ensure complete sync
+      const [resAdmin, resClient] = await Promise.allSettled([
+        api.get("/concierge/luxury-items?tenantId=1"),
+        api.get("/concierge/luxury-items")
+      ]);
+
+      const adminItems = resAdmin.status === 'fulfilled' && resAdmin.value.data?.success
+        ? (Array.isArray(resAdmin.value.data.data) ? resAdmin.value.data.data : (Array.isArray(resAdmin.value.data) ? resAdmin.value.data : []))
+        : (resAdmin.status === 'fulfilled' && Array.isArray(resAdmin.value.data) ? resAdmin.value.data : []);
+
+      const clientItems = resClient.status === 'fulfilled' && resClient.value.data?.success
+        ? (Array.isArray(resClient.value.data.data) ? resClient.value.data.data : (Array.isArray(resClient.value.data) ? resClient.value.data : []))
+        : (resClient.status === 'fulfilled' && Array.isArray(resClient.value.data) ? resClient.value.data : []);
+
+      const combined = [...adminItems, ...clientItems];
+      const seen = new Set();
+      const rawData = combined.filter((itm) => {
+        const id = itm.id || itm.itemId;
+        if (!id || seen.has(String(id))) return false;
+        seen.add(String(id));
+        return true;
+      });
+
+      const mapped = (rawData || []).map((item) => {
+        const metadata = item.metadata && typeof item.metadata === 'object' ? item.metadata : {};
+        const clientId = item.clientId ?? item.client_id ?? metadata.clientId ?? metadata.client_id ?? null;
+        const clientName = item.clientName ?? item.client_name ?? metadata.clientName ?? metadata.client_name ?? item.owner_name ?? item.owner ?? '';
+        return {
+          id: item.itemId || item.id,
+          itemId: item.itemId || item.id,
+          item: item.item_name || item.name || 'Unknown Item',
+          name: item.name || item.item_name || 'Unknown Item',
+          owner: item.owner_name || item.owner || clientName || 'Unknown Beneficiary',
+          vault: item.vault_location || item.vault || 'Vault Alpha',
+          status: item.status || 'Stored',
+          value: item.estimated_value || item.value || item.price || 0,
+          price: item.price || item.estimated_value || item.value || 0,
+          notes: item.notes || '',
+          clientId: clientId != null ? String(clientId) : null,
+          client_id: clientId != null ? String(clientId) : null,
+          clientName: clientName,
+          client_name: clientName,
+          company_id: item.tenantId || 1,
+          companyId: item.tenantId || 1,
+        };
+      });
+      setLuxuryItems(mapped);
+    } catch (e) {
+      console.error("Fetch luxury items failed", e);
+    }
+  }, [currentUser]);
+
+  const fetchDashboardStats = React.useCallback(async (filter) => {
+    try {
+      const filterParam = filter || revenueFilter || 'Monthly';
+      const res = await api.get(`/dashboard/stats?revenueFilter=${encodeURIComponent(filterParam)}`);
+      if (res.data?.success) setDashboardStats(res.data.data);
+    } catch (e) {
+      console.error("Fetch dashboard stats failed", e);
+    }
+  }, [revenueFilter]);
+
+  const fetchDashboardLogs = React.useCallback(async () => {
+    try {
+      const res = await api.get("/dashboard/logs");
+      if (res.data?.success) {
+        setLogs(res.data.data.map(audit => ({
+          action: audit.action || "System Action",
+          detail: audit.detail || "System event recorded",
+          type: "system",
+          time: audit.timestamp ? new Date(audit.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : "Unknown Time"
+        })));
+      }
+    } catch (e) {
+      console.error("Fetch dashboard logs failed", e);
+    }
+  }, []);
+
+  const fetchSystemSettings = React.useCallback(async () => {
+    try {
+      const res = await api.get("/settings/system");
+      if (res.data?.success) setSystemSettings(res.data.data);
+    } catch (e) {
+      console.error("Fetch system settings failed", e);
+    }
+  }, []);
+
+  const fetchDeliveryPricing = React.useCallback(async () => {
+    try {
+      const res = await api.get("/logistics/pricing");
+      if (res.data?.success) setDeliveryPricing(res.data.data);
+    } catch (e) {
+      console.error("Fetch delivery pricing failed", e);
+    }
+  }, []);
+
+  const DISMISSED_ALERTS_KEY = "zz_dismissed_inv_alerts";
+
+  const fetchInventoryAlerts = React.useCallback(async () => {
+    let dismissed = [];
+    try {
+      dismissed = JSON.parse(
+        localStorage.getItem(DISMISSED_ALERTS_KEY) || "[]",
+      );
+    } catch {
+      dismissed = [];
+    }
+    const dismissedSet = new Set(dismissed.map(String));
+    try {
+      const res = await api.get("/inventory/alerts");
+      if (res.data?.success) {
+        const mapped = res.data.data.map((i) => ({
+          id: i.id,
+          name: i.name,
+          qty: i.quantity,
+          threshold: i.threshold,
+          status:
+            i.status === "low_stock"
+              ? "Warning"
+              : i.status === "out_of_stock"
+                ? "Critical"
+                : i.status,
+          location: i.warehouse_name || "General Storage",
+        }));
+        setInventoryAlerts(
+          mapped.filter((a) => !dismissedSet.has(String(a.id))),
+        );
+      }
+    } catch (e) {
+      console.error("Fetch inventory alerts failed", e);
+    }
+  }, []);
+
+  const acknowledgeInventoryAlert = React.useCallback((alertId) => {
+    const idStr = String(alertId);
+    setInventoryAlerts((prev) => prev.filter((a) => String(a.id) !== idStr));
+    try {
+      const arr = JSON.parse(
+        localStorage.getItem(DISMISSED_ALERTS_KEY) || "[]",
+      );
+      if (!arr.includes(idStr)) {
+        arr.push(idStr);
+        localStorage.setItem(DISMISSED_ALERTS_KEY, JSON.stringify(arr));
+      }
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const fetchNotifications = React.useCallback(async () => {
+    try {
+      const res = await api.get("/notifications");
+      if (res.data?.success) {
+        // Backend already scopes notifications to the current user via user_id and role_target+company_id.
+        // No additional client-side filtering needed — this prevents false notifications for new accounts.
+        let notifs = res.data.data || [];
+
+        // Ignore default mock notifications that leak from outdated mockApi fallback
+        notifs = notifs.filter(n => {
+          const title = n.title || '';
+          const msg = n.message || '';
+          const isDefaultMock1 = title === "New Purchase Order" && msg.includes("PO-001");
+          const isDefaultMock2 = title === "Critical Stock Alert" && msg.includes("Dom Perignon");
+          return !isDefaultMock1 && !isDefaultMock2;
+        });
+
+        setNotifications(notifs);
+        // Compute unread count directly from the scoped list to prevent phantom badges
+        setUnreadCount(notifs.filter(n => !(n.isRead || n.is_read)).length);
+      }
+    } catch (e) {
+      console.error("Fetch notifications failed", e);
+    }
+  }, [currentUser]);
+
+  const fetchUnreadCount = React.useCallback(async () => {
+    // Disabled: Unread count is now calculated accurately from fetchNotifications.
+    // This prevents phantom badges where the backend unread-count endpoint includes unscoped items.
+  }, []);
+
+  const markNotificationRead = async (id) => {
+    try {
+      await api.put(`/notifications/${id}/read`);
+      setNotifications((prev) =>
+        prev.map((n) => (n.id === id ? { ...n, isRead: true, is_read: true } : n)),
+      );
+      setUnreadCount((prev) => Math.max(0, prev - 1));
+    } catch (e) {
+      console.error("Mark read failed", e);
+    }
+  };
+
+  const markAllNotificationsRead = async () => {
+    try {
+      await api.put("/notifications/mark-all-read");
+      setNotifications((prev) => prev.map((n) => ({ ...n, isRead: true, is_read: true })));
+      setUnreadCount(0);
+    } catch (e) {
+      console.error("Mark all read failed", e);
+    }
+  };
+
+  // Poll for new notifications every 15 seconds
+  React.useEffect(() => {
+    if (!currentUser || !localStorage.getItem("token")) return;
+    fetchNotifications();
+    fetchUnreadCount();
+    const interval = setInterval(() => {
+      fetchNotifications();
+      fetchUnreadCount();
+    }, 15000);
+    return () => clearInterval(interval);
+  }, [currentUser, fetchNotifications, fetchUnreadCount]);
+
+  const fetchInitialData = async () => {
+    if (!localStorage.getItem("token")) {
+      setLoading(false);
+      return;
+    }
+    // Instantly render UI without artificial blocking
+    setLoading(false);
+
+    try {
+      const role = normalizeRole(currentUser?.role);
+      const canAccessUsers = ["superadmin", "admin", "saas_client", "operations", "logistics"].includes(role);
+      const canAccessRoles = ["superadmin", "admin", "saas_client", "logistics"].includes(role);
+
+      // Fetch primary dashboard essentials in background
+      Promise.allSettled([
+        fetchDashboardStats(),
+        fetchDashboardLogs(),
+        fetchTickets(),
+        fetchNotifications(),
+        canAccessUsers ? fetchStaff() : Promise.resolve(),
+        (canAccessRoles || canAccessUsers)
+          ? api.get('/roles?limit=100').then(res => {
+            const rawData = res.data?.data;
+            const rolesArray = Array.isArray(rawData) ? rawData : (rawData?.roles || []);
+            setRoles(rolesArray);
+          }).catch(() => { })
+          : Promise.resolve(),
+      ]);
+    } catch (err) {
+      console.error("Error fetching initial context data:", err);
+    }
+  };
+
+  // Initial Data Fetch
+  useEffect(() => {
+    if (currentUser && localStorage.getItem("token")) {
+      if (lastFetchedUserIdRef.current !== currentUser.id) {
+        lastFetchedUserIdRef.current = currentUser.id;
+        // Clean slate reset on account change
+        setOrders([]);
+        setDeliveries([]);
+        setInvoices([]);
+        setClients([]);
+        setCustomerUsers([]);
+        setUsers([]);
+        setProjects([]);
+        setMissions([]);
+        setStaffAssignments([]);
+        setGuestRequests([]);
+        setRawGuestRequests([]);
+        setEvents([]);
+        setRawEvents([]);
+        setSupportTickets([]);
+        setRawSupportTickets([]);
+        setChauffeurRequests([]);
+        setNotifications([]);
+        fetchInitialData();
+      }
+    } else {
+      lastFetchedUserIdRef.current = null;
+      setOrders([]);
+      setDeliveries([]);
+      setInvoices([]);
+      setClients([]);
+      setCustomerUsers([]);
+      setUsers([]);
+      setProjects([]);
+      setMissions([]);
+      setStaffAssignments([]);
+      setGuestRequests([]);
+      setRawGuestRequests([]);
+      setEvents([]);
+      setRawEvents([]);
+      setSupportTickets([]);
+      setRawSupportTickets([]);
+      setChauffeurRequests([]);
+      setNotifications([]);
+    }
+  }, [currentUser]);
+
+  // Keep support / concierge tickets and guest requests refreshed across roles.
+  useEffect(() => {
+    if (!currentUser || !localStorage.getItem("token")) return;
+    fetchTickets();
+  }, [currentUser, fetchTickets]);
+
+
+
+
+  const recordLoss = async (loss) => {
+    try {
+      const item = inventory.find((i) => i.name === loss.item);
+      if (!item) return;
+
+      const res = await api.post(`/inventory/${item.id}/adjust`, {
+        quantity: loss.qty,
+        type: "loss",
+        reason: loss.reason,
+      });
+
+      if (res.data?.success) {
+        setInventory((prev) =>
+          prev.map((i) =>
+            i.id === item.id
+              ? { ...i, ...res.data.data, qty: res.data.data.quantity }
+              : i,
+          ),
+        );
+        await fetchStockMovements();
+        addLog({
+          action: "Asset Loss Recorded",
+          detail: `Loss of ${loss.qty} units for ${loss.item} noted: ${loss.reason || "No reason provided"}. Auditor notified.`,
+          type: "inventory",
+        });
+      }
+    } catch (error) {
+      console.error("Failed to record loss:", error);
+    }
+  };
+
+  const addStockEntry = async (entry) => {
+    try {
+      const item = inventory.find((i) => i.name === entry.item);
+      if (item) {
+        const res = await api.post(`/inventory/${item.id}/adjust`, {
+          quantity: entry.qty,
+          type: "entry",
+          reference_type: entry.prRef ? "purchase_request" : null,
+          reference_id: entry.prRef || null,
+        });
+
+        if (res.data?.success) {
+          const qtyAfter =
+            parseInt(
+              res.data.data.quantity ?? res.data.data.qty ?? item.qty,
+              10,
+            ) || 0;
+          const categoryForApi = canonicalMarketplaceCategory(
+            entry.category ?? item.category,
+          );
+          try {
+            if (entry.imageFile) {
+              const formData = new FormData();
+              formData.append("name", item.name);
+              formData.append("category", categoryForApi);
+              formData.append("price", String(parseFloat(item.price) || 0));
+              formData.append("quantity", String(qtyAfter));
+              appendInventoryFk(
+                formData,
+                "warehouse_id",
+                item.warehouse_id ?? item.warehouseId,
+              );
+              appendInventoryFk(
+                formData,
+                "vendor_id",
+                item.vendor_id ?? item.vendorId,
+              );
+              appendInventoryFk(
+                formData,
+                "client_id",
+                item.client_id ?? item.clientId,
+              );
+              formData.append(
+                "company_id",
+                String(
+                  resolveInventoryCompanyId(
+                    currentUser,
+                    item.company_id ?? item.companyId,
+                  ),
+                ),
+              );
+              formData.append("image", entry.imageFile);
+              await api.put(`/inventory/${item.id}`, formData);
+            } else {
+              await api.put(`/inventory/${item.id}`, {
+                name: item.name,
+                category: categoryForApi,
+                price: parseFloat(item.price) || 0,
+                quantity: qtyAfter,
+                warehouse_id: nullablePositiveInt(
+                  item.warehouse_id ?? item.warehouseId,
+                ),
+                vendor_id: nullablePositiveInt(item.vendor_id ?? item.vendorId),
+                client_id: nullablePositiveInt(item.client_id ?? item.clientId),
+                company_id: resolveInventoryCompanyId(
+                  currentUser,
+                  item.company_id ?? item.companyId,
+                ),
+              });
+            }
+          } catch (e) {
+            console.warn("Inventory category sync after stock entry failed", e);
+          }
+
+          await fetchInventory();
+          await fetchStockMovements();
+
+          if (entry.prRef) {
+            setPurchaseRequests((prev) =>
+              prev.map((pr) =>
+                pr.id === entry.prRef ? { ...pr, status: "Received" } : pr,
+              ),
+            );
+          }
+
+          addLog({
+            action: "Stock Entry",
+            detail: `Procured ${entry.qty} units of ${entry.item} from ${entry.vendor || entry.vendorName || "Unknown Partner"}.`,
+            type: "inventory",
+          });
+          return { ok: true };
+        }
+      } else {
+        const imageUrl =
+          entry.image_url || entry.imageUrl || entry.image || null;
+        let res;
+
+        if (entry.imageFile) {
+          const formData = new FormData();
+          formData.append("name", entry.item || "");
+          formData.append(
+            "category",
+            canonicalMarketplaceCategory(entry.category),
+          );
+          formData.append("price", String(parseFloat(entry.price) || 0));
+          formData.append("quantity", String(parseInt(entry.qty) || 0));
+          appendInventoryFk(
+            formData,
+            "warehouse_id",
+            entry.warehouseId ?? entry.warehouse_id,
+          );
+          formData.append(
+            "inventory_type",
+            entry.inventoryType || "Marketplace",
+          );
+          appendInventoryFk(formData, "client_id", entry.clientId);
+          formData.append(
+            "sku",
+            entry.sku || `SKU-${Math.floor(Math.random() * 100000)}`,
+          );
+          appendInventoryFk(
+            formData,
+            "vendor_id",
+            entry.vendorId ?? entry.vendor_id,
+          );
+          if (imageUrl) formData.append("image_url", String(imageUrl));
+          formData.append(
+            "company_id",
+            String(
+              resolveInventoryCompanyId(
+                currentUser,
+                entry.company_id ?? entry.companyId,
+              ),
+            ),
+          );
+          formData.append("image", entry.imageFile);
+
+          res = await api.post("/inventory", formData);
+        } else {
+          const reqData = {
+            name: entry.item,
+            category: canonicalMarketplaceCategory(entry.category),
+            price: entry.price,
+            quantity: entry.qty,
+            warehouse_id: nullablePositiveInt(
+              entry.warehouseId ?? entry.warehouse_id,
+            ),
+            vendor_id: nullablePositiveInt(entry.vendorId ?? entry.vendor_id),
+            inventory_type: entry.inventoryType || "Marketplace",
+            client_id: nullablePositiveInt(entry.clientId),
+            company_id: resolveInventoryCompanyId(
+              currentUser,
+              entry.company_id ?? entry.companyId,
+            ),
+            image_url: imageUrl,
+            sku: entry.sku || `SKU-${Math.floor(Math.random() * 100000)}`,
+          };
+          res = await api.post("/inventory", reqData);
+        }
+
+        if (inventoryWriteResponseOk(res)) {
+          // Re-fetch to ensure correct mapping
+          await fetchInventory();
+          await fetchStockMovements();
+          addLog({
+            action: "Stock Entry",
+            detail: `Procured ${entry.qty} units of ${entry.item} from ${entry.vendor || entry.vendorName || "Unknown Partner"}.`,
+            type: "inventory",
+          });
+          return { ok: true };
+        }
+      }
+      return { ok: false, error: "Stock entry did not complete." };
+    } catch (error) {
+      console.error("Failed to add stock entry:", error);
+      return {
+        ok: false,
+        error:
+          error?.response?.data?.message ||
+          error?.message ||
+          "Failed to add stock entry.",
+      };
+    }
+  };
+
+  const issueStock = async (issue) => {
+    try {
+      const item = inventory.find((i) => i.name === issue.item);
+      if (!item) return;
+
+      const res = await api.post(`/inventory/${item.id}/adjust`, {
+        quantity: issue.qty,
+        type: "issue",
+        reference_type: issue.projectRef ? "project" : "client",
+        reference_id: issue.projectRef || issue.clientId || null,
+      });
+
+      if (res.data?.success) {
+        const updatedItem = {
+          ...item,
+          ...res.data.data,
+          qty: res.data.data.quantity,
+        };
+        setInventory((prev) =>
+          prev.map((i) => (i.id === item.id ? updatedItem : i)),
+        );
+        await fetchStockMovements();
+
+        // Automate low stock alert if needed (local check after update)
+        if (updatedItem.qty < 10) {
+          addLog({
+            action: "Automated Procurement Alert",
+            detail: `Low stock detected for ${issue.item}. System generated auto-PR.`,
+            type: "automated",
+          });
+        }
+
+        addLog({
+          action: "Stock Issue",
+          detail: `Issued ${issue.qty} units of ${issue.item} to ${issue.client || issue.issuedTo}.`,
+          type: "inventory",
+        });
+      }
+    } catch (error) {
+      console.error("Failed to issue stock:", error);
+    }
+  };
+
+  const addPlan = async (plan) => {
+    try {
+      const priceNum = parseFloat(String(plan.price).replace(/[^0-9.-]+/g, "")) || 0;
+      const yearlyPriceNum = parseFloat(String(plan.yearlyPrice).replace(/[^0-9.-]+/g, "")) || 0;
+      const apiPayload = {
+        name: plan.name,
+        description: plan.description || "",
+        price: priceNum,
+        billingCycle: "MONTHLY",
+        maxUsers: 100,
+        maxStorage: 1024,
+        features: {
+          tier: plan.tier || "",
+          planType: plan.planType || "SaaS",
+          yearlyPrice: yearlyPriceNum,
+          commitment: plan.commitment || "",
+          list: plan.features || []
+        }
+      };
+      await api.post("/plans", apiPayload);
+      addLog({
+        action: "Plan Created",
+        detail: `Super Admin created new protocol: ${plan.name}`,
+        type: "system",
+      });
+      await fetchAccessPlans();
+    } catch (error) {
+      console.error("Failed to add access plan:", error);
+      if (!silentUi) window.alert(`Failed to add plan: ${error?.response?.data?.message || error.message}`);
+    }
+  };
+
+  const updatePlan = async (updated) => {
+    try {
+      const priceNum = parseFloat(String(updated.price).replace(/[^0-9.-]+/g, "")) || 0;
+      const yearlyPriceNum = parseFloat(String(updated.yearlyPrice).replace(/[^0-9.-]+/g, "")) || 0;
+      const apiPayload = {
+        name: updated.name,
+        description: updated.description || "",
+        price: priceNum,
+        billingCycle: "MONTHLY",
+        features: {
+          tier: updated.tier || "",
+          planType: updated.planType || "SaaS",
+          yearlyPrice: yearlyPriceNum,
+          commitment: updated.commitment || "",
+          list: updated.features || []
+        }
+      };
+      await api.put(`/plans/${updated.id}`, apiPayload);
+      addLog({
+        action: "Plan Updated",
+        detail: `Super Admin modified protocol: ${updated.name}`,
+        type: "system",
+      });
+      await fetchAccessPlans();
+    } catch (error) {
+      console.error("Failed to update access plan:", error);
+      if (!silentUi) window.alert(`Failed to update plan: ${error?.response?.data?.message || error.message}`);
+    }
+  };
+
+  const deletePlan = async (id) => {
+    setAccessPlans((prev) => prev.filter((p) => String(p.id) !== String(id)));
+    try {
+      await api.delete(`/plans/${id}`);
+      addLog({
+        action: "Plan Deleted",
+        detail: `Super Admin removed protocol ID: ${id}`,
+        type: "system",
+      });
+      await fetchAccessPlans();
+    } catch (error) {
+      console.error("Failed to delete access plan:", error);
+    }
+  };
+
+  const registerSaaSClient = async (formData) => {
+    try {
+      const res = await api.post("/clients", {
+        name: formData.clientName,
+        email: formData.email,
+        phone: formData.phone || "0000000000",
+        password: formData.password || "Password123!", // Default password for initial setup
+        location: formData.country || "Bahamas",
+        client_type: "SaaS",
+        plan: formData.plan.replace(" Protocol", ""),
+        billing_cycle: "Monthly",
+        payment_method: "Credit Card",
+        clientCode: `CLT-${Date.now().toString().slice(-6)}`,
+        companyName: formData.clientName || "Unknown Company",
+        contactPerson: formData.contact || "Admin",
+        country: formData.country || "Bahamas",
+        status: "active",
+      });
+
+      if (res.data?.success) {
+        await fetchClients();
+        addLog({
+          action: "SaaS Registration",
+          detail: `New SaaS client ${formData.clientName} registered via Landing Page.`,
+          type: "system",
+        });
+        return res.data.data;
+      }
+    } catch (error) {
+      console.error("Failed to register SaaS client:", error);
+      throw error;
+    }
+  };
+
+  const dispatchSubscriptionRequest = async (request) => {
+    try {
+      const res = await api.post("/saas/submit", request);
+      return res.data;
+    } catch (error) {
+      console.error("Failed to submit SaaS request:", error);
+      throw error;
+    }
+  };
+
+  const updateSubscriptionRequest = async (id, status) => {
+    try {
+      if (status === "Approved") {
+        // Call the provisioning endpoint which creates user + client in DB
+        const res = await api.post(`/saas/requests/${id}/provision`);
+        if (res.data?.success) {
+          setSubscriptionRequests((prev) =>
+            prev.map((req) =>
+              String(req.id) === String(id)
+                ? { ...req, status: "Provisioned" }
+                : req,
+            ),
+          );
+
+          // Refresh clients list to include the new client
+          await fetchClients();
+
+          addLog({
+            action: "Request Approved",
+            detail: `Provisioned workspace for ${res.data.data.clientName}. Protocol: ${res.data.data.plan}. Credentials generated for ${res.data.data.email}.`,
+            type: "system",
+          });
+
+          return res.data.data; // { clientId, clientName, email, password, plan }
+        }
+      } else {
+        // For Rejected or other status updates
+        const res = await api.put(`/saas/requests/${id}/status`, { status });
+        if (res.data?.success) {
+          setSubscriptionRequests((prev) =>
+            prev.map((req) =>
+              String(req.id) === String(id) ? { ...req, status } : req,
+            ),
+          );
+
+          const req = (subscriptionRequests || []).find((r) => r.id === id);
+          if (req) {
+            addLog({
+              action: "Request Updated",
+              detail: `Registration for ${req.clientName} marked as ${status}.`,
+              type: "alert",
+            });
+          }
+        }
+      }
+    } catch (error) {
+      console.error("Failed to update subscription request:", error);
+      const errMsg = error.response?.data?.message || "Provisioning failed";
+      alert(errMsg);
+    }
+    return null;
+  };
+
+  const deleteSubscriptionRequest = async (id) => {
+    try {
+      const res = await api.delete(`/saas/requests/${id}`);
+      if (res.data?.success) {
+        setSubscriptionRequests((prev) => prev.filter((req) => req.id !== id));
+        addLog({
+          action: "Request Purged",
+          detail: `Institutional request ${id} removed from queue.`,
+          type: "alert",
+        });
+      }
+    } catch (error) {
+      console.error("Failed to delete subscription request:", error);
+    }
+  };
+
+  const getRevenueChartData = () => {
+    const now = new Date();
+    const dataMap = {};
+
+    const paidInvoices = invoices.filter((inv) => inv.status?.toLowerCase() === "paid");
+
+    if (revenueFilter === "Daily") {
+      // Last 24 hours in 2-hour blocks
+      for (let i = 0; i < 24; i += 2) {
+        const hour = String(i).padStart(2, "0") + ":00";
+        dataMap[hour] = 0;
+      }
+      paidInvoices.forEach((inv) => {
+        const date = new Date(inv.date);
+        if (now.getTime() - date.getTime() < 86400000) {
+          const hour = Math.floor(date.getHours() / 2) * 2;
+          const key = String(hour).padStart(2, "0") + ":00";
+          if (dataMap[key] !== undefined)
+            dataMap[key] += Number(inv.totalAmount);
+        }
+      });
+    } else if (revenueFilter === "Weekly") {
+      const days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+      days.forEach((d) => (dataMap[d] = 0));
+      paidInvoices.forEach((inv) => {
+        const date = new Date(inv.date);
+        if (now.getTime() - date.getTime() < 7 * 86400000) {
+          const day = days[date.getDay()];
+          dataMap[day] += Number(inv.totalAmount);
+        }
+      });
+    } else if (revenueFilter === "Monthly") {
+      ["Week 1", "Week 2", "Week 3", "Week 4"].forEach((w) => (dataMap[w] = 0));
+      paidInvoices.forEach((inv) => {
+        const date = new Date(inv.date);
+        if (
+          now.getMonth() === date.getMonth() &&
+          now.getFullYear() === date.getFullYear()
+        ) {
+          const week = Math.min(4, Math.ceil(date.getDate() / 7));
+          dataMap[`Week ${week}`] += Number(inv.totalAmount);
+        }
+      });
+    } else {
+      // Generic fallback or larger grouping
+      const months = [
+        "Jan",
+        "Feb",
+        "Mar",
+        "Apr",
+        "May",
+        "Jun",
+        "Jul",
+        "Aug",
+        "Sep",
+        "Oct",
+        "Nov",
+        "Dec",
+      ];
+      months.forEach((m) => (dataMap[m] = 0));
+      paidInvoices.forEach((inv) => {
+        const date = new Date(inv.date);
+        if (now.getFullYear() === date.getFullYear()) {
+          const month = months[date.getMonth()];
+          dataMap[month] += Number(inv.totalAmount);
+        }
+      });
+    }
+
+    return Object.keys(dataMap).map((key) => ({
+      name: key,
+      revenue: dataMap[key],
+    }));
+  };
+
+  // --- STAFF ACTIONS ---
+  const addUser = async (user) => {
+    try {
+      const cleaned = { ...user };
+      const normalizedCompanyId = normalizeCompanyIdForApi(
+        cleaned.company_id ?? cleaned.companyId,
+      );
+
+      if (normalizedCompanyId === undefined) {
+        delete cleaned.company_id;
+        delete cleaned.companyId;
+      } else {
+        cleaned.company_id = normalizedCompanyId;
+        cleaned.companyId = normalizedCompanyId;
+      }
+
+      const res = await api.post("/users", cleaned);
+      if (res.data?.success) {
+        await fetchStaff();
+        addLog({
+          action: "Staff Provisioned",
+          detail: `Onboarded ${user.name} as ${user.role}.`,
+          type: "system",
+        });
+        return res.data;
+      }
+    } catch (error) {
+      console.error("Failed to add user:", error);
+      const msg = error.response?.data?.message || "Failed to add user.";
+      alert(msg);
+      throw error;
+    }
+  };
+
+  const updateUser = async (updated) => {
+    try {
+      const id = updated?.id;
+      if (id == null) {
+        console.error("updateUser: missing user id");
+        return;
+      }
+      const safePayload = { ...updated };
+      if (!safePayload.password) {
+        delete safePayload.password;
+      }
+      if (safePayload.avatar && typeof safePayload.avatar === 'string' && safePayload.avatar.length > 190 && !safePayload.avatar.startsWith('http')) {
+        delete safePayload.avatar;
+      }
+      const bank =
+        safePayload?.bankingInfo?.bank ??
+        safePayload.bankName ??
+        safePayload.bank_name;
+      const account =
+        safePayload?.bankingInfo?.account ??
+        safePayload.accountNumber ??
+        safePayload.account_number;
+      const routing =
+        safePayload?.bankingInfo?.routing ??
+        safePayload.routingNumber ??
+        safePayload.routing_number;
+      const payload = {
+        ...safePayload,
+        bank_name: bank,
+        bankName: bank,
+        account_number: account,
+        accountNumber: account,
+        routing_number: routing,
+        routingNumber: routing,
+        vacation_balance:
+          safePayload.vacationBalance ?? safePayload.vacation_balance,
+        vacationBalance:
+          safePayload.vacationBalance ?? safePayload.vacation_balance,
+        bankingInfo: {
+          ...(typeof safePayload.bankingInfo === 'object' ? safePayload.bankingInfo : {}),
+          bank,
+          account,
+          routing,
+          vacationQuota: Number(safePayload.vacationBalance ?? safePayload.vacation_balance ?? 80),
+        },
+      };
+
+      if (safePayload.vacationBalance !== undefined && id) {
+        try {
+          localStorage.setItem(`dedicated_vacation_${id}`, String(safePayload.vacationBalance));
+        } catch (_) { }
+      }
+
+      const endpoint = String(id) === String(currentUser?.id) ? '/auth/profile' : `/users/${id}`;
+      const res = await api.put(endpoint, payload);
+      if (res.data?.success) {
+        const apiUser = normalizeUserForUi(
+          normalizeApiUserPayload(res.data.data),
+        );
+        const normalizedPayload = normalizeUserForUi(payload);
+
+        const list = await fetchStaff();
+        setUsers((prev) => {
+          const baseList = Array.isArray(list) ? list : prev;
+          if (!Array.isArray(baseList)) return prev;
+          return baseList.map((u) => {
+            if (String(u.id) !== String(id)) return u;
+            return normalizeUserForUi(
+              mergeUserFields(u, apiUser, normalizedPayload),
+            );
+          });
+        });
+
+        setCurrentUser((cur) => {
+          if (!cur || String(cur.id) !== String(id)) return cur;
+          const next = normalizeUserForUi(
+            mergeUserFields(cur, apiUser, normalizedPayload),
+          );
+          try {
+            localStorage.setItem("user", JSON.stringify(next));
+          } catch (e) {
+            console.error("Failed to persist user to localStorage", e);
+          }
+          return next;
+        });
+
+        addLog({
+          action: "Staff Profile Modified",
+          detail: `Updated record for ${safePayload.name || apiUser?.name || id}.`,
+          type: "system",
+        });
+        return res.data;
+      }
+    } catch (error) {
+      console.error("Failed to update user:", error);
+      const msg = error.response?.data?.message || "Failed to update user.";
+      alert(msg);
+      throw error;
+    }
+  };
+
+  const reviewStaff = async (id, status) => {
+    try {
+      // Try tenant-scoped review first (admin reviewing their own staff)
+      // Falls back to super_admin staff-review endpoint
+      try {
+        await api.put(`/users/${id}/review`, { status });
+      } catch (e) {
+        await api.put(`/auth/staff-review/${id}`, { status });
+      }
+
+      // Re-fetch staff to update local state
+      await fetchStaff();
+
+      addLog({
+        action: "Staff Review",
+        detail: `Staff protocol ${status === "Active" ? "Activated" : "Denied"} for ID: ${id}.`,
+        type: "system",
+      });
+    } catch (error) {
+      console.error("Failed to review staff:", error);
+      alert("Error updating staff status.");
+    }
+  };
+
+  const deleteUser = async (id) => {
+    try {
+      await api.delete(`/users/${id}`);
+      await fetchStaff();
+      addLog({
+        action: "Staff Terminated",
+        detail: `Separated staff member ID: ${id}.`,
+        type: "alert",
+      });
+    } catch (error) {
+      console.error("Failed to delete user:", error);
+      const msg = error.response?.data?.message || "Failed to delete user.";
+      alert(msg);
+      throw error;
+    }
+  };
+
+  const deleteOrder = async (id) => {
+    try {
+      await api.delete(`/orders/${id}`);
+      setOrders((prev) => prev.filter((o) => o.id !== id));
+      await syncGlobalState();
+      addLog({
+        action: "Order Terminated",
+        detail: `Protocol ${id} deleted from ledger.`,
+        type: "alert",
+      });
+    } catch (error) {
+      console.error("Failed to delete order:", error);
+    }
+  };
+
+  const updateOrder = async (orderId, data) => {
+    try {
+      console.log(data)
+      const numericParam =
+        typeof orderId === "string"
+          ? orderId.replace(/[^\d]/g, "") || orderId
+          : orderId;
+
+      // Status-only payloads (backward compat): string | { status }
+      const isBareStatus =
+        typeof data === "string" ||
+        (data &&
+          typeof data === "object" &&
+          Object.keys(data).length === 1 &&
+          Object.prototype.hasOwnProperty.call(data, "status"));
+
+      if (isBareStatus) {
+        const statusRaw = typeof data === "string" ? data : data.status;
+        const normalized = normalizeOrderStatusForApi(statusRaw);
+        if (!normalized) {
+          alert(
+            `Invalid workflow status "${statusRaw}". Use a known stage (e.g. admin_review, concierge, operation, logistics, completed).`,
+          );
+          return;
+        }
+        await api.patch(`/orders/${numericParam}/status`, {
+          status: normalized,
+        });
+        setOrders((prev) =>
+          prev.map((o) =>
+            String(o.id) === String(orderId) ||
+              String(o.id) === String(numericParam)
+              ? { ...o, status: normalized }
+              : o,
+          ),
+        );
+        addLog({
+          action: "Order Updated",
+          detail: `Order ${orderId} status changed to ${normalized}.`,
+          type: "system",
+        });
+        notifyStateChanged(queryClient, ['orders', ['orders', numericParam], 'deliveries', 'dashboardStats']);
+        await fetchOrders();
+        return;
+      }
+
+      const { status: uiStatusRaw, ...rest } = data;
+      const normalizedFromForm = normalizeOrderStatusForApi(uiStatusRaw);
+      let statusPatched = false;
+
+      // PATCH status first: PUT can return 400 "No fields to update" when only status changed, which blocked saves.
+      if (normalizedFromForm) {
+        await api.patch(`/orders/${numericParam}/status`, {
+          status: normalizedFromForm,
+        });
+        statusPatched = true;
+      }
+
+      const putCandidate = {
+        client_id: rest.clientId ?? rest.client_id,
+        company_id: rest.companyId ?? rest.company_id,
+        vendor_id: rest.vendorId ?? rest.vendor_id,
+        vendor_name: rest.vendorName ?? rest.vendor_name ?? rest.vendor,
+        type: rest.type,
+        items: rest.items,
+        notes: rest.notes,
+        location: rest.location,
+        pickup_location: rest.pickupLocation ?? rest.pickup_location,
+        total_amount: rest.total ?? rest.total_amount ?? rest.totalAmount,
+        due_date: isoDateSlice(rest.dueDate || rest.due_date) || null,
+        order_date:
+          isoDateSlice(rest.date || rest.requestDate || rest.order_date) ||
+          undefined,
+        deliveryType: rest.deliveryType ?? rest.deliveryMode ?? rest.mode,
+      };
+      const putBody = {};
+      for (const [k, val] of Object.entries(putCandidate)) {
+        if (val === undefined) continue;
+        if (val === "" && ["client_id", "vendor_id", "company_id"].includes(k))
+          continue;
+        putBody[k] = val;
+      }
+      if (Object.keys(putBody).length > 0) {
+        try {
+          await api.put(`/orders/${numericParam}`, putBody);
+        } catch (putError) {
+          // Keep status change durable even if generic profile update fails.
+          if (!statusPatched) throw putError;
+          console.warn(
+            "Order detail PUT failed after successful status PATCH:",
+            putError?.response?.data || putError?.message,
+          );
+        }
+      }
+
+      notifyStateChanged(queryClient, ['orders', ['orders', numericParam], 'deliveries', 'dashboardStats']);
+      await syncGlobalState();
+      addLog({
+        action: "Order Updated",
+        detail: `Order ${orderId} parameters recalibrated.`,
+        type: "system",
+      });
+    } catch (error) {
+      console.error("Failed to update order:", error);
+      const msg = error.response?.data?.message || "";
+      alert(msg || "Failed to update order.");
+    }
+  };
+
+  const assignOrderToStage = async (
+    orderId,
+    stage,
+    assignedTo = null,
+    notes = null,
+  ) => {
+    try {
+      const res = await api.put(`/orders/${orderId}/assign`, {
+        stage,
+        assigned_to: assignedTo,
+        notes,
+      });
+      if (res.data?.success) {
+        notifyStateChanged(queryClient, ['orders', ['orders', orderId], 'deliveries', 'dashboardStats']);
+        await fetchOrders();
+        const stageNorm = String(stage || "").toLowerCase();
+        if (stageNorm === "logistics" && orderId != null) {
+          try {
+            const delRes = await api.get("/deliveries");
+            const rawDel = delRes.data?.success ? delRes.data.data : [];
+            const hasForOrder =
+              Array.isArray(rawDel) &&
+              rawDel.some((d) => Number(d.order_id) === Number(orderId));
+            if (!hasForOrder) {
+              const ordRes = await api.get("/orders");
+              const ordList = ordRes.data?.success
+                ? ordRes.data.data
+                : Array.isArray(ordRes.data)
+                  ? ordRes.data
+                  : [];
+              const o = ordList.find((x) => String(x.id) === String(orderId));
+              if (o) {
+                let parsedItems = o.items;
+                if (typeof parsedItems === "string") {
+                  try {
+                    parsedItems = JSON.parse(parsedItems);
+                  } catch {
+                    parsedItems = [];
+                  }
+                }
+                const itemsArr = Array.isArray(parsedItems) ? parsedItems : [];
+                const totalAmountVal = mapOrderDisplayTotal(o, itemsArr);
+                const orderDateVal = isoDateSlice(o.order_date || o.created_at);
+                const dueVal = isoDateSlice(o.due_date);
+                const dropAddr =
+                  o.delivery_address || o.location || o.deliveryAddress || "";
+                const firstItemName = itemsArr[0]?.name || "Order";
+                await addDelivery({
+                  orderId,
+                  company_id: o.company_id ?? null,
+                  client_id: o.client_id ?? o.customer_id ?? null,
+                  customer_id: o.customer_id ?? null,
+                  missionType: "Delivery",
+                  location: dropAddr,
+                  driver: "",
+                  vehicleId: "",
+                  items: itemsArr,
+                  pickupLocation: "Fulfilment Hub",
+                  dropLocation: dropAddr,
+                  dueDate: dueVal || orderDateVal,
+                  status: "Pending Pickup",
+                  delivery_instructions:
+                    o.delivery_instructions || o.deliveryInstructions || null,
+                  delivery_fee: 0, // Staff payout is set separately in Deliveries form (distance × rate/km)
+                });
+                await addStaffAssignment({
+                  assigneeId: assignedTo ?? null,
+                  task: `Dispatch Order #${orderId} - ${firstItemName}`,
+                  location: dropAddr || "Client location",
+                  status: "Pending",
+                  priority: "Normal",
+                  missionType: "Delivery",
+                  pickupLocation: "Fulfilment Hub",
+                  deliveryLocation: dropAddr || "",
+                });
+              }
+            }
+          } catch (ensureErr) {
+            console.warn(
+              "Could not ensure delivery queue after logistics stage:",
+              ensureErr?.response?.data || ensureErr?.message,
+            );
+          }
+        } else if (stageNorm === "concierge" && orderId != null) {
+          try {
+            const ordRes = await api.get("/orders");
+            const ordList = ordRes.data?.success
+              ? ordRes.data.data
+              : Array.isArray(ordRes.data)
+                ? ordRes.data
+                : [];
+            const o = ordList.find((x) => String(x.id) === String(orderId));
+            if (o) {
+              const customLabel =
+                String(
+                  o.custom_request_category || o.customRequestCategory || "",
+                )
+                  .replace(/_/g, " ")
+                  .trim() || "Custom request";
+              const dropAddr =
+                o.delivery_address || o.location || o.deliveryAddress || "";
+              await addStaffAssignment({
+                assigneeId: assignedTo ?? null,
+                task: `Concierge triage: Order #${orderId} — ${customLabel}`,
+                location: dropAddr || "Client location",
+                status: "Pending",
+                priority: "High",
+                missionType: "Concierge",
+                pickupLocation: "Concierge desk",
+                deliveryLocation: dropAddr || "",
+              });
+            }
+          } catch (conciergeErr) {
+            console.warn(
+              "Could not enqueue concierge desk assignment:",
+              conciergeErr?.response?.data || conciergeErr?.message,
+            );
+          }
+        }
+        addLog({
+          action: "Stage Transition",
+          detail: `Order ${orderId} moved to ${stage} stage.`,
+          type: "system",
+        });
+        return res.data;
+      }
+    } catch (error) {
+      console.error("Failed to assign order stage:", error);
+      const errMsg =
+        error.response?.data?.message || "Failed to move order to next stage.";
+      alert(errMsg);
+    }
+    return null;
+  };
+
+  const launchMissionFromOrder = async (orderId, missionData) => {
+    try {
+      const res = await api.post(`/missions/convert/${orderId}`, missionData);
+      if (res.data?.success) {
+        await fetchOrders();
+        await fetchMissions();
+        addLog({
+          action: "Mission Launched",
+          detail: `Order ${orderId} converted to Mission ${res.data.data.id}.`,
+          type: "system",
+        });
+        return res.data.data;
+      }
+    } catch (error) {
+      console.error("Failed to convert order to mission:", error);
+    }
+  };
+
+  const convertOrderToProject = async (orderId, projectData) => {
+    try {
+      const res = await api.post(`/orders/convert/${orderId}`, projectData);
+      if (res.data?.success) {
+        try { await api.put(`/orders/${orderId}/status`, { status: 'logistics' }); } catch (_) { }
+        await fetchOrders();
+        await fetchProjects();
+        window.dispatchEvent(new CustomEvent('app:state-changed'));
+        addLog({
+          action: "Project Launched",
+          detail: `Order ${orderId} converted to Project ${res.data.data.id}.`,
+          type: "system",
+        });
+        return res.data.data;
+      }
+    } catch (error) {
+      console.error("Failed to convert order to project:", error);
+    }
+  };
+
+  const convertProjectToMission = async (projectId, missionData) => {
+    try {
+      const res = await api.post(
+        `/missions/convert-project/${projectId}`,
+        missionData,
+      );
+      if (res.data?.success) {
+        const prj = (projects || []).find(p => String(p.id) === String(projectId));
+        const orderRef = prj?.orderRef || prj?.order_ref || prj?.orderId || prj?.order_id;
+        if (orderRef) {
+          try { await api.put(`/orders/${orderRef}/status`, { status: 'logistics' }); } catch (_) { }
+        }
+        await fetchProjects();
+        await fetchMissions();
+        await fetchOrders();
+        window.dispatchEvent(new CustomEvent('app:state-changed'));
+        addLog({
+          action: "Mission Launched",
+          detail: `Project ${projectId} converted to Mission ${res.data.data.id}.`,
+          type: "system",
+        });
+        return res.data.data;
+      }
+    } catch (error) {
+      console.error("Failed to convert project to mission:", error);
+    }
+  };
+
+  const updateMissionStatus = async (id, status) => {
+    try {
+      await api.put(`/missions/${id}/status`, { status });
+
+      const normSt = String(status).toLowerCase();
+      const targetMission = (missions || []).find((m) =>
+        String(m.id) === String(id) || String(m.missionNumber) === String(id) || String(m.db_id) === String(id)
+      );
+
+      if (targetMission) {
+        let mOrderId = targetMission.orderId || targetMission.order_id || targetMission.metadata?.orderId;
+        if (typeof mOrderId === 'string' && mOrderId.startsWith('DEL-')) {
+          mOrderId = targetMission.delivery?.orderId || targetMission.metadata?.orderId;
+        }
+        const linkedPrj = (projects || []).find(p => String(p.id) === String(mOrderId) || String(p.orderId) === String(mOrderId) || String(p.id) === String(targetMission.metadata?.projectId));
+        const orderRef = linkedPrj?.orderRef || linkedPrj?.order_ref || linkedPrj?.orderId || mOrderId;
+
+        let targetOrderStatus = null;
+        if (['completed', 'delivered', 'done'].includes(normSt)) {
+          targetOrderStatus = 'completed';
+        } else if (['en_route', 'in_transit', 'dispatched'].includes(normSt)) {
+          targetOrderStatus = 'en_route';
+        } else if (['assigned', 'accepted', 'in_progress'].includes(normSt)) {
+          targetOrderStatus = 'logistics';
+        }
+
+        if (targetOrderStatus) {
+          const idsToUpdate = [mOrderId, orderRef, linkedPrj?.id].filter(oId => oId && !String(oId).startsWith('DEL-'));
+          for (const targetId of new Set(idsToUpdate)) {
+            try {
+              await api.put(`/orders/${targetId}/status`, { status: targetOrderStatus }).catch(() =>
+                api.patch(`/orders/${targetId}/status`, { status: targetOrderStatus })
+              );
+            } catch (_) { }
+          }
+        }
+      }
+
+      await syncGlobalState();
+      window.dispatchEvent(new CustomEvent('app:state-changed'));
+      notifyStateChanged(queryClient, ['missions', 'deliveries', 'orders', 'projects', 'dashboardStats']);
+
+      addLog({
+        action: "Mission Update",
+        detail: `Mission ${id} status updated to ${status}.`,
+        type: "logistics",
+      });
+    } catch (error) {
+      console.error("Failed to update mission status:", error);
+    }
+  };
+
+  const submitMissionPOD = async (missionId, podData) => {
+    try {
+      const res = await api.post(`/missions/${missionId}/pod`, podData);
+
+      const targetMission = (missions || []).find((m) =>
+        String(m.id) === String(missionId) || String(m.missionNumber) === String(missionId) || String(m.db_id) === String(missionId)
+      );
+
+      if (targetMission) {
+        let mOrderId = targetMission.orderId || targetMission.order_id || targetMission.metadata?.orderId;
+        if (typeof mOrderId === 'string' && mOrderId.startsWith('DEL-')) {
+          mOrderId = targetMission.delivery?.orderId || targetMission.metadata?.orderId;
+        }
+        const linkedPrj = (projects || []).find(p => String(p.id) === String(mOrderId) || String(p.orderId) === String(mOrderId) || String(p.id) === String(targetMission.metadata?.projectId));
+        const orderRef = linkedPrj?.orderRef || linkedPrj?.order_ref || linkedPrj?.orderId || mOrderId;
+
+        const idsToUpdate = [mOrderId, orderRef, linkedPrj?.id].filter(oId => oId && !String(oId).startsWith('DEL-'));
+        for (const targetId of new Set(idsToUpdate)) {
+          try {
+            await api.put(`/orders/${targetId}/status`, { status: 'completed' }).catch(() =>
+              api.patch(`/orders/${targetId}/status`, { status: 'completed' })
+            );
+          } catch (_) { }
+        }
+      }
+
+      await syncGlobalState();
+      window.dispatchEvent(new CustomEvent('app:state-changed'));
+      notifyStateChanged(queryClient, ['missions', 'deliveries', 'orders', 'projects', 'dashboardStats']);
+
+      addLog({
+        action: "Mission POD Submitted",
+        detail: `POD submitted for Mission ${missionId}. Status marked completed.`,
+        type: "logistics",
+      });
+      return res.data;
+    } catch (error) {
+      console.error("Submit mission POD failed", error);
+      throw error;
+    }
+  };
+
+  const assignMissionDriver = async (missionId, driverId, vehicleId) => {
+    try {
+      await api.put(`/missions/${missionId}/assign`, { driverId, vehicleId });
+      await Promise.all([
+        fetchMissions(),
+        fetchChauffeurRequests ? fetchChauffeurRequests() : Promise.resolve(),
+        fetchDeliveries ? fetchDeliveries() : Promise.resolve()
+      ]);
+      addLog({
+        action: "Driver Assigned",
+        detail: `Driver ${driverId} assigned to Mission ${missionId}.`,
+        type: "logistics",
+      });
+      return true;
+    } catch (error) {
+      console.error("Failed to assign driver:", error);
+      return false;
+    }
+  };
+
+  const deleteMission = async (id) => {
+    try {
+      await api.delete(`/missions/${id}`);
+      setMissions((prev) => prev.filter((m) => m.id !== id));
+      addLog({
+        action: "Mission Scrapped",
+        detail: `Removed mission ${id} from operational queue.`,
+        type: "system",
+      });
+    } catch (error) {
+      console.error("Failed to delete mission:", error);
+    }
+  };
+
+  const hasPermission = (permission) => {
+    const normalizedRole = normalizeRole(currentUser?.role);
+    if (normalizedRole === "superadmin") return true;
+    // Financial restrictions
+    if (
+      ["financial_reports", "revenue_analytics", "invoice_management"].includes(
+        permission,
+      )
+    ) {
+      return normalizedRole === "superadmin";
+    }
+    return true;
+  };
+
+  // --- INTEGRATED DATA FLOW ACTIONS ---
+
+  const addOrder = async (order, options = {}) => {
+    const { silentUi = false, customerCheckout = false } = options;
+    const roleKey = normalizeRole(currentUser?.role);
+    const userRole = roleKey;
+    const isCustomer = userRole === "customer";
+
+    // Marketplace / store checkout — customers may place orders. Manual "Create Order" is staff-only.
+    if (
+      !customerCheckout &&
+      !roleCanCreateInstitutionalOrder(roleKey)
+    ) {
+      const msg =
+        "Only authorised staff can create orders here. Customers should use Marketplace checkout, or ask staff to raise an order on their behalf.";
+      if (!silentUi) window.alert(msg);
+      return { ok: false, error: msg };
+    }
+    if (!order.items || order.items.length === 0) {
+      if (!silentUi) alert("Order Error: No items in manifest.");
+      return false;
+    }
+
+    // 0. Resolve Client ID if missing but name is present
+    let targetClientId = order.clientId;
+    if (isCustomer && currentUser?.clientId) {
+      targetClientId = currentUser.clientId;
+    } else if (!targetClientId && order.client) {
+      const foundClient = clients.find((c) => (currentUser?.email && c.email?.toLowerCase() === currentUser.email?.toLowerCase()) || c.name === order.client);
+      if (foundClient) targetClientId = foundClient.id;
+    }
+    if (!targetClientId) targetClientId = 1;
+
+    const total = (order.items || []).reduce(
+      (acc, item) =>
+        acc + parseFloat(item.price || 0) * parseInt(item.qty || 0),
+      0,
+    );
+
+    try {
+      const tenantTypeKey = String(
+        currentUser?.tenant_type || currentUser?.tenantType || "",
+      )
+        .trim()
+        .toLowerCase();
+      const isBusinessTenant =
+        tenantTypeKey === "saas" ||
+        tenantTypeKey === "business" ||
+        ["client", "saas_client", "admin"].includes(roleKey);
+      const isPersonalAutoChargeUser =
+        roleKey === "customer" && !isBusinessTenant;
+      const hqCompanyId = Number(import.meta.env?.VITE_DEFAULT_COMPANY_ID) || 1;
+      const scopedCompanyId =
+        currentUser?.company_id || currentUser?.companyId || null;
+      /** Personal marketplace orders must use the customer's linked company when set, so that company's admin sees them in /orders. */
+      const customerOrderCompanyId = isCustomer
+        ? (normalizeCompanyIdForApi(scopedCompanyId) ?? hqCompanyId)
+        : null;
+      const orderDateVal =
+        isoDateSlice(
+          order.order_date ||
+          order.orderDate ||
+          order.date ||
+          order.requestDate,
+        ) || localDateISO();
+      const dueVal = isoDateSlice(order.dueDate || order.due_date || null);
+      const orderKindNorm = String(
+        order.order_kind || order.orderKind || "marketplace",
+      ).toLowerCase();
+      const customCategory = String(
+        order.custom_request_category || order.customRequestCategory || "",
+      ).toLowerCase();
+      const isCustomRequestOrder =
+        orderKindNorm === "custom_request" || customCategory !== "";
+      /** All client and customer orders must enter pending review ('created') so Admin can accept before moving to operations */
+      const routedDepartment = isCustomRequestOrder ? "concierge" : "operations";
+
+      const requestedStatus =
+        normalizeOrderStatusForApi(order.status) || "created";
+      const totalAmountVal = (() => {
+        const direct = parseFloat(
+          order.estimated_total ?? order.total_amount ?? order.total ?? 0,
+        );
+        if (Number.isFinite(direct) && !Number.isNaN(direct) && direct >= 0)
+          return direct;
+        return Number.isFinite(total) && !Number.isNaN(total) ? total : 0;
+      })();
+      const subtotalVal = (() => {
+        const sub = parseFloat(order.subtotal ?? totalAmountVal);
+        return Number.isFinite(sub) && !Number.isNaN(sub)
+          ? sub
+          : totalAmountVal;
+      })();
+      const pickupLocationVal =
+        order.pickupLocation ?? order.pickup_location ?? null;
+
+      const res = await api.post("/orders", {
+        clientId: isCustomer ? (currentUser?.clientId || targetClientId) : targetClientId,
+        tenantId: isCustomer ? (currentUser?.tenantId || 1) : undefined,
+        companyId: isCustomer
+          ? customerOrderCompanyId
+          : userRole !== "super_admin"
+            ? scopedCompanyId
+            : order.company_id || order.companyId || targetClientId,
+        vendorId: (() => {
+          const vId = order.vendorId != null ? order.vendorId : order.vendor_id;
+          return vId && vId !== "" ? Number(vId) : null;
+        })(),
+        vendor_name: order.vendor || order.vendor_name || null,
+        type: order.type || order.orderType || "Delivery",
+        orderType: order.orderType || order.type || "Delivery",
+        items: order.items,
+        customItems: order.items,
+        custom_items: order.items,
+        manifestItems: order.items,
+        notes: order.notes || null,
+        location: order.deliveryAddress || order.location || null,
+        delivery_address: order.deliveryAddress || order.location || null,
+        pickup_location: pickupLocationVal,
+        order_date: orderDateVal,
+        request_date: orderDateVal,
+        due_date: dueVal || null,
+        order_kind: order.order_kind || order.orderKind || "marketplace",
+        delivery_mode:
+          order.deliveryType || order.delivery_mode || order.deliveryMode || "Road",
+        deliveryType:
+          order.deliveryType || order.delivery_mode || order.deliveryMode || "Road",
+        delivery_type:
+          order.deliveryType || order.delivery_mode || order.deliveryMode || "Road",
+        transportAsset:
+          order.transportAsset || order.transport_asset || null,
+        transport_asset:
+          order.transport_asset || order.transportAsset || null,
+        transportAssetCustom:
+          order.transportAssetCustom || order.transport_asset_custom || null,
+        transport_asset_custom:
+          order.transport_asset_custom || order.transportAssetCustom || null,
+        islandLocation:
+          order.islandLocation || order.island_location || null,
+        island_location:
+          order.island_location || order.islandLocation || null,
+        transport_fee:
+          order.transport_fee || null,
+        currentDepartment: routedDepartment,
+        current_department: routedDepartment,
+        routed_department: routedDepartment,
+        route_department: routedDepartment,
+        total_amount: totalAmountVal,
+        totalAmount: totalAmountVal,
+        subtotal: subtotalVal,
+        estimated_total: totalAmountVal,
+        status: requestedStatus,
+        book_chauffeur: !!(order.bookChauffeur || order.book_chauffeur),
+        custom_request_category:
+          order.custom_request_category || order.customRequestCategory || null,
+        concierge_member: !!(
+          currentUser?.concierge_member || currentUser?.conciergeMembership
+        ),
+        delivery_instructions:
+          order.delivery_instructions || order.deliveryInstructions || null,
+      });
+
+      const newId = res.data?.data?.id ?? res.data?.data ?? res.data?.id;
+
+      if (newId != null) {
+        const createdIso = new Date().toISOString();
+        const optimisticOrder = {
+          ...order,
+          id: newId,
+          rawId: newId,
+          orderNumber: res.data?.data?.orderNumber || `ORD-${new Date().getFullYear()}-${String(newId).padStart(4, '0')}`,
+          createdAt: createdIso,
+          created_at: createdIso,
+          order_date: orderDateVal,
+          date: orderDateVal,
+          requestDate: orderDateVal,
+          status: requestedStatus,
+          statusLabel: displayOrderStatus(requestedStatus),
+          total: totalAmountVal,
+          total_amount: totalAmountVal,
+          amount: totalAmountVal,
+          items: order.items || [],
+          customItems: order.items || [],
+          manifestItems: order.items || [],
+          client: order.client || currentUser?.name || "Client",
+          clientId: isCustomer ? (currentUser?.clientId || targetClientId) : targetClientId,
+          customer_id: isCustomer ? currentUser?.id : undefined,
+          created_by: currentUser?.id,
+          userId: currentUser?.id,
+          email: currentUser?.email,
+          location: order.deliveryAddress || order.location || null,
+          delivery_address: order.deliveryAddress || order.location || null,
+          pickupLocation: pickupLocationVal,
+          pickup_location: pickupLocationVal,
+          deliveryType: order.deliveryType || "Road",
+          delivery_mode: order.deliveryType || "Road",
+          metadata: {
+            ...order,
+            customItems: order.items || [],
+            manifestItems: order.items || [],
+            status: requestedStatus,
+            totalAmount: totalAmountVal,
+            total_amount: totalAmountVal,
+            customer_id: currentUser?.id,
+            user_id: currentUser?.id,
+            created_by: currentUser?.id,
+            email: currentUser?.email,
+          }
+        };
+        setOrders((prev) => [optimisticOrder, ...prev.filter((o) => String(o.id) !== String(newId))]);
+      }
+
+      if (!silentUi) {
+        swalSuccess(
+          "Institutional Protocol Initialized: Order has been successfully logged and queued for audit.",
+        );
+      }
+
+      addLog({
+        action: "Order Received",
+        detail: `${newId} submitted by client.`,
+        type: "system",
+      });
+
+      // Background tasks (non-blocking Promise execution so UI doesn't hang)
+      Promise.resolve().then(async () => {
+        // Enforce routed status if role allows
+        if (
+          requestedStatus &&
+          newId != null &&
+          roleCanUpdateOrderStatus(normalizeRole(currentUser?.role))
+        ) {
+          try {
+            await api.patch(`/orders/${newId}/status`, {
+              status: requestedStatus,
+            });
+          } catch (statusErr) {
+            console.warn(
+              "Could not enforce routed status after order create:",
+              statusErr?.response?.data || statusErr?.message,
+            );
+          }
+        }
+
+        // Personal (non-business) accounts: immediately raise invoice + settlement record in background
+        if (isPersonalAutoChargeUser && newId != null) {
+          try {
+            const invRes = await api.post(
+              "/finance/invoices",
+              buildFinanceInvoiceCreatePayload({
+                orderId: newId,
+                clientId: currentUser?.id ?? null,
+                totalAmount: totalAmountVal,
+                dueDate: orderDateVal,
+                paidAmount: 0,
+                status: "unpaid",
+              }),
+            );
+            const payload = invRes.data?.data ?? invRes.data;
+            const invId = payload?.id ?? payload?.invoice_id ?? payload;
+            if (invId != null && String(invId).match(/^\d+$/)) {
+              await api.post(`/finance/invoices/${invId}/pay`, {
+                amount: totalAmountVal,
+                payment_method: "Instant checkout (personal)",
+                transaction_id: `AUTO-${Date.now()}`,
+              });
+              await fetchFinance();
+            }
+          } catch (e) {
+            console.warn(
+              "Personal auto-charge in background:",
+              e?.response?.data || e?.message,
+            );
+          }
+        }
+
+        // Global state background synchronization
+        if (syncGlobalState) await syncGlobalState();
+      }).catch(err => console.error("Background order sync error:", err));
+
+      return { ok: true, id: newId, charged: true, chargeError: null };
+    } catch (error) {
+      console.error("Failed to submit order:", error);
+      const hint = error.response?.data?.message || error.message;
+      if (!silentUi) swalError(hint ? `Order failed: ${hint}` : "Order failed.");
+      return { ok: false, error: hint };
+    }
+  };
+
+  const generateInvoiceFromOrder = async (order) => {
+    swalLoading("Generating Invoice", "Creating institutional invoice ledger from order...");
+    try {
+      const items = (order.items && order.items.length > 0)
+        ? order.items.map(item => ({
+          itemId: Number(item.itemId || item.id || 1),
+          quantity: Number(item.quantity || item.qty || 1),
+          unitPrice: Number(item.unitPrice || item.price || 0),
+          tax: 0,
+          discount: 0
+        }))
+        : [{
+          itemId: 1,
+          quantity: 1,
+          unitPrice: Number(order.totalAmount || order.total || 0),
+          tax: 0,
+          discount: 0
+        }];
+
+      const isoDueDate = order.dueDate
+        ? new Date(order.dueDate).toISOString()
+        : new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+
+      const rawOrderId = order.rawId || order.id;
+      const numericOrderId = Number(String(rawOrderId).replace(/\D/g, '')) || 1;
+      const parsedClientId = order.clientId
+        ? (String(order.clientId).startsWith('user_') ? Number(String(order.clientId).replace('user_', '')) : Number(order.clientId))
+        : undefined;
+
+      const reqData = {
+        deliveryId: numericOrderId,
+        orderId: numericOrderId,
+        dueDate: isoDueDate,
+        items,
+        ...(parsedClientId ? { clientId: parsedClientId } : {})
+      };
+
+      const res = await api.post("/invoices", reqData);
+      swalClose();
+      const invNum = res?.data?.data?.invoiceNumber || res?.data?.invoiceNumber || 'Created';
+      swalSuccess("Invoice Generated", `Institutional Ledger ${invNum} generated successfully.`);
+
+      // Re-fetch to sync
+      await fetchFinance();
+
+      addLog({
+        action: "Manual Ledger Commit",
+        detail: `Institutional Ledger generated for mission ${order.id}.`,
+        type: "system",
+      });
+    } catch (error) {
+      swalClose();
+      console.error("Failed to generate invoice:", error);
+      const hint = error.response?.data?.message || error.message;
+      swalError("Invoice Generation Failed", hint || "Please ensure the order/delivery is completed with POD.");
+    }
+  };
+
+  const settleInvoice = async (invoiceId, paymentData) => {
+    try {
+      const numericId =
+        typeof invoiceId === "string" && invoiceId.startsWith("INV-")
+          ? invoiceId.split("-")[1]
+          : invoiceId;
+
+      await api.post("/payments", {
+        invoiceId: Number(numericId),
+        paymentMethod: paymentData.method || "bank_transfer",
+        amount: Number(paymentData.amount),
+        referenceNumber: `TXN-${Date.now()}`,
+        remarks: paymentData.remarks || "Institutional Settlement"
+      });
+
+      await fetchFinance();
+
+      addLog({
+        action: "Ledger Settlement",
+        detail: `Paid $${paymentData.amount} for invoice ${invoiceId}.`,
+        type: "finance",
+      });
+    } catch (error) {
+      console.error("Failed to settle invoice:", error);
+    }
+  };
+
+  const addInvoice = async (invoice) => {
+    try {
+      const reqData = buildFinanceInvoiceCreatePayload(invoice);
+      if (reqData.client_id == null || Number.isNaN(reqData.client_id)) {
+        const msg =
+          "Choose a valid client (company or personal). IDs like user_123 are converted automatically once selected.";
+        window.alert(msg);
+        return { ok: false, error: msg };
+      }
+      await api.post("/finance/invoices", reqData);
+
+      await fetchFinance();
+      addLog({
+        action: "Invoice Generated",
+        detail: `Institutional ledger entry for Order ${invoice.orderId ?? "—"} successfully logged.`,
+        type: "system",
+      });
+      return { ok: true };
+    } catch (error) {
+      console.error("Failed to add invoice:", error);
+      const msg =
+        error.response?.data?.message ||
+        error.message ||
+        "Failed to create invoice.";
+      window.alert(msg);
+      return { ok: false, error: msg };
+    }
+  };
+
+  const addDelivery = async (del) => {
+    try {
+      // Sanitize order_id: strip non-numeric prefixes (e.g., 'ord-122' -> 122)
+      let sanitizedOrderId = null;
+      if (del.orderId) {
+        const parsed =
+          typeof del.orderId === "string"
+            ? parseInt(del.orderId.replace(/[^0-9]/g, ""), 10)
+            : del.orderId;
+        if (!isNaN(parsed)) sanitizedOrderId = parsed;
+      }
+      const rawStatus = String(del.status || "pending")
+        .toLowerCase()
+        .replace(/\s+/g, "_");
+      const createStatusMap = {
+        pending_pickup: "pending",
+        pending_review: "pending",
+        in_transit: "en_route",
+        completed: "delivered",
+      };
+      const apiCreateStatus = createStatusMap[rawStatus] || rawStatus;
+
+      const reqData = {
+        orderId: sanitizedOrderId,
+        companyId: del.companyId || del.company_id || null,
+        clientId: del.customerId || del.customer_id || del.client_id || null,
+        missionType: ["Delivery", "Pickup", "Transfer", "Chauffeur"].includes(
+          del.missionType || del.mission_type,
+        )
+          ? del.missionType || del.mission_type
+          : "Delivery",
+        remarks: JSON.stringify({
+          route: del.location || del.route || "",
+          driver: del.driver_name || del.driver || "",
+          assigned_driver: del.assigned_driver || del.driverId || del.driver_id || null,
+          package_details: typeof del.items === "string" ? del.items : JSON.stringify(del.items || []),
+        }),
+        pickupLocation: del.pickupLocation || del.pickup_location || "",
+        dropLocation: del.dropLocation || del.drop_location || "",
+        dueDate: del.dueDate || del.due_date || null,
+        status: apiCreateStatus,
+        items: Array.isArray(del.items) ? del.items.map(i => ({
+          quantity: Number(i.qty || i.quantity || 1),
+          itemId: i.itemId || i.id || 1
+        })) : [{ quantity: 1, itemId: 1 }],
+        routeDistance: del.route_distance !== '' && del.route_distance !== undefined ? del.route_distance : null,
+        staffPayRate: del.staff_pay_rate !== '' && del.staff_pay_rate !== undefined ? del.staff_pay_rate : null,
+        transportMode: del.mode || 'Road'
+      };
+      const res = await api.post("/deliveries", reqData);
+      if (res.data.success) {
+        await syncGlobalState();
+
+        const delId = `DEL-${String(res.data.data.id).padStart(3, "0")}`;
+        addLog({
+          action: "Mission Launched",
+          detail: `Logistics Protocol ${delId} initiated for ${del.item || "Order " + del.orderId}.`,
+          type: "logistics",
+        });
+      }
+    } catch (error) {
+      console.error("Failed to add delivery:", error);
+      const msg = error.response?.data?.message || "Failed to create delivery.";
+      alert(msg);
+    }
+  };
+
+  const normalizeDeliveryDbId = (d) => {
+    if (d?.db_id != null && d.db_id !== "") return d.db_id;
+    if (d?.id != null && d.id !== "") return d.id;
+    return null;
+  };
+
+  const toApiDeliveryStatus = (s) => {
+    const x = String(s || "")
+      .toLowerCase()
+      .replace(/\s+/g, "_");
+    const map = {
+      in_transit: "en_route",
+      pending_pickup: "pending",
+      pending_review: "pending",
+      /** Admin approved — still awaiting driver on logistics row */
+      approved: "pending",
+      accepted: "assigned",
+      declined: "cancelled",
+      delivered: "delivered",
+      completed: "delivered",
+      cancelled: "cancelled",
+    };
+    return map[x] || x;
+  };
+
+  const updateDelivery = async (updated) => {
+    const patchId = normalizeDeliveryDbId(updated);
+    const apiStatus = toApiDeliveryStatus(updated.status);
+
+    const isChauffeurOrder = updated.mission_type === "Chauffeur" || String(updated.id).startsWith("CH-ORD-");
+    if (isChauffeurOrder) {
+      try {
+        let detail = {};
+        if (updated.remarks) {
+          try {
+            detail = JSON.parse(updated.remarks);
+          } catch {
+            detail = {};
+          }
+        }
+        await updateChauffeurRequest({
+          id: patchId,
+          db_id: patchId,
+          mission_type: "Chauffeur",
+          status: updated.status,
+          driverName: updated.driver ?? updated.driver_name ?? detail.driverName ?? detail.driver,
+          plateNumber: updated.vehicleId ?? updated.plate_number ?? detail.plateNumber,
+          driver_user_id: updated.assigned_driver ?? updated.driverId ?? updated.driver_id ?? detail.driver_user_id,
+          passenger_info: detail,
+          _passengerInfo: detail,
+        });
+        await syncGlobalState();
+        return;
+      } catch (e) {
+        console.error("Failed to update Chauffeur order:", e);
+      }
+    }
+
+    const applyLocal = () => {
+      setDeliveries((prev) =>
+        prev.map((x) => {
+          if (patchId != null && x.db_id === patchId)
+            return { ...x, ...updated, status: updated.status };
+          if (String(x.id) === String(updated.id))
+            return { ...x, ...updated, status: updated.status };
+          return x;
+        }),
+      );
+    };
+
+    if (!patchId) {
+      applyLocal();
+      return;
+    }
+
+    try {
+      const patchBody = {
+        status: apiStatus,
+      };
+
+      const rawDriverId = updated.assigned_driver !== undefined ? updated.assigned_driver : (updated.driverId !== undefined ? updated.driverId : (updated.assignedTo !== undefined ? updated.assignedTo : undefined));
+
+      if (rawDriverId !== undefined) {
+        if (rawDriverId === null || rawDriverId === '') {
+          patchBody.assigned_driver = null;
+          patchBody.assignedTo = null;
+        } else {
+          const n = Number(rawDriverId);
+          if (Number.isFinite(n) && !Number.isNaN(n)) {
+            patchBody.assigned_driver = n;
+          }
+        }
+      }
+
+      if (updated.routeDistance != null || updated.route_distance != null) {
+        const val = parseFloat(updated.routeDistance ?? updated.route_distance);
+        if (!isNaN(val)) patchBody.routeDistance = val;
+      }
+
+      if (updated.staffPayRate != null || updated.staff_pay_rate != null) {
+        const val = parseFloat(updated.staffPayRate ?? updated.staff_pay_rate);
+        if (!isNaN(val)) patchBody.staffPayRate = val;
+      }
+
+      if (updated.deliveryFee != null || updated.delivery_fee != null) {
+        const val = parseFloat(updated.deliveryFee ?? updated.delivery_fee);
+        if (!isNaN(val)) patchBody.deliveryFee = val;
+      }
+
+      if (updated.transportMode || updated.mode) {
+        patchBody.transportMode = String(updated.transportMode || updated.mode);
+      }
+
+      if (updated.vehicleRef || updated.plate_number || updated.vehicleId) {
+        patchBody.vehicleRef = String(updated.vehicleRef || updated.plate_number || updated.vehicleId);
+      }
+
+      console.log('Sending PUT to /deliveries/' + patchId, patchBody);
+      try {
+        const res = await api.put(`/deliveries/${patchId}`, patchBody);
+        console.log('PUT response:', res.data);
+      } catch (delErr) {
+        console.warn('PUT /deliveries failed, trying order status fallback:', delErr?.response?.data?.message || delErr.message);
+        const numericOrderId = updated.order_id_raw || (updated.orderId ? parseInt(String(updated.orderId).replace(/[^0-9]/g, ""), 10) : patchId);
+        if (numericOrderId && !isNaN(numericOrderId)) {
+          await api.patch(`/orders/${numericOrderId}/status`, { status: updated.status === 'assigned' ? 'logistics' : updated.status });
+        } else {
+          throw delErr;
+        }
+      }
+
+      await syncGlobalState();
+      const numericOrderId =
+        updated.order_id_raw ||
+        (updated.orderId
+          ? parseInt(String(updated.orderId).replace(/[^0-9]/g, ""), 10)
+          : null);
+      if (numericOrderId && !isNaN(numericOrderId)) {
+        let newOrderStatus = null;
+        const delSt = String(updated.status || '').toLowerCase();
+        if (['delivered', 'completed'].includes(delSt)) {
+          newOrderStatus = 'completed';
+        } else if (['assigned', 'en_route', 'in_transit', 'dispatched', 'shipped', 'picked_up', 'accepted'].includes(delSt)) {
+          newOrderStatus = 'logistics';
+        }
+
+        if (newOrderStatus) {
+          try {
+            await api.patch(`/orders/${numericOrderId}/status`, {
+              status: newOrderStatus,
+            });
+          } catch (e) {
+            console.warn("Could not auto-update order status:", e.message);
+          }
+        }
+      }
+
+      if (updated.status === "Delivered" || updated.status === "Completed") {
+        const rawId =
+          updated.order_id_raw ||
+          (updated.orderId
+            ? parseInt(String(updated.orderId).replace(/[^0-9]/g, ""), 10)
+            : null);
+        if (rawId) {
+          const matchingOrder = orders.find(
+            (o) => Number(o.id) === Number(rawId),
+          );
+          if (matchingOrder) {
+            await generateInvoiceFromOrder(matchingOrder);
+          }
+        }
+      }
+      await syncGlobalState();
+    } catch (error) {
+      console.error(
+        "Delivery status API failed:",
+        error?.response?.data || error?.message,
+      );
+      throw error;
+    }
+  };
+
+  const deleteDelivery = async (id) => {
+    try {
+      const numericId =
+        typeof id === "string" && id.includes("-") ? id.split("-")[1] : id;
+      await api.delete(`/deliveries/${numericId}`);
+      setDeliveries((prev) =>
+        prev.filter((d) => d.id !== id && d.db_id !== id),
+      );
+      await syncGlobalState();
+      addLog({
+        action: "Mission Decommissioned",
+        detail: `Logistics Protocol ${id} terminated and removed from active operations.`,
+        type: "alert",
+      });
+    } catch (error) {
+      console.error("Failed to delete delivery:", error);
+    }
+  };
+
+  const updateInvoice = async (updated) => {
+    try {
+      const numericId =
+        typeof updated.id === "string" && updated.id.startsWith("INV-")
+          ? updated.id.split("-")[1]
+          : updated.id;
+
+      const reqData = {
+        amount: updated.totalAmount, // Map frontend structural property
+        due_date: updated.dueDate,
+        status: updated.status
+          ? updated.status.toLowerCase().replace(" ", "_")
+          : "unpaid",
+      };
+
+      await api.put(`/finance/invoices/${numericId}`, reqData);
+
+      await syncGlobalState();
+      addLog({
+        action: "Invoice Updated",
+        detail: `Institutional ledger ${updated.id} parameters recalibrated.`,
+        type: "system",
+      });
+    } catch (error) {
+      console.error("Failed to update invoice:", error);
+    }
+  };
+
+  const deleteInvoice = async (id) => {
+    try {
+      // Handle string vs numeric ID
+      const numericId =
+        typeof id === "string" && id.startsWith("INV-") ? id.split("-")[1] : id;
+
+      await api.delete(`/finance/invoices/${numericId}`);
+      await syncGlobalState();
+      addLog({
+        action: "Invoice Terminated",
+        detail: `Financial record ${id} removed from ledger.`,
+        type: "alert",
+      });
+    } catch (error) {
+      console.error("Failed to delete invoice:", error);
+    }
+  };
+
+  const confirmDeliveryReceipt = async (id, signature) => {
+    try {
+      // id might be 'DEL-001' or 'DEL-PENDING-53' or numeric. The API expects numeric ID.
+      const numericId =
+        typeof id === "string" && id.includes("-")
+          ? (id.includes("PENDING") ? id.split("-").pop() : id.split("-")[1])
+          : id;
+
+      await api.put(`/deliveries/${numericId}`, {
+        status: "delivered",
+        signature,
+      });
+
+      // Sync local state
+      await fetchDeliveries();
+      await fetchOrders();
+
+      addLog({
+        action: "Delivery Confirmed",
+        detail: `Client signature received for shipment ${id}.`,
+        type: "success",
+      });
+    } catch (error) {
+      console.error("Failed to confirm delivery:", error);
+    }
+  };
+
+  // --- UNIVERSAL CRUD PROTOCOLS ---
+  const addVendor = async (vendor) => {
+    try {
+      const companyId = currentUser?.company_id ?? currentUser?.companyId;
+      const desiredStatus = String(vendor.status || "active").toLowerCase() === "inactive" ? "inactive" : "active";
+      const vendorWithGate = { ...vendor, status: desiredStatus };
+      const reqData = buildVendorApiBody(vendorWithGate, companyId);
+      reqData.status = desiredStatus;
+      const res = await api.post("/vendors", reqData);
+
+      // Re-fetch to ensure correct mapping and sync
+      await fetchVendors();
+      if (syncGlobalState) await syncGlobalState();
+
+      addLog({
+        action: "Vendor Onboarding",
+        detail: `${vendor.name || "Vendor"} added successfully to directory & marketplace.`,
+        type: "system",
+      });
+      await swalSuccess(
+        "Vendor Added",
+        `${vendor.name || "Vendor"} is now active and available in the marketplace.`,
+      );
+      return res.data;
+    } catch (error) {
+      console.error("Failed to add vendor:", error);
+      throw error;
+    }
+  };
+
+  const updateVendor = async (updated) => {
+    try {
+      const pathId = vendorPathId(updated.id);
+      if (!pathId) {
+        const err = new Error("Invalid vendor ID.");
+        err.code = "VALIDATION";
+        throw err;
+      }
+      const companyId = currentUser?.company_id ?? currentUser?.companyId;
+      const reqData = buildVendorApiBody(updated, companyId);
+      const res = await api.put(`/vendors/${pathId}`, reqData);
+      const nextStatus = String(updated?.status || "")
+        .trim()
+        .toLowerCase();
+      if (nextStatus === "active") {
+        const nextOverrides = (pendingVendorOverrideIds || []).filter(
+          (id) => String(id) !== String(updated.id),
+        );
+        setPendingVendorOverrideIds(nextOverrides);
+        writePendingVendorOverrides(nextOverrides);
+        const nextDrafts = (pendingVendorDrafts || []).filter(
+          (x) => String(x?.id) !== String(updated.id),
+        );
+        setPendingVendorDrafts(nextDrafts);
+        writePendingVendorDrafts(nextDrafts);
+      }
+
+      // Re-fetch to ensure sync
+      await fetchVendors();
+
+      addLog({
+        action: "Vendor Update",
+        detail: `Recalibrated profile for ${updated.name}.`,
+        type: "system",
+      });
+      return res.data;
+    } catch (error) {
+      console.error("Failed to update vendor:", error);
+      throw error;
+    }
+  };
+
+  const deleteVendor = async (id) => {
+    try {
+      const pathId = vendorPathId(id);
+      await api.delete(`/vendors/${pathId}`);
+
+      setVendors((prev) => prev.filter((v) => v.id !== id));
+      addLog({
+        action: "Vendor Removal",
+        detail: `Decommissioned vendor reference ID ${id}.`,
+        type: "system",
+      });
+
+      // Re-fetch to be absolutely sure
+      await fetchVendors();
+    } catch (error) {
+      console.error("Failed to delete vendor:", error);
+      throw error;
+    }
+  };
+
+  const addInventory = async (item) => {
+    try {
+      const imageUrl = item.image_url || item.imageUrl || item.image || null;
+      let res;
+
+      if (item.imageFile) {
+        const formData = new FormData();
+        formData.append("name", item.name || "");
+        formData.append(
+          "category",
+          canonicalMarketplaceCategory(item.category),
+        );
+        formData.append("price", String(parseFloat(item.price) || 0));
+        formData.append("quantity", String(parseInt(item.qty) || 0));
+        appendInventoryFk(
+          formData,
+          "warehouse_id",
+          item.warehouse_id ?? item.warehouseId,
+        );
+        appendInventoryFk(
+          formData,
+          "vendor_id",
+          item.vendorId ?? item.vendor_id,
+        );
+        formData.append("inventory_type", item.inventoryType || "Marketplace");
+        appendInventoryFk(formData, "client_id", item.clientId);
+        formData.append(
+          "sku",
+          item.sku || `SKU-${Math.floor(Math.random() * 10000)}`,
+        );
+        if (imageUrl) formData.append("image_url", String(imageUrl));
+        formData.append(
+          "company_id",
+          String(
+            resolveInventoryCompanyId(
+              currentUser,
+              item.company_id ?? item.companyId,
+            ),
+          ),
+        );
+        formData.append("image", item.imageFile);
+
+        res = await api.post("/inventory", formData);
+      } else {
+        const reqData = {
+          name: item.name,
+          category: canonicalMarketplaceCategory(item.category),
+          price: parseFloat(item.price) || 0,
+          quantity: parseInt(item.qty) || 0,
+          warehouse_id: nullablePositiveInt(
+            item.warehouse_id ?? item.warehouseId,
+          ),
+          vendor_id: nullablePositiveInt(item.vendorId ?? item.vendor_id),
+          inventory_type: item.inventoryType || "Marketplace",
+          client_id: nullablePositiveInt(item.clientId),
+          company_id: resolveInventoryCompanyId(
+            currentUser,
+            item.company_id ?? item.companyId,
+          ),
+          image_url: imageUrl,
+          sku: item.sku || `SKU-${Math.floor(Math.random() * 10000)}`,
+        };
+        res = await api.post("/inventory", reqData);
+      }
+
+      if (!inventoryWriteResponseOk(res)) {
+        const msg =
+          res?.data?.message ||
+          res?.data?.error ||
+          "Inventory create was not accepted by the server.";
+        throw new Error(msg);
+      }
+
+      // Re-fetch to sync and map
+      await fetchInventory();
+
+      addLog({
+        action: "Asset Intake",
+        detail: `Ingested ${item.name} into Warehouse.`,
+        type: "system",
+      });
+      return res.data;
+    } catch (error) {
+      console.error("Failed to add inventory item:", error);
+      throw error;
+    }
+  };
+
+  const updateInventory = async (updated) => {
+    try {
+      const imageUrl =
+        updated.image_url || updated.imageUrl || updated.image || null;
+
+      if (updated.imageFile) {
+        const formData = new FormData();
+        formData.append("name", updated.name || "");
+        formData.append(
+          "category",
+          canonicalMarketplaceCategory(updated.category),
+        );
+        formData.append("price", String(parseFloat(updated.price) || 0));
+        formData.append("quantity", String(parseInt(updated.qty) || 0));
+        appendInventoryFk(
+          formData,
+          "warehouse_id",
+          updated.warehouse_id ?? updated.warehouseId,
+        );
+        appendInventoryFk(
+          formData,
+          "vendor_id",
+          updated.vendorId ?? updated.vendor_id,
+        );
+        appendInventoryFk(formData, "client_id", updated.clientId);
+        if (imageUrl) formData.append("image_url", String(imageUrl));
+        formData.append(
+          "company_id",
+          String(
+            resolveInventoryCompanyId(
+              currentUser,
+              updated.company_id ?? updated.companyId,
+            ),
+          ),
+        );
+        formData.append("image", updated.imageFile);
+        formData.append(
+          "inventory_type",
+          updated.inventoryType || updated.inventory_type || "Marketplace",
+        );
+        if (updated.sku) formData.append("sku", String(updated.sku));
+
+        const putRes = await api.put(`/inventory/${updated.id}`, formData);
+        if (!inventoryWriteResponseOk(putRes)) {
+          throw new Error(
+            putRes?.data?.message ||
+            putRes?.data?.error ||
+            "Inventory update failed.",
+          );
+        }
+      } else {
+        const reqData = {
+          name: updated.name,
+          category: canonicalMarketplaceCategory(updated.category),
+          price: parseFloat(updated.price) || 0,
+          quantity: parseInt(updated.qty) || 0,
+          warehouse_id: nullablePositiveInt(
+            updated.warehouse_id ?? updated.warehouseId,
+          ),
+          vendor_id: nullablePositiveInt(updated.vendorId ?? updated.vendor_id),
+          client_id: nullablePositiveInt(updated.clientId),
+          company_id: resolveInventoryCompanyId(
+            currentUser,
+            updated.company_id ?? updated.companyId,
+          ),
+          inventory_type:
+            updated.inventoryType || updated.inventory_type || "Marketplace",
+          sku: updated.sku || undefined,
+          image_url: imageUrl,
+        };
+        const putRes = await api.put(`/inventory/${updated.id}`, reqData);
+        if (!inventoryWriteResponseOk(putRes)) {
+          throw new Error(
+            putRes?.data?.message ||
+            putRes?.data?.error ||
+            "Inventory update failed.",
+          );
+        }
+      }
+
+      // Re-fetch to sync
+      await fetchInventory();
+
+      addLog({
+        action: "Inventory Update",
+        detail: `Asset ${updated.name} protocol modified.`,
+        type: "system",
+      });
+    } catch (error) {
+      console.error("Failed to update inventory item:", error);
+      throw error;
+    }
+  };
+
+  const deleteInventory = async (id) => {
+    try {
+      await api.delete(`/inventory/${id}`);
+      setInventory((prev) => prev.filter((i) => i.id !== id));
+      await fetchInventory();
+      addLog({
+        action: "Asset Decommission",
+        detail: `Removed asset ID ${id} from ledger.`,
+        type: "system",
+      });
+    } catch (error) {
+      console.error("Failed to delete inventory item:", error);
+    }
+  };
+
+  const issueInventory = (id, qty, issuedTo) => {
+    setInventory((prev) =>
+      prev.map((item) => {
+        if (item.id === id) {
+          const newQty = Math.max(0, item.qty - qty);
+          return {
+            ...item,
+            qty: newQty,
+            stockValue: newQty * item.price,
+            issuedTo: issuedTo,
+            lastIssuedDate: new Date().toISOString().split("T")[0],
+          };
+        }
+        return item;
+      }),
+    );
+    const item = inventory.find((i) => i.id === id);
+    addLog({
+      action: "Asset Issued",
+      detail: `Issued ${qty} of ${item?.name || id} to ${issuedTo}.`,
+      type: "system",
+    });
+  };
+
+  const addClient = async (client) => {
+    try {
+      const res = await api.post("/clients", {
+        ...client,
+        clientCode: `CLT-${Date.now().toString().slice(-6)}`,
+        companyName: client.companyName || client.name || "Unknown Company",
+        contactPerson: client.contact || client.contactPerson || "Admin",
+        email: client.email,
+        phone: client.phone || "0000000000",
+        address: client.location || "N/A",
+        country: client.country || "Bahamas",
+        client_type: client.clientType || 'Business',
+        password: client.password || null,
+        billing_cycle: client.billingCycle,
+        payment_method: client.paymentMethod,
+        logo_url: client.logo,
+      });
+
+      // Re-fetch to ensure perfect sync and correct mapping
+      await fetchClients();
+
+      addLog({
+        action: "Client Onboarding",
+        detail: `Registered ${client.name} via ${client.source || "Admin Dashboard"}.`,
+        type: "system",
+      });
+      return res.data;
+    } catch (error) {
+      console.error("Failed to add client:", error);
+      throw error;
+    }
+  };
+
+  const updateClient = async (updated) => {
+    try {
+      const reqData = {
+        ...updated,
+        phone: updated.phone, // Ensure phone is mapped
+        client_type: updated.clientType,
+        billing_cycle: updated.billingCycle,
+        payment_method: updated.paymentMethod,
+        contact_person: updated.contact,
+        business_name: updated.companyName,
+        logo_url: updated.logo,
+      };
+      const res = await api.put(`/clients/${updated.id}`, reqData);
+
+      // Re-fetch to ensure sync
+      await fetchClients();
+
+      addLog({
+        action: "Client Update",
+        detail: `Recalibrated profile for ${updated.name || updated.business_name || updated.id}.`,
+        type: "system",
+      });
+      return res.data;
+    } catch (error) {
+      console.error("Failed to update client:", error);
+      throw error;
+    }
+  };
+
+  const updateClientBranding = async (clientId, branding) => {
+    try {
+      // Map frontend naming to backend database fields
+      const reqData = {
+        companyName: branding.businessName,
+        name: branding.businessName,
+        business_name: branding.businessName,
+        tagline: branding.tagline,
+        logoUrl: branding.logo,
+        logo: branding.logo,
+        logo_url: branding.logo,
+      };
+
+      const numericId = String(clientId || '').replace('CLT-', '');
+      const res = await api.put(`/clients/${numericId}`, reqData);
+      if (res.data?.success) {
+        setClients((prev) =>
+          prev.map((c) => (String(c.id).replace('CLT-', '') === String(numericId) ? { ...c, ...reqData, companyName: branding.businessName, logoUrl: branding.logo, logo: branding.logo } : c)),
+        );
+        setCurrentUser((prev) => {
+          if (!prev) return prev;
+          const updatedUser = {
+            ...prev,
+            companyName: branding.businessName || prev.companyName,
+            company_name: branding.businessName || prev.company_name,
+            logoUrl: branding.logo || prev.logoUrl,
+            logo: branding.logo || prev.logo
+          };
+          try {
+            localStorage.setItem('user', JSON.stringify(updatedUser));
+          } catch (_) { }
+          return updatedUser;
+        });
+        addLog({
+          action: "Branding Updated",
+          detail: `Institutional identity recalibrated for ${clientId}.`,
+          type: "system",
+        });
+      }
+    } catch (error) {
+      console.error("Failed to update client branding:", error);
+    }
+  };
+
+  const updateDeliveryPricingTier = async (id, price) => {
+    try {
+      const res = await api.put(`/logistics/pricing/${id}`, { price });
+      if (res.data?.success) {
+        setDeliveryPricing((prev) =>
+          prev.map((tier) => (tier.id === id ? { ...tier, price } : tier)),
+        );
+        addLog({
+          action: "Pricing Updated",
+          detail: `Logistics Protocol Rate ID ${id} adjusted to $${price}.`,
+          type: "system",
+        });
+      }
+    } catch (error) {
+      console.error("Failed to update delivery pricing:", error);
+    }
+  };
+
+  const deleteClient = async (id) => {
+    try {
+      await api.delete(`/clients/${id}`);
+      setClients((prev) => prev.filter((c) => c.id !== id));
+      addLog({
+        action: "Client Decommission",
+        detail: `Removed client reference ${id}.`,
+        type: "system",
+      });
+      return { success: true, deletedFrom: "clients" };
+    } catch (error) {
+      console.error("Failed to delete client:", error);
+      const msg = String(
+        error?.response?.data?.message || error?.message || "",
+      ).toLowerCase();
+      if (msg.includes("client record not found")) {
+        await api.delete(`/users/${id}`);
+        setClients((prev) =>
+          prev.filter(
+            (c) =>
+              String(c.id) !== String(id) &&
+              String(c.signup_user_id) !== String(id),
+          ),
+        );
+        await fetchStaff();
+        addLog({
+          action: "Client Decommission",
+          detail: `Removed signup user ${id} from users ledger.`,
+          type: "alert",
+        });
+        return { success: true, deletedFrom: "users" };
+      }
+      throw error;
+    }
+  };
+
+  const addProject = async (project) => {
+    const mapStatusToBackend = (status) => {
+      switch (String(status || '').toLowerCase().trim()) {
+        case "pending":
+        case "planned":
+          return "planned";
+        case "active":
+        case "in progress":
+        case "in_progress":
+          return "in_progress";
+        case "completed":
+          return "completed";
+        case "cancelled":
+        case "on_hold":
+        case "on hold":
+          return "on_hold";
+        default:
+          return "planned";
+      }
+    };
+
+    try {
+      let resolvedCompanyId = project.companyId || project.company_id || null;
+      let resolvedCustomerId = project.customerId || project.customer_id || null;
+      let resolvedClientUserId = project.clientUserId || project.client_user_id || null;
+
+      if (typeof project.clientId === 'string' && project.clientId.includes('_')) {
+        const [type, idStr] = project.clientId.split('_');
+        const id = parseInt(idStr, 10);
+        if (!isNaN(id)) {
+          if (type === 'company') {
+            resolvedCompanyId = id;
+          } else if (type === 'customer') {
+            resolvedCustomerId = id;
+          } else if (type === 'user') {
+            resolvedClientUserId = id;
+          }
+        }
+      }
+
+      const reqData = {
+        name: project.name || project.projectName,
+        description:
+          project.description || `Tactical deployment for ${project.client}`,
+        manager_id:
+          project.manager_id || project.assignedLeaderId || currentUser?.id,
+        startDate: project.start || project.startDate,
+        location: project.location,
+        status: mapStatusToBackend(project.status),
+        company_id:
+          resolvedCompanyId ||
+          currentUser?.company_id ||
+          currentUser?.companyId ||
+          null,
+        customer_id: resolvedCustomerId || null,
+        client_user_id: resolvedClientUserId || null,
+        client_name: project.client || project.clientName || null,
+        delivery_type: project.deliveryType || project.delivery_type || "Road",
+      };
+
+      const res = await api.post("/orders/projects", reqData);
+      if (res.data?.success) {
+        await fetchProjects();
+        const newProject = res.data.data;
+
+        // Automatically create a corresponding Logistics/Delivery Mission (UI state only for now as per current logic)
+        const deliveryId = `DEL-P-${Math.floor(1000 + Math.random() * 999)}`;
+        setDeliveries((prev) => [
+          {
+            id: deliveryId,
+            projectId: newProject?.id,
+            item: `Project Setup: ${project.name}`,
+            status: "Pending",
+            location: project.location || "Client Hub",
+            mode: project.deliveryType || "Road",
+            pod: { signature: null, image: null, actualTime: null },
+            clientId: project.clientId || 1,
+            assignedStaff: project.assignedLeader || "Operational Queue",
+          },
+          ...prev,
+        ]);
+
+        addLog({
+          action: "Project Deployment",
+          detail: `Initiated ${project.name} for ${project.client}. Distribution protocol ${project.deliveryType || "Road"} initialized under ${deliveryId}.`,
+          type: "system",
+        });
+      }
+    } catch (error) {
+      console.error("Failed to add project:", error);
+    }
+  };
+
+  const updateProject = async (updated) => {
+    const mapStatusToBackend = (status) => {
+      switch (String(status || '').toLowerCase().trim()) {
+        case "pending":
+        case "planned":
+          return "planned";
+        case "active":
+        case "in progress":
+        case "in_progress":
+          return "in_progress";
+        case "completed":
+          return "completed";
+        case "cancelled":
+        case "on_hold":
+        case "on hold":
+          return "on_hold";
+        default:
+          return "planned";
+      }
+    };
+
+    try {
+      let resolvedCompanyId = updated.companyId || updated.company_id || null;
+      let resolvedCustomerId = updated.customerId || updated.customer_id || null;
+      let resolvedClientUserId = updated.clientUserId || updated.client_user_id || null;
+
+      if (typeof updated.clientId === 'string' && updated.clientId.includes('_')) {
+        const [type, idStr] = updated.clientId.split('_');
+        const id = parseInt(idStr, 10);
+        if (!isNaN(id)) {
+          if (type === 'company') {
+            resolvedCompanyId = id;
+          } else if (type === 'customer') {
+            resolvedCustomerId = id;
+          } else if (type === 'user') {
+            resolvedClientUserId = id;
+          }
+        }
+      }
+
+      const reqData = {
+        name: updated.name || updated.projectName,
+        description: updated.description,
+        status: mapStatusToBackend(updated.status),
+        location: updated.location,
+        startDate: updated.start || updated.startDate,
+        manager_id: updated.manager_id || updated.managerId,
+        delivery_type: updated.deliveryType || updated.delivery_type || "Road",
+        company_id: resolvedCompanyId || currentUser?.company_id || currentUser?.companyId || null,
+        customer_id: resolvedCustomerId || null,
+        client_user_id: resolvedClientUserId || null,
+        client_name: updated.client || updated.clientName || null,
+      };
+      await api.put(`/orders/projects/${updated.id}`, reqData);
+      await fetchProjects();
+      addLog({
+        action: "Project Redesign",
+        detail: `Updated parameters for ${updated.name}.`,
+        type: "system",
+      });
+    } catch (error) {
+      console.error("Failed to update project:", error);
+    }
+  };
+
+  const deleteProject = async (id) => {
+    try {
+      await api.delete(`/orders/projects/${id}`);
+      setProjects((prev) => prev.filter((p) => p.id !== id));
+      addLog({
+        action: "Project Decommission",
+        detail: `Archived project reference ${id}.`,
+        type: "system",
+      });
+    } catch (error) {
+      console.error("Failed to delete project:", error);
+    }
+  };
+
+  const updateAssignment = async (updated) => {
+    try {
+      await api.put(`/staff/assignments/${updated.id}`, updated);
+      setStaffAssignments((prev) =>
+        prev.map((a) => (a.id === updated.id ? updated : a)),
+      );
+    } catch (error) {
+      console.error("Failed to update assignment:", error);
+    }
+  };
+
+  const updateMission = async (updated) => {
+    try {
+      if (updated.status === 'in_progress' || updated.status === 'assigned') {
+        await api.put(`/missions/${updated.rawId}/assign`, { driverId: updated.assigneeId, vehicleId: 1 });
+      }
+
+      if (updated.status === 'Completed' || updated.status === 'Delivered') {
+        const podPayload = {
+          receiverName: updated.receiverName || 'System Verified',
+          deliveryPhoto: updated.photo,
+          remarks: updated.notes ? `${updated.notes}\n[GPS]: ${updated.gps}` : `[GPS]: ${updated.gps}`
+        };
+        await api.post(`/missions/${updated.rawId}/pod`, podPayload);
+      } else {
+        await api.put(`/missions/${updated.rawId}/status`, { status: updated.status });
+      }
+
+      if (typeof fetchSupportingDocs === 'function') {
+        await fetchSupportingDocs();
+      }
+      if (typeof fetchDeliveries === 'function') {
+        await fetchDeliveries();
+      }
+      if (typeof fetchOrders === 'function') {
+        await fetchOrders();
+      }
+
+      setStaffAssignments((prev) =>
+        prev.map((a) => (a.id === updated.id ? { ...a, ...updated } : a)),
+      );
+    } catch (error) {
+      console.error("Failed to update mission:", error);
+    }
+  };
+
+  const clockStorageKey = () => {
+    const uid = currentUser?.id ?? currentUser?.email ?? "guest";
+    return `zz_clock_${uid}`;
+  };
+
+  const clockIn = async (location) => {
+    const loc = location || currentUser?.location || "Central Hub";
+    const payload = { location: loc };
+    let shiftRef = null;
+
+    try {
+      const res = await api.post("/staff/clock-in", payload);
+      const root = res.data;
+      const inner =
+        root?.data !== undefined && typeof root.data === "object"
+          ? root.data
+          : null;
+      shiftRef =
+        inner?.shiftId ?? inner?.shift_id ?? inner?.id ?? root?.shiftId;
+      const ok = root?.success !== false && root?.error == null;
+      if (ok) {
+        const ref = shiftRef ?? true;
+        if (currentUser?.id) toggleAvailability(currentUser.id, true);
+        localStorage.setItem(
+          clockStorageKey(),
+          JSON.stringify({
+            in: true,
+            at: new Date().toISOString(),
+            location: loc,
+            shiftRef: ref,
+          }),
+        );
+        return ref;
+      }
+    } catch (error) {
+      console.warn(
+        "Clock-in API unavailable, using local session:",
+        error?.response?.data?.message || error.message,
+      );
+    }
+
+    shiftRef = shiftRef || `local-${Date.now()}`;
+    if (currentUser?.id) toggleAvailability(currentUser.id, true);
+    localStorage.setItem(
+      clockStorageKey(),
+      JSON.stringify({
+        in: true,
+        at: new Date().toISOString(),
+        location: loc,
+        shiftRef,
+      }),
+    );
+    return shiftRef;
+  };
+
+  const clockOut = async () => {
+    try {
+      const res = await api.post("/staff/clock-out");
+      const root = res.data;
+      const ok = root?.success !== false && root?.error == null;
+      if (ok) {
+        localStorage.removeItem(clockStorageKey());
+        if (currentUser?.id) toggleAvailability(currentUser.id, false);
+        try {
+          await fetchPayHistory();
+        } catch {
+          /* optional */
+        }
+        return root?.data || root || { ok: true };
+      }
+    } catch (error) {
+      console.warn(
+        "Clock-out API unavailable, clearing local session:",
+        error?.response?.data?.message || error.message,
+      );
+    }
+    localStorage.removeItem(clockStorageKey());
+    if (currentUser?.id) toggleAvailability(currentUser.id, false);
+    return { ok: true, local: true };
+  };
+
+  const addStaffAssignment = async (asg) => {
+    try {
+      const reqData = {
+        assigneeId: asg.assigneeId,
+        task: asg.task,
+        location: asg.location,
+        status: asg.status || "Pending",
+        priority: asg.priority || "Normal",
+        missionType: asg.missionType,
+        passengerName: asg.passengerName,
+        pickupTime: asg.pickupTime,
+        dropLocation: asg.dropLocation,
+        luggage: asg.luggage,
+        goodsDetails: asg.goodsDetails,
+        weight: asg.weight,
+        pickupLocation: asg.pickupLocation,
+        deliveryLocation: asg.deliveryLocation,
+      };
+      const res = await api.post("/missions", reqData);
+      if (res.data?.success) {
+        const newAsg = {
+          ...asg,
+          id: res.data.data.missionNumber || res.data.data.id,
+          db_id: res.data.data.id,
+        };
+        setStaffAssignments((prev) => [newAsg, ...prev]);
+        addLog({
+          action: "Mission Delegated",
+          detail: `${asg.missionType || "General"} mission assigned to ${asg.assignee}.`,
+          type: "system",
+        });
+      }
+    } catch (error) {
+      console.error("Failed to add assignment:", error);
+    }
+  };
+
+  const addAudit = async (audit) => {
+    try {
+      const res = await api.post("/support/audits", audit); // Need to check if POST exists, implementation plan said maps to audit_logs
+      setAudits((prev) => [res.data.data, ...prev]);
+      addLog({
+        action: "Audit Initialized",
+        detail: `Started ${audit.title || "Inventory"} compliance screening.`,
+        type: "system",
+      });
+    } catch (error) {
+      console.error("Failed to add audit:", error);
+    }
+  };
+
+  const updateAudit = async (updated) => {
+    try {
+      await api.put(`/support/audits/${updated.id}`, updated);
+      setAudits((prev) => prev.map((a) => (a.id === updated.id ? updated : a)));
+      addLog({
+        action: "Audit Updated",
+        detail: `Recalibrated metrics for ${updated.id}.`,
+        type: "system",
+      });
+    } catch (error) {
+      console.error("Failed to update audit:", error);
+    }
+  };
+
+  const deleteAudit = async (id) => {
+    try {
+      await api.delete(`/support/audits/${id}`);
+      setAudits((prev) => prev.filter((a) => a.id !== id));
+      addLog({
+        action: "Audit Removal",
+        detail: `Decommissioned audit record ${id}.`,
+        type: "system",
+      });
+    } catch (error) {
+      console.error("Failed to delete audit:", error);
+    }
+  };
+
+  const addQuote = async (quote) => {
+    try {
+      const parsedVendorId = parseInt(
+        String(quote.vendorId ?? quote.vendor_id ?? "").trim(),
+        10,
+      );
+      const normalizedVendorId =
+        Number.isFinite(parsedVendorId) && parsedVendorId > 0
+          ? parsedVendorId
+          : null;
+      const res = await api.post("/quotations", {
+        ...quote,
+        vendor_id: normalizedVendorId,
+        vendor_name: quote.vendor_name || quote.vendor || "",
+        quote_type: quote.quoteType ?? quote.quote_type ?? "client",
+        payment_terms: quote.paymentTerms ?? quote.payment_terms ?? "Net 30",
+      });
+      if (res.data?.success) {
+        await fetchQuotes();
+        addLog({
+          action: "Quote Manifest",
+          detail: `Received procurement offer from Vendor ${quote.vendorId}.`,
+          type: "system",
+        });
+      }
+    } catch (error) {
+      console.error("Failed to add quote:", error);
+    }
+  };
+
+  const updateQuote = async (updated) => {
+    try {
+      const qid = quotePathId(updated.id);
+      const payload = {
+        vendor_id: updated.vendorId ?? updated.vendor_id,
+        vendor_name: updated.vendor_name || updated.vendor,
+        items: updated.items,
+        total_amount: updated.total ?? updated.total_amount,
+        lead_time: updated.leadTime ?? updated.lead_time,
+        validity_date: updated.validity ?? updated.validity_date,
+        status: updated.status,
+        quote_type: updated.quoteType ?? updated.quote_type ?? "client",
+        payment_terms: updated.paymentTerms ?? updated.payment_terms,
+        notes: updated.notes,
+      };
+      await api.put(`/quotations/${qid}/status`, payload).catch(() => api.put(`/quotations/${qid}`, payload));
+      setQuotes((prev) =>
+        prev.map((q) => (q.id === updated.id ? { ...updated, ...payload } : q)),
+      );
+      addLog({
+        action: "Quote Revision",
+        detail: `Updated terms for ${updated.id}.`,
+        type: "system",
+      });
+    } catch (error) {
+      console.error("Failed to update quote:", error);
+      setQuotes((prev) =>
+        prev.map((q) => (q.id === updated.id ? { ...q, ...updated } : q)),
+      );
+    }
+  };
+
+  const deleteQuote = async (id) => {
+    try {
+      await api.delete(`/quotations/${id}`);
+      setQuotes((prev) => prev.filter((q) => q.id !== id));
+      addLog({
+        action: "Quote Discarded",
+        detail: `Removed quote reference ${id}.`,
+        type: "system",
+      });
+    } catch (error) {
+      console.error("Failed to delete quote:", error);
+    }
+  };
+
+  const addPurchaseRequest = async (req) => {
+    try {
+      const uniqueId = Date.now();
+      const body = {
+        ...req,
+        items: Array.isArray(req.items) ? req.items : [],
+        id: req.id ?? uniqueId,
+        requestId: req.requestId ?? `REQ-${Math.floor(100 + Math.random() * 900)}`,
+        status:
+          req.status && String(req.status).trim() !== ""
+            ? req.status
+            : "Pending",
+      };
+      // Send estimated_cost to backend since backend reads estimated_cost on creation
+      body.estimated_cost = req.total ?? req.estimated_cost ?? 0;
+
+      const res = await api.post("/purchase-requests", body);
+      if (res.data?.success) {
+        // Fetch the fresh requests from the backend to get the actual auto-incremented ID and keep state correct!
+        await fetchPurchaseRequests();
+        addLog({
+          action: "Request Initialized",
+          detail: `New purchase manifest submitted by ${req.requester}.`,
+          type: "system",
+        });
+      }
+    } catch (error) {
+      console.error("Failed to add purchase request:", error);
+    }
+  };
+
+  const updatePurchaseRequest = async (updated) => {
+    try {
+      const identifier = updated.id ?? updated.requestId;
+
+      // Optimistic update for instant UI feedback
+      setPurchaseRequests((prev) =>
+        prev.map((r) => {
+          if (r.id === identifier || r.requestId === identifier) {
+            const newTotal = updated.total !== undefined ? updated.total : r.total;
+            return { ...r, ...updated, total: newTotal };
+          }
+          return r;
+        })
+      );
+
+      await api.put(`/purchase-requests/${identifier}`, updated);
+      await fetchPurchaseRequests();
+      addLog({
+        action: "Request Updated",
+        detail: `Modified procurement request ${identifier}.`,
+        type: "system",
+      });
+    } catch (error) {
+      console.error("Failed to update purchase request:", error);
+      // Revert if needed by fetching again
+      await fetchPurchaseRequests();
+    }
+  };
+
+  const deletePurchaseRequest = async (id) => {
+    try {
+      await api.delete(`/purchase-requests/${id}`);
+      setPurchaseRequests((prev) => prev.filter((r) => r.id !== id && r.requestId !== id));
+      addLog({
+        action: "Request Purged",
+        detail: `Removed request ID ${id} from queue.`,
+        type: "system",
+      });
+    } catch (error) {
+      console.error("Failed to delete purchase request:", error);
+    }
+  };
+
+  const addPurchaseOrder = async (po) => {
+    try {
+      const reqData = {
+        vendor_id:
+          po.vendorId != null
+            ? parseInt(String(po.vendorId).replace(/\D/g, ""), 10) ||
+            po.vendorId
+            : po.vendorId,
+        vendorId: po.vendorId,
+        payment_terms: po.paymentTerms || po.payment_terms || "Net 30",
+        notes: po.notes || "",
+        total_amount: po.total || po.total_amount,
+        status: "Pending",
+        items: po.items.map((item) => ({
+          name: item.name,
+          category: item.category,
+          quantity: item.orderedQty ?? item.quantity,
+          unit_price: item.price,
+        })),
+      };
+      const res = await api.post("/purchase-orders", reqData);
+      if (res.data?.success) {
+        await fetchPurchaseOrders();
+        // Refresh purchase requests to reflect status/total changes automatically
+        await fetchPurchaseRequests();
+        addLog({
+          action: "PO Issued",
+          detail: `Purchase Order ${res.data.data.id} sent to ${po.vendorName}.`,
+          type: "procurement",
+        });
+      }
+    } catch (error) {
+      console.error("Failed to add PO:", error);
+    }
+  };
+
+  const updatePurchaseOrder = async (updated) => {
+    try {
+      const pid = poNumericId(updated.id);
+      const payload = {
+        payment_terms:
+          updated.paymentTerms ?? updated.payment_terms ?? "Net 30",
+        total_amount: updated.total ?? updated.total_amount,
+        items: (updated.items || []).map((item) => ({
+          id: item.id,
+          name: item.name,
+          category: item.category,
+          quantity: item.orderedQty ?? item.quantity,
+          unit_price: item.price,
+          received_qty: item.receivedQty ?? item.received_qty,
+        })),
+        vendor_name: updated.vendorName ?? updated.vendor_name,
+      };
+      await api.put(`/purchase-orders/${pid}`, payload);
+      const merged = {
+        ...updated,
+        payment_terms: payload.payment_terms,
+        paymentTerms: payload.payment_terms,
+      };
+      // After updating PO, refresh purchase requests to keep totals/status in sync
+      await fetchPurchaseRequests();
+      setPurchaseOrders((prev) =>
+        prev.map((po) => (po.id === updated.id ? merged : po)),
+      );
+      addLog({
+        action: "PO Revised",
+        detail: `Purchase Order ${updated.id} parameters adjusted for ${updated.vendorName}.`,
+        type: "procurement",
+      });
+    } catch (error) {
+      console.error("Failed to update PO:", error);
+      setPurchaseOrders((prev) =>
+        prev.map((po) => (po.id === updated.id ? { ...po, ...updated } : po)),
+      );
+    }
+  };
+
+  const receiveGoodsAgainstPO = async (poId, receivedData, options = {}) => {
+    try {
+      // Extract numeric ID if it's "PO-1002" format
+      const numericId =
+        typeof poId === "string" && poId.includes("-")
+          ? poId.split("-")[1]
+          : poId;
+
+      const reqData = {
+        items: receivedData.map((r) => ({
+          id: r.id, // Expecting item database ID
+          name: r.name,
+          receivedQty: Number(r.receivedNow),
+        })),
+      };
+      if (options.packingSlip) reqData.packingSlip = options.packingSlip;
+      if (options.adminApproved) reqData.adminApproved = true;
+
+      const res = await api.put(
+        `/purchase-orders/${numericId}/receive`,
+        reqData,
+      );
+      if (res.data?.success) {
+        await fetchPurchaseOrders();
+
+        addLog({
+          action: "Goods Receiving",
+          detail: `Shipment received against PO ${poId}.`,
+          type: "inventory",
+        });
+      }
+    } catch (error) {
+      console.error("Failed to receive goods against PO:", error);
+      throw error;
+    }
+  };
+
+  const approvePOReceipt = async (poId) => {
+    try {
+      const numericId = typeof poId === "string" && poId.includes("-") ? poId.split("-")[1] : poId;
+      const res = await api.put(`/purchase-orders/${numericId}/approve-receipt`);
+      if (res.data?.success) {
+        await fetchPurchaseOrders();
+
+        addLog({
+          action: "Receipt Approved",
+          detail: `Admin approved receipt for PO ${poId}.`,
+          type: "inventory",
+        });
+      }
+    } catch (error) {
+      console.error("Failed to approve PO receipt:", error);
+      throw error;
+    }
+  };
+
+  /** Reduce received quantities when goods were registered incorrectly (local sync if API missing). */
+  const reverseGoodsReceipt = async (poId, lineAdjustments) => {
+    const pid = poNumericId(poId);
+    try {
+      await api.post(`/purchase-orders/${pid}/reverse-receipt`, {
+        lines: lineAdjustments,
+      });
+      await fetchPurchaseOrders();
+    } catch (error) {
+      console.error("reverse-receipt API failed", error);
+      throw error;
+    }
+  };
+
+  const addWarehouse = async (wh) => {
+    try {
+      const managerId =
+        wh.manager_id !== "" && wh.manager_id != null
+          ? parseInt(wh.manager_id, 10)
+          : null;
+      const warehouseData = {
+        name: wh.name,
+        location: wh.location,
+        capacity: wh.capacity,
+        status: wh.status || "active",
+        company_id: currentUser?.company_id || wh.company_id,
+        manager_id: Number.isFinite(managerId) ? managerId : null,
+      };
+      const res = await api.post("/warehouses", warehouseData);
+      if (res.data?.success) {
+        await fetchWarehouses();
+        addLog({
+          action: "Facility Added",
+          detail: `Commissioned ${wh.name} into the network.`,
+          type: "system",
+        });
+      }
+    } catch (error) {
+      console.error("Failed to add warehouse:", error);
+    }
+  };
+
+  const updateWarehouse = async (updated) => {
+    try {
+      const managerId =
+        updated.manager_id !== "" && updated.manager_id != null
+          ? parseInt(updated.manager_id, 10)
+          : null;
+      const payload = {
+        name: updated.name,
+        location: updated.location,
+        capacity: updated.capacity,
+        status: updated.status,
+        manager_id: Number.isFinite(managerId) ? managerId : null,
+        company_id: updated.company_id,
+      };
+      const res = await api.put(`/warehouses/${updated.id}`, payload);
+      if (res.data?.success) {
+        await fetchWarehouses();
+        addLog({
+          action: "Facility Updated",
+          detail: `Modified configurations for ${updated.name}.`,
+          type: "system",
+        });
+      }
+    } catch (error) {
+      console.error("Failed to update warehouse:", error);
+    }
+  };
+
+  const deleteWarehouse = async (id) => {
+    try {
+      await api.delete(`/warehouses/${id}`);
+      setWarehouses((prev) => prev.filter((w) => w.id !== id));
+      addLog({
+        action: "Facility Decommission",
+        detail: `Removed warehouse reference ID ${id} from ledger.`,
+        type: "system",
+      });
+    } catch (error) {
+      console.error("Failed to delete warehouse:", error);
+    }
+  };
+
+  const [luxuryItems, setLuxuryItems] = useState([]);
+
+  const addLuxuryItem = async (item) => {
+    const tempId = item.id || item.itemId || `LXY-${Math.floor(1000 + Math.random() * 8999)}`;
+    const clientId = item.clientId || item.client_id || null;
+    const clientName = item.clientName || item.client_name || item.owner || null;
+    const fallbackCompanyId = currentUser?.company_id || currentUser?.companyId || currentUser?.clientId || currentUser?.client_id || 1;
+
+    const newItem = {
+      ...item,
+      id: tempId,
+      itemId: tempId,
+      item: item.item || item.name || 'Luxury Item',
+      name: item.name || item.item || 'Luxury Item',
+      owner: item.owner || clientName || 'Beneficiary',
+      vault: item.vault || 'Vault Alpha',
+      status: item.status || 'Stored',
+      value: item.value || item.price || 0,
+      price: item.price || item.value || 0,
+      notes: item.notes || '',
+      clientId: clientId ? String(clientId) : null,
+      client_id: clientId ? String(clientId) : null,
+      clientName: clientName,
+      client_name: clientName,
+      company_id: fallbackCompanyId,
+      companyId: fallbackCompanyId,
+      tenantId: 1,
+    };
+
+    // Instant optimistic update so new entry appears immediately without reloading
+    setLuxuryItems((prev) => [newItem, ...prev.filter(i => i.id !== tempId && i.itemId !== tempId)]);
+    window.dispatchEvent(new CustomEvent('app:state-changed'));
+
+    try {
+      const reqData = {
+        id: tempId,
+        itemId: tempId,
+        name: newItem.item,
+        item: newItem.item,
+        item_name: newItem.item,
+        owner: newItem.owner,
+        owner_name: newItem.owner,
+        vault: newItem.vault,
+        vault_location: newItem.vault,
+        estimated_value: newItem.value,
+        price: newItem.price,
+        status: newItem.status,
+        notes: newItem.notes,
+        clientId: newItem.clientId,
+        client_id: newItem.clientId,
+        clientName: newItem.clientName,
+        client_name: newItem.clientName,
+        tenantId: 1,
+      };
+
+      const res = await api.post("/concierge/luxury-items", reqData);
+      if (res.data?.success && res.data?.data) {
+        const created = res.data.data;
+        const realId = created.itemId || created.id || tempId;
+        setLuxuryItems((prev) =>
+          prev.map((i) =>
+            i.id === tempId || i.itemId === tempId
+              ? {
+                ...i,
+                id: realId,
+                itemId: realId,
+                ...created,
+                clientId: newItem.clientId,
+                client_id: newItem.clientId,
+                clientName: newItem.clientName,
+                client_name: newItem.clientName,
+              }
+              : i
+          )
+        );
+      }
+      await fetchLuxuryItems();
+      window.dispatchEvent(new CustomEvent('app:state-changed'));
+
+      addLog({
+        action: "Luxury Item Registered",
+        detail: `New vault entry: ${newItem.item} for ${clientName || 'Client'}`,
+        type: "system",
+      });
+      return { success: true };
+    } catch (error) {
+      console.error("Failed to add luxury item:", error);
+      await fetchLuxuryItems();
+      return { success: false, error };
+    }
+  };
+
+  const updateLuxuryItem = async (updated) => {
+    const targetId = updated.itemId || updated.id;
+    const clientId = updated.clientId || updated.client_id || null;
+    const clientName = updated.clientName || updated.client_name || updated.owner || null;
+
+    const mergedItem = {
+      ...updated,
+      id: targetId,
+      itemId: targetId,
+      item: updated.item || updated.name,
+      name: updated.name || updated.item,
+      owner: updated.owner || clientName || '',
+      vault: updated.vault || 'Vault Alpha',
+      status: updated.status || 'Stored',
+      value: updated.value || updated.price || 0,
+      price: updated.price || updated.value || 0,
+      notes: updated.notes || '',
+      clientId: clientId ? String(clientId) : null,
+      client_id: clientId ? String(clientId) : null,
+      clientName: clientName,
+      client_name: clientName,
+    };
+
+    // Instant optimistic update so changes (status, details) reflect immediately
+    setLuxuryItems((prev) =>
+      prev.map((i) =>
+        i.id === targetId || i.itemId === targetId || i.id === updated.id || i.itemId === updated.id
+          ? { ...i, ...mergedItem }
+          : i
+      )
+    );
+    window.dispatchEvent(new CustomEvent('app:state-changed'));
+
+    try {
+      const reqData = {
+        name: mergedItem.item,
+        item: mergedItem.item,
+        item_name: mergedItem.item,
+        owner: mergedItem.owner,
+        owner_name: mergedItem.owner,
+        vault: mergedItem.vault,
+        vault_location: mergedItem.vault,
+        estimated_value: mergedItem.value,
+        price: mergedItem.price,
+        status: mergedItem.status,
+        notes: mergedItem.notes,
+        clientId: mergedItem.clientId,
+        client_id: mergedItem.clientId,
+        clientName: mergedItem.clientName,
+        client_name: mergedItem.clientName,
+      };
+
+      await api.put(`/concierge/luxury-items/${targetId}?tenantId=1`, reqData);
+      await fetchLuxuryItems();
+      window.dispatchEvent(new CustomEvent('app:state-changed'));
+
+      addLog({
+        action: "Luxury Item Updated",
+        detail: `Recalibrated details for vault entry: ${mergedItem.item} (${mergedItem.status})`,
+        type: "system",
+      });
+      return { success: true };
+    } catch (error) {
+      console.error("Failed to update luxury item:", error);
+      await fetchLuxuryItems();
+      return { success: false, error };
+    }
+  };
+
+  const fetchChauffeurRequests = React.useCallback(async () => {
+    try {
+      const res = await api.get("/orders", { params: { orderType: 'CHAUFFEUR', limit: 100 } });
+      const raw = res.data;
+      let orders = [];
+      if (Array.isArray(raw?.data?.orders)) {
+        orders = raw.data.orders;
+      } else if (Array.isArray(raw?.data)) {
+        orders = raw.data;
+      } else if (Array.isArray(raw?.orders)) {
+        orders = raw.orders;
+      } else if (Array.isArray(raw)) {
+        orders = raw;
+      }
+
+      const deletedIds = getDeletedChauffeurIds();
+      const updatedMap = getUpdatedChauffeurMap();
+
+      const mapped = (orders || [])
+        .filter((order) => {
+          if (!order || typeof order !== 'object') return false;
+          const strId = String(order.id);
+          if (deletedIds.includes(strId)) return false;
+          const status = String(order.status || '').toLowerCase();
+          return status !== 'deleted';
+        })
+        .map((order) => {
+          let meta = order.metadata;
+          if (typeof meta === 'string') {
+            try { meta = JSON.parse(meta); } catch { meta = {}; }
+          }
+          meta = meta || {};
+          const customItem = meta.customItems?.[0] || meta.custom_items?.[0] || {};
+          const orderItem = order.items?.[0] || {};
+          const detail = { ...orderItem, ...meta, ...customItem };
+
+          const compId = order.companyId || order.company_id || order.clientId || order.client_id || detail?.companyId || detail?.company_id || detail?.clientId || null;
+
+          // Resolve verified customer owner identity from trusted metadata or direct order customer fields
+          // Note: order.createdById is a database foreign key to Employee.id (often 1 as fallback),
+          // so it must never be treated as the customer's ownership identity.
+          const customerOwnerId =
+            (meta.customer_id != null && !isNaN(Number(meta.customer_id))) ? Number(meta.customer_id) :
+              (meta.customer_user_id != null && !isNaN(Number(meta.customer_user_id))) ? Number(meta.customer_user_id) :
+                (meta.user_id != null && !isNaN(Number(meta.user_id))) ? Number(meta.user_id) :
+                  (meta.userId != null && !isNaN(Number(meta.userId))) ? Number(meta.userId) :
+                    (customItem?.customer_id != null && !isNaN(Number(customItem.customer_id))) ? Number(customItem.customer_id) :
+                      (customItem?.user_id != null && !isNaN(Number(customItem.user_id))) ? Number(customItem.user_id) :
+                        (customItem?.userId != null && !isNaN(Number(customItem.userId))) ? Number(customItem.userId) :
+                          (detail?.customer_id != null && !isNaN(Number(detail.customer_id))) ? Number(detail.customer_id) :
+                            (detail?.user_id != null && !isNaN(Number(detail.user_id))) ? Number(detail.user_id) :
+                              (order.customer_id != null && !isNaN(Number(order.customer_id))) ? Number(order.customer_id) :
+                                (order.userId != null && !isNaN(Number(order.userId))) ? Number(order.userId) :
+                                  (order.user_id != null && !isNaN(Number(order.user_id))) ? Number(order.user_id) :
+                                    null;
+
+          const customerEmail =
+            meta.customer_email ||
+            meta.email ||
+            customItem?.customer_email ||
+            customItem?.email ||
+            order.client?.email ||
+            order.customer_email ||
+            order.email ||
+            null;
+
+          // Cross-reference with deliveries array using unambiguous, exact relational matching only
+          // Never use substring matching (.includes) or compare delivery table PK (d.db_id) with order PK (order.id)
+          const targetOrderId = order?.id != null && !isNaN(Number(order.id)) ? Number(order.id) : null;
+          const targetOrderNum = order?.orderNumber ? String(order.orderNumber).trim() : null;
+          const cleanTargetNum = targetOrderNum ? targetOrderNum.replace(/^#|^ORD-/i, '').trim() : null;
+
+          const matchingDelivery = (deliveries || []).find(d => {
+            if (!d) return false;
+
+            // 1. Direct numeric match on foreign key delivery.order_id_raw -> order.id
+            if (targetOrderId !== null && d.order_id_raw != null) {
+              const rawIdNum = Number(d.order_id_raw);
+              if (!isNaN(rawIdNum) && rawIdNum > 0 && rawIdNum === targetOrderId) {
+                return true;
+              }
+            }
+
+            // 2. Exact match against formatted delivery.orderId reference string
+            if (d.orderId) {
+              const delOrderStr = String(d.orderId).trim();
+              if (targetOrderNum && delOrderStr.toLowerCase() === targetOrderNum.toLowerCase()) {
+                return true;
+              }
+              const cleanDelStr = delOrderStr.replace(/^#|^ORD-/i, '').trim();
+              if (targetOrderId !== null) {
+                const parsedClean = Number(cleanDelStr);
+                if (!isNaN(parsedClean) && parsedClean > 0 && parsedClean === targetOrderId) {
+                  return true;
+                }
+              }
+              if (cleanTargetNum && cleanDelStr.toLowerCase() === cleanTargetNum.toLowerCase()) {
+                return true;
+              }
+            }
+
+            return false;
+          });
+
+          const isOrderCancelled = ['cancelled', 'rejected', 'canceled'].includes(String(order.status || '').toLowerCase());
+          const isDeliveryCancelled = ['cancelled', 'rejected', 'canceled'].includes(String(matchingDelivery?.status || '').toLowerCase());
+          const orderSt = String(order.status || '').toLowerCase();
+          const deliverySt = String(matchingDelivery?.status || '').toLowerCase();
+
+          let liveStatus = 'pending';
+          if (isOrderCancelled || isDeliveryCancelled) {
+            liveStatus = 'cancelled';
+          } else if (['completed', 'delivered', 'done'].includes(orderSt) || ['completed', 'delivered', 'done'].includes(deliverySt)) {
+            liveStatus = 'completed';
+          } else if (['in transit', 'in_transit', 'en route', 'en_route', 'picked up', 'picked_up'].includes(deliverySt) || ['in transit', 'in_transit', 'en route', 'en_route'].includes(orderSt)) {
+            liveStatus = (deliverySt === 'en_route' || orderSt === 'en_route') ? 'en_route' : (deliverySt || orderSt);
+          } else if (['accepted', 'approved'].includes(orderSt) || ['accepted', 'approved'].includes(deliverySt)) {
+            liveStatus = 'accepted';
+          } else {
+            liveStatus = matchingDelivery?.status || order.status || 'pending';
+          }
+
+          const liveDriver =
+            order.driverName ||
+            meta.driverName ||
+            customItem.driverName ||
+            matchingDelivery?.driver ||
+            detail?.driverName ||
+            null;
+
+          const liveVehicle =
+            order.plateNumber ||
+            order.vehicleId ||
+            order.vehicle ||
+            meta.plateNumber ||
+            meta.vehicleId ||
+            meta.vehicle ||
+            customItem.plateNumber ||
+            customItem.vehicleId ||
+            matchingDelivery?.vehicleId ||
+            detail?.plateNumber ||
+            null;
+
+          const resolvedPickup =
+            order.pickup_location ||
+            order.pickupLocation ||
+            meta.pickup_location ||
+            meta.pickupLocation ||
+            customItem.pickupLocation ||
+            customItem.pickup_location ||
+            detail.pickupLocation ||
+            detail.pickup_location ||
+            matchingDelivery?.pickupLocation ||
+            '';
+
+          const resolvedDrop =
+            order.location ||
+            order.delivery_address ||
+            order.deliveryAddress ||
+            order.dropLocation ||
+            order.drop_location ||
+            meta.location ||
+            meta.delivery_address ||
+            meta.deliveryAddress ||
+            meta.dropLocation ||
+            meta.drop_location ||
+            customItem.dropLocation ||
+            customItem.drop_location ||
+            customItem.location ||
+            detail.dropLocation ||
+            detail.drop_location ||
+            detail.location ||
+            matchingDelivery?.dropLocation ||
+            '';
+
+          const baseMapped = {
+            id: order.id,
+            db_id: order.id,
+            orderNumber: order.orderNumber,
+            tenantId: order.tenantId || meta.tenantId || null,
+            createdAt: order.createdAt || order.created_at || order.order_date || order.date || null,
+            created_at: order.createdAt || order.created_at || order.order_date || order.date || null,
+            order_date: order.order_date || order.createdAt || order.created_at || order.date || null,
+            requestDate: order.order_date || order.createdAt || order.created_at || order.date || null,
+            date: order.order_date || order.createdAt || order.created_at || order.date || null,
+            clientId: order.clientId || order.client_id || detail?.clientId || 'CLT-GUEST',
+            company_id: compId,
+            companyId: compId,
+            customer_id: customerOwnerId,
+            customerId: customerOwnerId,
+            user_id: customerOwnerId,
+            userId: customerOwnerId,
+            created_by: customerOwnerId,
+            employee_created_by: order.createdById,
+            customer_email: customerEmail,
+            email: customerEmail,
+            clientName: formatClientDisplayName(order, clients, [...(users || []), ...(customerUsers || [])]),
+            driverName: liveDriver,
+            plateNumber: liveVehicle,
+            vehicle: liveVehicle,
+            vehicleId: liveVehicle,
+            driverPhotoUrl: detail?.driverPhotoUrl || meta?.driverPhotoUrl || null,
+            driver_user_id: order.driver_user_id || meta.driver_user_id || meta.driverId || customItem.driver_user_id || customItem.driverId || detail?.driver_user_id || matchingDelivery?.driverId || null,
+            serviceType: customItem?.serviceType || meta?.serviceType || detail?.serviceType || "One Way",
+            pickupLocation: resolvedPickup || "Pickup Point",
+            dropLocation: resolvedDrop || "Destination",
+            dueDate: detail?.dueDate || meta?.dueDate || customItem?.dueDate || detail?.eta || null,
+            pickupDate: detail?.dueDate || meta?.dueDate || customItem?.dueDate || detail?.eta || null,
+            pickupTime: detail?.pickupTime || meta?.pickupTime || customItem?.pickupTime || null,
+            status: liveStatus,
+            chauffeurFee: (() => {
+              const sType = customItem?.serviceType || meta?.serviceType || detail?.serviceType || "One Way";
+              const daysVal = parseInt(customItem?.numberOfDays || meta?.numberOfDays || detail?.numberOfDays || detail?.dailyDays || 1, 10) || 1;
+              const qtyMultiplier = sType === "Round Trip" ? 2 : (sType === "Daily Service" ? daysVal : 1);
+              return Number((120 * qtyMultiplier).toFixed(2));
+            })(),
+            chauffeur_fee_mode: detail?.chauffeur_fee_mode || meta?.chauffeur_fee_mode || "separate",
+            numberOfPassengers: customItem?.numberOfPassengers || customItem?.passengers || meta?.numberOfPassengers || meta?.passengers || detail?.numberOfPassengers || detail?.passengers || 1,
+            passengers: customItem?.numberOfPassengers || customItem?.passengers || meta?.numberOfPassengers || meta?.passengers || detail?.numberOfPassengers || detail?.passengers || 1,
+            passengerName: customItem?.passengerName || meta?.passengerName || detail?.passengerName || detail?.guestName || formatClientDisplayName(order, clients, [...(users || []), ...(customerUsers || [])]),
+            guestName: customItem?.passengerName || meta?.passengerName || detail?.passengerName || detail?.guestName || formatClientDisplayName(order, clients, [...(users || []), ...(customerUsers || [])]),
+            wifi: customItem?.wifi || meta?.wifi || detail?.wifi || (Array.isArray(detail?.amenities) && detail.amenities.some(a => String(a).toLowerCase().includes('wifi')) ? 'Yes' : 'No'),
+            refreshments: customItem?.refreshments || meta?.refreshments || detail?.refreshments || (Array.isArray(detail?.amenities) && detail.amenities.some(a => String(a).toLowerCase().includes('refreshment')) ? 'Yes' : 'No'),
+            carSeat: customItem?.carSeat || meta?.carSeat || detail?.carSeat || (Array.isArray(detail?.amenities) && detail.amenities.some(a => String(a).toLowerCase().includes('car seat') || String(a).toLowerCase().includes('baby')) ? 'Yes' : 'No'),
+            luggage: customItem?.luggage || meta?.luggage || detail?.luggage || "No",
+            bags: customItem?.bags ?? meta?.bags ?? detail?.bags ?? 0,
+            stops: customItem?.stops || meta?.stops || detail?.stops || "No",
+            stopLocations: customItem?.stopLocations || meta?.stopLocations || detail?.stopLocations || "",
+            amenities: customItem?.amenities || meta?.amenities || detail?.amenities || [],
+            passenger_info: detail,
+            _passengerInfo: detail,
+            remarks: JSON.stringify(detail),
+            adminApproved: !!detail?.adminApproved || !!meta?.adminApproved || !!liveDriver,
+          };
+
+          const overlay = updatedMap[String(order.id)] || {};
+          return {
+            ...baseMapped,
+            ...overlay,
+            status: overlay.status || baseMapped.status,
+            chauffeur_status: overlay.chauffeur_status || overlay.status || baseMapped.status,
+          };
+        });
+      setChauffeurRequests(filterDataForCurrentUser(mapped));
+    } catch (error) {
+      console.error("Failed to fetch chauffeur requests:", error);
+    }
+  }, [filterDataForCurrentUser]);
+
+  const fetchAudits = React.useCallback(async () => {
+    try {
+      const res = await api.get("/support/audits");
+      if (res.data?.success) {
+        setAudits(filterDataForCurrentUser(res.data.data));
+      }
+    } catch (error) {
+      console.error("Failed to fetch audits:", error);
+    }
+  }, [currentUser]);
+
+  const toggleAvailability = async (userId, forcedStatus = null) => {
+    try {
+      const user = users.find((u) => u.id === userId);
+      const newStatus =
+        forcedStatus !== null ? forcedStatus : user ? !user.isAvailable : true;
+
+      await api.put(`/staff/${userId}`, { is_available: newStatus });
+
+      setUsers((prev) =>
+        prev.map((u) =>
+          u.id === userId ? { ...u, isAvailable: newStatus } : u,
+        ),
+      );
+      if (currentUser?.id === userId) {
+        const updatedUser = { ...currentUser, isAvailable: newStatus };
+        setCurrentUser(updatedUser);
+        localStorage.setItem("user", JSON.stringify(updatedUser));
+      }
+      addLog({
+        action: "Status Update",
+        detail: `${user?.name || "Staff"} availability updated to ${newStatus ? "Active" : "Offline"}.`,
+        type: "system",
+      });
+    } catch (error) {
+      console.error("Failed to toggle availability:", error);
+    }
+  };
+
+  const fetchPayHistory = React.useCallback(async () => {
+    try {
+      const res = await api.get("/finance/payroll");
+      if (res.data?.success) {
+        const mapped = (res.data.data || []).map((p) => ({
+          id: p.id,
+          period: new Date(p.payment_date || p.created_at).toLocaleDateString(
+            "en-US",
+            { month: "long", year: "numeric" },
+          ),
+          date: (p.payment_date || p.created_at)?.split("T")[0],
+          hours: p.hours || "Variable",
+          total: `$${parseFloat(p.net_amount || p.netAmount || p.amount || 0).toLocaleString()}`,
+          status: p.status || "Processed",
+          userId: p.user_id || p.userId,
+          userName: p.user_name || p.userName,
+        }));
+        setPayHistory(mapped);
+      }
+    } catch (error) {
+      console.error("Failed to fetch pay history:", error);
+    }
+  }, []);
+
+
+  const deleteLuxuryItem = async (id) => {
+    // Instant optimistic deletion
+    setLuxuryItems((prev) => prev.filter((i) => i.id !== id && i.itemId !== id));
+    window.dispatchEvent(new CustomEvent('app:state-changed'));
+
+    try {
+      await api.delete(`/concierge/luxury-items/${id}?tenantId=1`);
+      await fetchLuxuryItems();
+      window.dispatchEvent(new CustomEvent('app:state-changed'));
+      addLog({
+        action: "Luxury Item Decommissioned",
+        detail: `Removed vault entry ID ${id}.`,
+        type: "system",
+      });
+      return { success: true };
+    } catch (error) {
+      console.error("Failed to delete luxury item:", error);
+      await fetchLuxuryItems();
+      return { success: false, error };
+    }
+  };
+
+  const dispatchVehicle = async (data) => {
+    try {
+      // data.id is plate_number, data.db_id is the integer ID
+      // data.deliveryId is the DEL-00x formatted ID, data.delivery_db_id is the integer ID
+      const deliveryDbId =
+        data.delivery_db_id ||
+        (typeof data.deliveryId === "string"
+          ? parseInt(String(data.deliveryId).replace(/[^0-9]/g, ""), 10)
+          : data.deliveryId);
+      if (!deliveryDbId) {
+        throw new Error("No delivery selected for dispatch.");
+      }
+
+      await api.put(`/deliveries/${deliveryDbId}`, {
+        status: "en_route",
+        vehicle_id: data.db_id, // Ensure it's assigned if not already
+        route_id: data.routeId || null,
+      });
+
+      // Update vehicle status to En Route in the real DB
+      await api.put(`/vehicles/${data.db_id}`, { status: "En Route" });
+
+      // Re-fetch to sync
+      await fetchFleet();
+      const dRes = await api.get("/deliveries");
+
+      if (dRes.data.success) {
+        const dRaw = dRes.data?.data;
+        const dArr = Array.isArray(dRaw) ? dRaw : Array.isArray(dRaw?.deliveries) ? dRaw.deliveries : [];
+        const mappedDeliveries = dArr.map((d) => ({
+          id: `DEL-${String(d.id).padStart(3, "0")}`,
+          db_id: d.id,
+          orderId: d.order_id,
+          order_id_raw: d.order_id,
+          status: d.status,
+          driver: d.driver_name,
+          vehicleId: d.plate_number,
+          location: d.route || "In Transit",
+          route: d.route,
+          items: d.package_details ? JSON.parse(d.package_details) : [],
+        }));
+        setDeliveries(mappedDeliveries);
+
+        // Auto-sync tracking row for dispatched mission so Tracking tab reflects immediately.
+        const dispatched =
+          mappedDeliveries.find(
+            (d) => Number(d.db_id) === Number(deliveryDbId),
+          ) ||
+          mappedDeliveries.find(
+            (d) => String(d.id) === String(data.deliveryId),
+          );
+        if (dispatched) {
+          const trackingRow = {
+            id: `TRK-DEL-${dispatched.db_id}`,
+            asset: dispatched.vehicleId || data.id || "Assigned Vehicle",
+            location:
+              data.routeName ||
+              dispatched.route ||
+              dispatched.location ||
+              "In Transit",
+            signal: "Strong",
+            eta: dispatched.eta || "Live",
+            status:
+              String(dispatched.status || "").toLowerCase() === "en_route"
+                ? "En Route"
+                : "Active",
+            deliveryId: dispatched.id,
+          };
+          setTracking((prev) => {
+            const idx = prev.findIndex(
+              (t) => String(t.id) === String(trackingRow.id),
+            );
+            if (idx === -1) return [trackingRow, ...prev];
+            const next = [...prev];
+            next[idx] = { ...next[idx], ...trackingRow };
+            return next;
+          });
+        }
+      }
+
+      if (data.markUrgent) {
+        setUrgentTasks((prev) => [
+          {
+            id: `URG-${Date.now()}`,
+            task: data.mission || "High-priority dispatch",
+            time: "Immediate",
+            priority: "Critical",
+            location: data.routeName || "Dispatch Route",
+            assignee: data.driver || "Logistics Team",
+          },
+          ...prev,
+        ]);
+      }
+
+      addLog({
+        action: "Fleet Dispatch",
+        detail: `Vehicle ${data.id} launched for ${data.mission}. Pilot: ${data.driver}`,
+        type: "system",
+      });
+
+      alert(`Asset "${data.id}" successfully dispatched and status updated to "En Route"!`);
+    } catch (error) {
+      console.error("Failed to dispatch vehicle:", error);
+      alert(error.message || "Failed to dispatch vehicle.");
+    }
+  };
+
+  const TRACKING_ENDPOINTS = ["/logistics/tracking"];
+  const URGENT_ENDPOINTS = ["/logistics/urgent"];
+
+  const fetchTracking = React.useCallback(async () => {
+    try {
+      const res = await api.get('/logistics/tracking');
+      if (res.data?.success) {
+        setTracking(res.data.data.map(t => ({
+          ...t,
+          id: t.trackerId || t.id,
+        })));
+      }
+    } catch (error) {
+      console.error("Failed to fetch tracking data:", error);
+    }
+  }, []);
+
+  const addTracking = async (t) => {
+    try {
+      const res = await api.post('/logistics/tracking', t);
+      if (res.data?.success) {
+        setTracking((prev) => [{ ...t, id: res.data.data.id }, ...prev]);
+        addLog({
+          action: "Tracker Linked",
+          detail: `Connected asset ${t.asset} to Geo-Spatial Network.`,
+          type: "system",
+        });
+      }
+    } catch (error) {
+      console.error("Failed to link tracker:", error);
+    }
+  };
+
+  // --- FLEET ACTIONS ---
+  const addFleet = async (vehicle) => {
+    try {
+      const reqData = {
+        vehicleId: vehicle.id,
+        type: vehicle.type || 'Luxury Truck',
+        model: vehicle.model,
+        fuel: vehicle.fuel || '100%',
+        status: vehicle.status || 'Active',
+        capacity: vehicle.capacity || '',
+        location: vehicle.location || '',
+        insurancePolicy: vehicle.insurancePolicy || '',
+        registrationExpiry: vehicle.registrationExpiry || null,
+        inspectionDate: vehicle.inspectionDate || null,
+        diagnosticStatus: vehicle.diagnosticStatus || 'Healthy',
+      };
+      const res = await api.post("/vehicles", reqData);
+      if (res.data?.success) {
+        const saved = res.data.data;
+        setFleet((prev) => [{
+          id: saved.vehicleId,
+          db_id: saved.id,
+          type: saved.type,
+          model: saved.model,
+          fuel: saved.fuel,
+          status: saved.status,
+          capacity: saved.capacity,
+          location: saved.location,
+          insurancePolicy: saved.insurancePolicy,
+          registrationExpiry: saved.registrationExpiry || '',
+          inspectionDate: saved.inspectionDate || '',
+          diagnosticStatus: saved.diagnosticStatus,
+        }, ...prev]);
+        addLog({ action: "Asset Induction", detail: `Commissioned ${vehicle.id} into active fleet.`, type: "system" });
+      }
+    } catch (error) {
+      console.error("Failed to add fleet asset:", error);
+      alert(error.response?.data?.message || "Failed to add vehicle.");
+    }
+  };
+
+  const updateFleet = async (updated) => {
+    try {
+      const reqData = {
+        vehicleId: updated.id,
+        type: updated.type,
+        model: updated.model,
+        fuel: updated.fuel,
+        status: updated.status,
+        capacity: updated.capacity,
+        location: updated.location,
+        insurancePolicy: updated.insurancePolicy,
+        registrationExpiry: updated.registrationExpiry || null,
+        inspectionDate: updated.inspectionDate || null,
+        diagnosticStatus: updated.diagnosticStatus,
+      };
+      const res = await api.put(`/vehicles/${updated.db_id}`, reqData);
+      if (res.data?.success) {
+        setFleet((prev) => prev.map((v) => v.db_id === updated.db_id ? { ...v, ...updated } : v));
+        addLog({ action: "Asset Recalibration", detail: `Updated telemetry for ${updated.id}.`, type: "system" });
+      }
+    } catch (error) {
+      console.error("Failed to update fleet asset:", error);
+    }
+  };
+
+  const deleteFleet = async (id) => {
+    try {
+      const vehicle = fleet.find((v) => v.id === id);
+      if (vehicle && vehicle.db_id) {
+        await api.delete(`/vehicles/${vehicle.db_id}`);
+        setFleet((prev) => prev.filter((v) => v.id !== id));
+        addLog({ action: "Asset Decommissioned", detail: `Removed ${id} from active fleet operations.`, type: "alert" });
+      }
+    } catch (error) {
+      console.error("Failed to delete fleet asset:", error);
+    }
+  };
+
+  // --- ROUTE ACTIONS ---
+  const addRoute = async (route) => {
+    try {
+      // Send the entire route object directly so that dist, time, type, status, and id are preserved
+      const res = await api.post("/logistics/routes", route);
+      if (res.data.success) {
+        setRoutes((prev) => [{ ...route, id: res.data.data.id }, ...prev]);
+        addLog({
+          action: "Route Mapping",
+          detail: `Charted new logistics corridor: ${route.name}`,
+          type: "system",
+        });
+      }
+    } catch (error) {
+      console.error("Failed to add route:", error);
+    }
+  };
+
+  const updateRoute = async (updated) => {
+    try {
+      await api.put(`/logistics/routes/${updated.id}`, updated);
+      setRoutes((prev) => prev.map((r) => (r.id === updated.id ? updated : r)));
+      addLog({
+        action: "Route Updated",
+        detail: `Corridor ${updated.name} parameters recalibrated.`,
+        type: "system",
+      });
+    } catch (error) {
+      console.error("Failed to update route:", error);
+    }
+  };
+
+  const fetchRoutes = React.useCallback(async () => {
+    try {
+      const res = await api.get("/logistics/routes");
+      if (res.data?.success) {
+        setRoutes(
+          res.data.data.map((r) => ({
+            id: r.id, // mapped from routeId
+            name: r.name,
+            dist: r.dist || r.distance || "",
+            time: r.time || r.avgTime || "",
+            type: r.type || "Land",
+            status: r.status || "Active",
+          }))
+        );
+      }
+    } catch (error) {
+      console.error("Failed to fetch routes:", error);
+    }
+  }, []);
+
+  const deleteRoute = async (id) => {
+    try {
+      await api.delete(`/logistics/routes/${id}`);
+      setRoutes((prev) => prev.filter((r) => r.id !== id));
+      addLog({
+        action: "Route Decommissioned",
+        detail: `Path ID ${id} removed from distribution network.`,
+        type: "alert",
+      });
+    } catch (error) {
+      console.error("Failed to delete route:", error);
+    }
+  };
+
+  const addChauffeurRequest = async (request) => {
+    try {
+      const inputFee = Number(request.chauffeurFee ?? request.chauffeur_fee ?? 0) || 0;
+      const isRoundTrip = request.serviceType === 'Round Trip';
+      const daysCount = request.serviceType === 'Daily Service' ? (Number(request.numberOfDays) || 1) : 1;
+      const fee = inputFee > 0
+        ? inputFee
+        : (isRoundTrip ? CHAUFFEUR_BASE_FEE_USD * 2 : (daysCount > 1 ? CHAUFFEUR_BASE_FEE_USD * daysCount : CHAUFFEUR_BASE_FEE_USD));
+      const compId = request.clientId && request.clientId !== "CLT-GUEST"
+        ? request.clientId
+        : currentUser?.company_id || currentUser?.companyId || currentUser?.clientId || null;
+      const usrId = currentUser?.id || null;
+
+      const passengerPayload = {
+        ...request,
+        passengers: request.numberOfPassengers,
+        luggage: request.luggage,
+        amenities: request.amenities,
+        chauffeurFee: fee,
+        chauffeur_fee: fee,
+        chauffeur_fee_mode: request.chauffeur_fee_mode || "separate",
+        serviceType: request.serviceType,
+        returnDate: request.returnDate || null,
+        returnTime: request.returnTime || null,
+        numberOfDays: request.numberOfDays || null,
+        stops: request.stops || "No",
+        stopLocations: request.stopLocations || null,
+        bags: request.bags || 0,
+        clientName: request.clientName || null,
+        chauffeur_status: request.status || (request.driverName ? "assigned" : "pending"),
+        company_id: compId,
+        companyId: compId,
+        created_by: usrId,
+        user_id: usrId,
+        userId: usrId,
+      };
+      const reqData = {
+        mission_type: "Chauffeur",
+        company_id: compId,
+        companyId: compId,
+        pickup_location: request.pickupLocation,
+        drop_location: request.dropLocation,
+        delivery_date: request.dueDate || null,
+        pickup_time: request.pickupTime || null,
+        total_amount: fee,
+        estimated_total: fee,
+        driver_name: request.driverName || null,
+        plate_number: request.plateNumber || null,
+        passenger_info: JSON.stringify(passengerPayload),
+        status: request.driverName ? "assigned" : "pending",
+        created_by: usrId,
+        user_id: usrId,
+      };
+      const res = await api.post("/orders", {
+        clientId: request.clientId || compId || null,
+        companyId: compId,
+        orderType: "CHAUFFEUR",
+        status: reqData.status,
+        totalAmount: fee,
+        total_amount: fee,
+        chauffeurFee: fee,
+        items: [{
+          ...passengerPayload,
+          name: "VIP Chauffeur Service",
+          price: fee,
+          chauffeurFee: fee
+        }]
+      });
+
+      const newId = res.data?.data?.id || res.data?.id || Date.now();
+      const newChauffeurObj = {
+        id: newId,
+        db_id: newId,
+        clientId: request.clientId || 'CLT-GUEST',
+        company_id: compId,
+        companyId: compId,
+        created_by: usrId,
+        user_id: usrId,
+        userId: usrId,
+        clientName: request.clientName || 'Guest Client',
+        driverName: request.driverName || null,
+        plateNumber: request.plateNumber || null,
+        driver_user_id: request.driver_user_id || null,
+        serviceType: request.serviceType || "One Way",
+        pickupLocation: request.pickupLocation || "Nassau Area",
+        dropLocation: request.dropLocation || "Destination",
+        dueDate: request.dueDate || null,
+        pickupDate: request.dueDate || null,
+        pickupTime: request.pickupTime || null,
+        status: reqData.status,
+        chauffeurFee: fee,
+        chauffeur_fee_mode: request.chauffeur_fee_mode || "separate",
+        numberOfPassengers: request.numberOfPassengers || 1,
+        bags: request.bags || 0,
+        stops: request.stops || "No",
+        stopLocations: request.stopLocations || "",
+        amenities: request.amenities || [],
+        passenger_info: passengerPayload,
+        _passengerInfo: passengerPayload,
+        remarks: JSON.stringify(passengerPayload),
+        adminApproved: !!passengerPayload.adminApproved,
+      };
+
+      setChauffeurRequests((prev) => [newChauffeurObj, ...prev]);
+
+      await syncGlobalState();
+      addLog({
+        action: "Chauffeur Dispatched",
+        detail: `VIP Transport secured for ${request.clientName}.`,
+        type: "system",
+      });
+    } catch (error) {
+      console.error("Failed to add chauffeur request:", error);
+      const msg =
+        error.response?.data?.message || "Failed to create chauffeur request.";
+      alert(msg);
+    }
+  };
+
+  const updateChauffeurRequest = async (updated) => {
+    try {
+      const apiStatus = toApiDeliveryStatus(updated.status);
+      const patch = { status: apiStatus };
+      if (updated.driverName != null || updated.driver_name != null) {
+        patch.driver_name = updated.driverName ?? updated.driver_name ?? "";
+      }
+      if (updated.plateNumber != null || updated.plate_number != null) {
+        patch.plate_number = updated.plateNumber ?? updated.plate_number ?? "";
+      }
+      if (
+        updated.passenger_info !== undefined &&
+        updated.passenger_info !== null
+      ) {
+        patch.passenger_info =
+          typeof updated.passenger_info === "string"
+            ? updated.passenger_info
+            : JSON.stringify(updated.passenger_info);
+      }
+      let piObj = {};
+      try {
+        const rawPi = updated.passenger_info ?? updated._passengerInfo;
+        if (typeof rawPi === "string") {
+          piObj = JSON.parse(rawPi || "{}");
+        } else if (rawPi && typeof rawPi === "object") {
+          piObj = rawPi;
+        }
+      } catch {
+        piObj = {};
+      }
+
+      piObj.chauffeur_status = updated.status;
+      patch.passenger_info = JSON.stringify(piObj);
+
+      const driverUid =
+        piObj.driver_user_id ?? piObj.driverUserId ?? updated.driver_user_id;
+      if (driverUid != null && driverUid !== "") {
+        const n = Number(driverUid);
+        patch.assigned_driver =
+          Number.isFinite(n) && !Number.isNaN(n) ? n : driverUid;
+      }
+      const patchId = updated.db_id || updated.id;
+      setUpdatedChauffeurItem(patchId, updated);
+      setChauffeurRequests((prev) =>
+        prev.map((r) =>
+          String(r.id) === String(updated.id) || String(r.db_id) === String(updated.id) || (updated.db_id && String(r.id) === String(updated.db_id))
+            ? { ...r, ...updated }
+            : r
+        )
+      );
+
+      try {
+        const payload = {
+          clientId: updated.clientId || updated.client_id || '',
+          status: updated.status,
+          items: [{
+            ...piObj,
+            driverName: updated.driverName || updated.driver || piObj.driverName || "",
+            driver_user_id: driverUid || null,
+            plateNumber: updated.plateNumber || updated.vehicleId || piObj.plateNumber || "",
+            status: updated.status
+          }]
+        };
+        await api.put(`/orders/${patchId}`, payload);
+      } catch (err) {
+        console.warn("Update API call notice:", err);
+      }
+      await syncGlobalState();
+      addLog({
+        action: "Chauffeur Updated",
+        detail: `Protocol ID ${updated.id} status recalibrated.`,
+        type: "system",
+      });
+    } catch (error) {
+      console.error("Failed to update chauffeur request:", error);
+    }
+  };
+
+  const deleteChauffeurRequest = async (id) => {
+    try {
+      addDeletedChauffeurId(id);
+      setChauffeurRequests((prev) => prev.filter((r) => String(r.id) !== String(id) && String(r.db_id) !== String(id)));
+      try { await api.delete(`/orders/${id}`); } catch (_) { }
+      await syncGlobalState();
+    } catch (error) {
+      console.error("Failed to delete chauffeur request:", error);
+    }
+  };
+  const updateTracking = async (updated) => {
+    const payload = {
+      asset: updated.asset,
+      location: updated.location,
+      signal: updated.signal,
+      eta: updated.eta,
+      status: updated.status,
+      delivery_id: updated.deliveryId || null,
+      tracker_id: updated.id,
+    };
+    if (!trackingApiUnavailableRef.current)
+      for (const ep of TRACKING_ENDPOINTS) {
+        try {
+          await api.put(
+            `${ep}/${encodeURIComponent(updated.db_id || updated.id)}`,
+            payload,
+          );
+          await fetchTracking();
+          return;
+        } catch (_) {
+          /* try next endpoint */
+        }
+      }
+    trackingApiUnavailableRef.current = true;
+    setTracking((prev) => prev.map((t) => (t.id === updated.id ? updated : t)));
+  };
+
+  const deleteTracking = async (id) => {
+    if (!trackingApiUnavailableRef.current)
+      for (const ep of TRACKING_ENDPOINTS) {
+        try {
+          const row = tracking.find(
+            (t) =>
+              String(t.id) === String(id) || String(t.db_id) === String(id),
+          );
+          await api.delete(`${ep}/${encodeURIComponent(row?.db_id || id)}`);
+          await fetchTracking();
+          addLog({
+            action: "Signal Severed",
+            detail: `Decommissioned tracker ${id}.`,
+            type: "alert",
+          });
+          return;
+        } catch (_) {
+          /* try next endpoint */
+        }
+      }
+    trackingApiUnavailableRef.current = true;
+    setTracking((prev) => prev.filter((t) => t.id !== id));
+    addLog({
+      action: "Signal Severed",
+      detail: `Decommissioned tracker ${id}.`,
+      type: "alert",
+    });
+  };
+
+  const addEvent = async (event) => {
+    try {
+      const rawClientId =
+        event.client_id ||
+        clients.find((c) => c.name === event.client)?.id ||
+        null;
+      const parsedCid = rawClientId ? parseInt(String(rawClientId).replace("CLT-", ""), 10) : null;
+      const clientId = Number.isFinite(parsedCid) && parsedCid > 0 ? parsedCid : null;
+
+      let moodBoard = (event.moodBoardUrl || event.moodBoard || "").trim();
+      if (moodBoard && !moodBoard.startsWith("http://") && !moodBoard.startsWith("https://")) {
+        moodBoard = `https://${moodBoard}`;
+      }
+
+      const payload = {
+        title: event.title || "",
+        name: event.name || event.title || "",
+        event_date: event.date || "",
+        date: event.date || "",
+        location: event.location || "",
+        client_id: clientId,
+        manager_id: currentUser?.id || "",
+        status: event.status || "planned",
+        special_requests: event.specialRequests || "",
+        planner_name: event.plannerName || "",
+        guest_count: event.guestCount || event.guests || 0,
+        mood_board_url: moodBoard
+      };
+
+      const res = await api.post("/support/events", payload);
+      if (res.data?.success) {
+        const createdEvt = res.data.data;
+        const newEvt = {
+          ...createdEvt,
+          id: createdEvt.eventId || createdEvt.id,
+          eventId: createdEvt.eventId || createdEvt.id,
+          db_id: createdEvt.id || createdEvt.db_id,
+          title: createdEvt.name || event.title,
+          client: createdEvt.client_name || event.client || "Personal Client",
+          client_name: createdEvt.client_name || event.client || "Personal Client",
+          date: createdEvt.date || (createdEvt.event_date ? createdEvt.event_date.split("T")[0] : event.date || ""),
+          imageUrl: createdEvt.image_url || createdEvt.imageUrl || "",
+          moodBoardUrl: createdEvt.moodBoardUrl || createdEvt.mood_board_url || moodBoard || event.moodBoardUrl || "",
+          plannerName: createdEvt.plannerName || createdEvt.planner_name || event.plannerName || "",
+          specialRequests: createdEvt.specialRequests || createdEvt.special_requests || event.specialRequests || "",
+          guestCount: createdEvt.guestCount || createdEvt.guest_count || event.guestCount || 0,
+          client_id: createdEvt.clientId || createdEvt.client_id || clientId,
+          manager_id: createdEvt.managerId || createdEvt.manager_id || currentUser?.id,
+          status: createdEvt.status || event.status || "planned",
+          tenantId: currentUser?.tenantId || 1,
+        };
+        setEvents((prev) => [newEvt, ...prev]);
+        setRawEvents((prev) => [newEvt, ...prev]);
+        await fetchTickets();
+        window.dispatchEvent(new CustomEvent('app:state-changed'));
+        addLog({
+          action: "Event Registry",
+          detail: `New event request: ${event.title}`,
+          type: "system",
+        });
+      }
+    } catch (error) {
+      console.error("Failed to add event:", error);
+    }
+  };
+
+  const updateEvent = async (updated) => {
+    try {
+      const targetId = updated.id || updated.eventId;
+      let clientId;
+      if (updated.client_id !== undefined) {
+        clientId = String(updated.client_id).replace("CLT-", "");
+      } else if (updated.client !== undefined) {
+        const found =
+          clients.find((c) => c.name === updated.client)?.id || null;
+        clientId = found ? String(found).replace("CLT-", "") : undefined;
+      }
+
+      const payload = {
+        title: updated.title || "",
+        name: updated.name || updated.title || "",
+        event_date: updated.date || "",
+        date: updated.date || "",
+        location: updated.location || "",
+        client_id: clientId,
+        manager_id: updated.manager_id || updated.managerId || currentUser?.id || "",
+        status: updated.status || "planned",
+        special_requests: updated.specialRequests || "",
+        planner_name: updated.plannerName || "",
+        guest_count: updated.guestCount || updated.guests || 0,
+        mood_board_url: updated.moodBoardUrl || ""
+      };
+
+      // Optimistically update local state so UI reflects changes immediately.
+      const uiUpdate = {
+        ...updated,
+        title: updated.title,
+        date: updated.date,
+        location: updated.location,
+        plannerName: updated.plannerName,
+        specialRequests: updated.specialRequests,
+        guestCount: updated.guestCount,
+        moodBoardUrl: updated.moodBoardUrl,
+        status: updated.status,
+      };
+      Object.keys(uiUpdate).forEach(k => uiUpdate[k] === undefined && delete uiUpdate[k]);
+
+      const matchEvt = (e) =>
+        String(e.id) === String(targetId) ||
+        String(e.eventId) === String(targetId) ||
+        String(e.db_id) === String(targetId);
+
+      setEvents((prev) =>
+        prev.map((e) => (matchEvt(e) ? { ...e, ...uiUpdate } : e))
+      );
+      setRawEvents((prev) =>
+        prev.map((e) => (matchEvt(e) ? { ...e, ...uiUpdate } : e))
+      );
+
+      await api.put(`/support/events/${targetId}`, payload);
+
+      await fetchTickets();
+      window.dispatchEvent(new CustomEvent('app:state-changed'));
+      addLog({
+        action: "Event Update",
+        detail: `Synchronized details for ${updated.title || targetId}.`,
+        type: "system",
+      });
+    } catch (error) {
+      console.error("Failed to update event:", error);
+    }
+  };
+
+  const deleteEvent = async (id) => {
+    try {
+      const matchEvt = (e) =>
+        String(e.id) === String(id) ||
+        String(e.eventId) === String(id) ||
+        String(e.db_id) === String(id);
+
+      setEvents((prev) => prev.filter((e) => !matchEvt(e)));
+      setRawEvents((prev) => prev.filter((e) => !matchEvt(e)));
+
+      await api.delete(`/support/events/${id}`);
+      await fetchTickets();
+      window.dispatchEvent(new CustomEvent('app:state-changed'));
+      addLog({
+        action: "Event Cancellation",
+        detail: `Removed event reference ID ${id}.`,
+        type: "system",
+      });
+    } catch (error) {
+      console.error("Failed to delete event:", error);
+    }
+  };
+
+  const [deliveryPricing, setDeliveryPricing] = useState([]);
+  const [shippingModePricing, setShippingModePricing] = useState({ Road: 0, Sea: 150, Air: 300 });
+
+  React.useEffect(() => {
+    const s = systemSettings || {};
+    if (s.shipping_modes) {
+      setShippingModePricing(s.shipping_modes);
+    }
+    if (s.delivery_tiers) {
+      setDeliveryPricing(s.delivery_tiers);
+    }
+  }, [systemSettings]);
+
+  const updateShippingModePricing = async (nextPricing) => {
+    const normalized = {
+      Road: Number(nextPricing?.Road) >= 0 ? Number(nextPricing.Road) : 0,
+      Sea: Number(nextPricing?.Sea) >= 0 ? Number(nextPricing.Sea) : 150,
+      Air: Number(nextPricing?.Air) >= 0 ? Number(nextPricing.Air) : 300,
+    };
+    setShippingModePricing(normalized);
+    writeShippingModePricing(normalized); // Optional: keep for offline backup
+    try {
+      const res = await api.put("/settings/system", {
+        type: 'shipping_modes',
+        data: normalized
+      });
+      if (res.data?.success) {
+        setSystemSettings(prev => ({
+          ...prev,
+          shipping_modes: normalized
+        }));
+      }
+    } catch (e) {
+      console.warn("Could not persist shipping pricing to backend:", e?.response?.data || e?.message);
+    }
+    return true;
+  };
+
+  const updateDeliveryTiers = async (tiers) => {
+    setDeliveryPricing(tiers);
+    try {
+      const res = await api.put("/settings/system", {
+        type: 'delivery_tiers',
+        data: tiers
+      });
+      if (res.data?.success) {
+        setSystemSettings(prev => ({
+          ...prev,
+          delivery_tiers: tiers
+        }));
+      }
+    } catch (e) {
+      console.warn("Could not persist delivery tiers to backend:", e?.response?.data || e?.message);
+    }
+    return true;
+  };
+
+  const getVacationBalance = (userId) => {
+    const user = users.find((u) => u.id === userId);
+    if (!user || user.role === "client") return 0;
+
+    const join = new Date(user.joinedDate || "2024-01-01");
+    const now = new Date();
+    const diffYears = (now - join) / (1000 * 60 * 60 * 24 * 365);
+    const diffMonths = diffYears * 12;
+
+    if (user.isSalaried) {
+      if (diffYears > 10) return 15; // 3 weeks
+      if (diffYears >= 1) return 10; // 2 weeks
+      if (diffMonths >= 6) return 5; // 1 week
+      return 0;
+    } else {
+      // Hourly
+      if (diffYears >= 1) return 10; // 2 weeks
+      return 0;
+    }
+  };
+
+  const submitSaaSRequest = async (data) => {
+    try {
+      const res = await api.post("/clients", {
+        ...data,
+        clientCode: `CLT-${Date.now().toString().slice(-6)}`,
+        companyName: data.companyName || data.name || "Unknown Company",
+        contactPerson: data.contact || data.contactPerson || "Admin",
+        email: data.email,
+        phone: data.phone || "0000000000",
+        address: data.location || "N/A",
+        country: data.country || "Bahamas",
+        password: data.password || null,
+        client_type: data.clientType,
+        billing_cycle: data.billingCycle,
+        payment_method: data.paymentMethod,
+        logo_url: data.logo,
+        status: "pending",
+      });
+      if (res.data?.success) {
+        setClients((prev) => [res.data.data, ...prev]);
+        addLog({
+          action: "SaaS Invite Request",
+          detail: `New request from ${data.name} for ${data.plan} plan.`,
+          type: "system",
+        });
+      }
+    } catch (error) {
+      console.error("Failed to submit SaaS request:", error);
+    }
+  };
+
+  const processSaaSRequest = async (id, action) => {
+    try {
+      const newStatus = action === "approve" ? "active" : "rejected";
+      await api.put(`/clients/${id}`, { status: newStatus });
+      setClients((prev) =>
+        prev.map((c) => (c.id === id ? { ...c, status: newStatus } : c)),
+      );
+      addLog({
+        action: "SaaS Request Processed",
+        detail: `Request ${id} marked as ${newStatus}.`,
+        type: "system",
+      });
+    } catch (error) {
+      console.error("Failed to process SaaS request:", error);
+    }
+  };
+
+  const fetchTicketById = React.useCallback(async (ticketId) => {
+    if (!ticketId) return null;
+    const cleanId = String(ticketId).trim();
+    try {
+      const res = await api.get(`/support/tickets/${cleanId}?_t=${Date.now()}`);
+      if (res.data?.success && res.data.data) {
+        const t = res.data.data;
+        const formatStatus = (s) => {
+          if (!s) return "Open";
+          return String(s)
+            .split(/[_\s]+/)
+            .map((p) => p.charAt(0).toUpperCase() + p.slice(1))
+            .join(" ");
+        };
+        let msgs = [];
+        if (t.messages) {
+          try {
+            msgs = typeof t.messages === "string" ? JSON.parse(t.messages) : t.messages;
+          } catch (e) {
+            msgs = [];
+          }
+        }
+        if (!Array.isArray(msgs) || msgs.length === 0) {
+          msgs = [
+            {
+              sender: "client",
+              text: t.description || "No description provided.",
+              time: new Date(t.created_at || t.createdAt || Date.now()).toLocaleTimeString([], {
+                hour: "2-digit",
+                minute: "2-digit",
+              }),
+            },
+          ];
+        }
+        const uniqueTicketId = t.ticketId || (String(t.id).startsWith("TKT-") ? t.id : `TKT-${String(t.id).padStart(3, "0")}`);
+        const dbId = t.db_id || (typeof t.id === "number" ? t.id : null);
+        const mappedTicket = {
+          ...t,
+          id: uniqueTicketId,
+          ticketId: uniqueTicketId,
+          db_id: dbId,
+          submitted_by: t.submitted_by ?? t.createdById ?? null,
+          created_by: t.submitted_by ?? t.created_by ?? t.createdById ?? null,
+          user_id: t.submitted_by ?? t.user_id ?? t.createdById ?? null,
+          clientName: t.submitted_by_name || t.createdByName || t.clientName || "System User",
+          clientId: t.client_id ?? t.company_id ?? t.clientId ?? null,
+          createdById: t.created_by ?? t.user_id ?? t.createdById ?? null,
+          createdByEmail: t.created_by_email || t.email || t.createdByEmail || null,
+          createdByName: t.submitted_by_name || t.created_by_name || t.createdByName || null,
+          subject: t.subject || t.title,
+          category: t.category || "General",
+          priority: t.priority
+            ? t.priority.charAt(0).toUpperCase() + t.priority.slice(1)
+            : "Medium",
+          status: formatStatus(t.status),
+          date: t.created_at ? t.created_at.split("T")[0] : (t.createdAt ? t.createdAt.split("T")[0] : new Date().toISOString().split("T")[0]),
+          dispute_status: t.dispute_status || "none",
+          refund_amount: t.refund_amount || 0,
+          messages: msgs,
+        };
+
+        setSupportTickets((prev) =>
+          prev.map((item) => {
+            const itemId = item.ticketId || item.id;
+            if (itemId && String(itemId) === String(uniqueTicketId)) {
+              return { ...item, ...mappedTicket };
+            }
+            return item;
+          })
+        );
+        return mappedTicket;
+      }
+    } catch (e) {
+      // Backend /support/tickets/:id route fallback
+    }
+
+    const found = (rawSupportTickets || supportTickets || []).find((item) => {
+      const iId = item.ticketId || item.id;
+      return iId && String(iId).toLowerCase() === cleanId.toLowerCase();
+    });
+    return found || null;
+  }, [supportTickets, rawSupportTickets]);
+
+  const addSupportTicket = async (ticket) => {
+    try {
+      const generatedId = ticket.ticketId || ticket.id || `TKT-${Math.floor(1000 + Math.random() * 8999)}`;
+      const payload = {
+        id: generatedId,
+        ticketId: generatedId,
+        subject: ticket.subject,
+        category: ticket.category || "General",
+        description: String(ticket.description || ticket.subject || (ticket.messages?.[0]?.text) || "Support request").slice(0, 150),
+        messages: ticket.messages,
+        priority: (ticket.priority || "medium").toLowerCase(),
+        client_id:
+          ticket.clientId ||
+          currentUser?.clientId ||
+          currentUser?.company_id ||
+          null,
+        created_by: ticket.createdById || currentUser?.id || null,
+        createdByName: ticket.createdByName || currentUser?.name || null,
+        createdByEmail: ticket.createdByEmail || currentUser?.email || null,
+        dispute_status: ticket.dispute_status || "none",
+        refund_amount: ticket.refund_amount || 0,
+        dispute_data: ticket.dispute_data || null,
+        order_id: ticket.order_id || ticket.dispute_data?.orderId || null,
+      };
+      const res = await api.post("/support/tickets", payload);
+      if (res.data?.success) {
+        const createdTkt = res.data.data;
+        const finalTicketId = createdTkt.ticketId || createdTkt.id || generatedId;
+        const finalDbId = createdTkt.db_id || (typeof createdTkt.id === "number" ? createdTkt.id : null);
+
+        const newTicket = {
+          ...createdTkt,
+          id: finalTicketId,
+          ticketId: finalTicketId,
+          db_id: finalDbId,
+          clientName: ticket.clientName || currentUser?.name || "System User",
+          subject: ticket.subject,
+          category: ticket.category || "General",
+          priority: (ticket.priority || "Medium").charAt(0).toUpperCase() + (ticket.priority || "Medium").slice(1),
+          status: "Open",
+          date: new Date().toISOString().split("T")[0],
+          dispute_status: ticket.dispute_status || createdTkt.dispute_status || "none",
+          refund_amount: ticket.refund_amount || createdTkt.refund_amount || 0,
+          dispute_data: ticket.dispute_data || createdTkt.dispute_data || null,
+          order_id: ticket.order_id || createdTkt.order_id || null,
+          messages: ticket.messages || [],
+        };
+        setSupportTickets((prev) => [newTicket, ...prev.filter((t) => (t.ticketId || t.id) !== finalTicketId)]);
+        setRawSupportTickets((prev) => [newTicket, ...prev.filter((t) => (t.ticketId || t.id) !== finalTicketId)]);
+        await fetchTickets();
+        window.dispatchEvent(new CustomEvent('app:state-changed'));
+        addLog({
+          action: "Ticket Creation",
+          detail: `Ticket opened: ${ticket.subject}`,
+          type: "system",
+        });
+        return newTicket;
+      }
+    } catch (error) {
+      console.error("Failed to add support ticket:", error);
+      throw error;
+    }
+  };
+
+  const updateSupportTicket = async (ticketOrId, status = null) => {
+    try {
+      let id, payload, targetTicketId, targetDbId;
+      if (typeof ticketOrId === "object") {
+        targetTicketId = ticketOrId.ticketId || (String(ticketOrId.id).startsWith("TKT-") ? ticketOrId.id : null);
+        targetDbId = ticketOrId.db_id || (typeof ticketOrId.id === "number" ? ticketOrId.id : null);
+        id = targetTicketId || ticketOrId.id || targetDbId;
+        payload = {
+          status: (ticketOrId.status || "open").toLowerCase().replace(/\s+/g, "_"),
+          messages: ticketOrId.messages || ticketOrId.responses || [],
+          dispute_status: ticketOrId.dispute_status || "none",
+          refund_amount: ticketOrId.refund_amount !== undefined ? Number(ticketOrId.refund_amount) : 0,
+          dispute_data: ticketOrId.dispute_data || null,
+          order_id: ticketOrId.order_id || ticketOrId.dispute_data?.orderId || null,
+        };
+      } else {
+        id = ticketOrId;
+        targetTicketId = String(ticketOrId).startsWith("TKT-") ? ticketOrId : null;
+        targetDbId = !isNaN(Number(ticketOrId)) ? Number(ticketOrId) : null;
+        payload = { status: (status || "open").toLowerCase().replace(/\s+/g, "_") };
+      }
+
+      const formatStatus = (s) => {
+        if (!s) return "Open";
+        return String(s)
+          .split(/[_\s]+/)
+          .map((p) => p.charAt(0).toUpperCase() + p.slice(1))
+          .join(" ");
+      };
+      const formattedStatus = formatStatus(payload.status);
+
+      // Safe matching: never match undefined === undefined
+      const matchTicket = (t) => {
+        if (!t) return false;
+        const tTicketId = t.ticketId || (String(t.id).startsWith("TKT-") ? t.id : null);
+        const tDbId = t.db_id || (typeof t.id === "number" ? t.id : null);
+        if (targetTicketId && tTicketId && String(targetTicketId) === String(tTicketId)) return true;
+        if (targetDbId && tDbId && String(targetDbId) === String(tDbId)) return true;
+        if (id && (t.id || t.ticketId) && String(id) === String(t.ticketId || t.id)) return true;
+        return false;
+      };
+
+      setSupportTickets((prev) =>
+        prev.map((t) =>
+          matchTicket(t)
+            ? { ...t, ...payload, status: formattedStatus }
+            : t
+        )
+      );
+      setRawSupportTickets((prev) =>
+        prev.map((t) =>
+          matchTicket(t)
+            ? { ...t, ...payload, status: formattedStatus }
+            : t
+        )
+      );
+
+      const res = await api.put(`/support/tickets/${id}`, payload);
+
+      // Automatically sync refund deduction to the matching order if dispute is accepted
+      const linkedOrderId = ticketOrId?.order_id || ticketOrId?.dispute_data?.orderId || payload.order_id;
+      if (payload.dispute_status === 'accepted' && Number(payload.refund_amount) > 0 && linkedOrderId) {
+        try {
+          const matchOrder = (o) => {
+            const rawOId = String(o.id || o.rawId || '').replace(/\D/g, '');
+            const rawTargetId = String(linkedOrderId).replace(/\D/g, '');
+            return String(o.id) === String(linkedOrderId) || 
+              String(o.orderNumber) === String(linkedOrderId) || 
+              (rawOId && rawTargetId && rawOId === rawTargetId);
+          };
+
+          const matchedOrder = (orders || []).find(matchOrder);
+          const orderTotal = Number(matchedOrder?.total || matchedOrder?.totalAmount || matchedOrder?.total_amount || 0);
+          const isFull = Number(payload.refund_amount) >= orderTotal && orderTotal > 0;
+          const newOrderStatus = isFull ? 'Refunded' : 'Partially Refunded';
+          const newRefundStatus = isFull ? 'FULL' : 'PARTIAL';
+
+          setOrders(prev => prev.map(o => {
+            if (matchOrder(o)) {
+              return {
+                ...o,
+                status: newOrderStatus,
+                refund_status: newRefundStatus,
+                refunded_amount: Number(payload.refund_amount),
+                metadata: {
+                  ...(typeof o.metadata === 'object' ? o.metadata : {}),
+                  refund_status: newRefundStatus,
+                  refunded_amount: Number(payload.refund_amount),
+                  refundTicketId: id
+                }
+              };
+            }
+            return o;
+          }));
+
+          const targetOrderDbId = matchedOrder?.id || linkedOrderId;
+          const cleanNumericId = Number(String(targetOrderDbId).replace(/\D/g, ''));
+          if (cleanNumericId > 0) {
+            await api.put(`/orders/${cleanNumericId}`, {
+              status: newOrderStatus,
+              refunded_amount: Number(payload.refund_amount),
+              refund_status: newRefundStatus,
+              metadata: {
+                ...(matchedOrder?.metadata && typeof matchedOrder.metadata === 'object' ? matchedOrder.metadata : {}),
+                refund_status: newRefundStatus,
+                refunded_amount: Number(payload.refund_amount),
+                refundTicketId: id
+              }
+            }).catch(e => console.warn('Could not update order status on backend:', e?.message));
+          }
+        } catch (orderSyncErr) {
+          console.warn('Failed to sync refund to order:', orderSyncErr);
+        }
+      }
+      await fetchTickets();
+      window.dispatchEvent(new CustomEvent('app:state-changed'));
+      addLog({
+        action: "Ticket Update",
+        detail: `Synchronized support ticket ${id}.`,
+        type: "system",
+      });
+      return res.data;
+    } catch (error) {
+      console.error("Failed to update ticket:", error);
+      throw error;
+    }
+  };
+
+  const deleteSupportTicket = async (ticketOrId) => {
+    try {
+      const ticketId = typeof ticketOrId === "object" ? (ticketOrId.ticketId || ticketOrId.id) : ticketOrId;
+      const numId = typeof ticketOrId === "object" ? (ticketOrId.db_id || ticketOrId.id) : ticketOrId;
+
+      const matchTicket = (t) => {
+        if (!t) return false;
+        const tId = t.ticketId || t.id;
+        const tDb = t.db_id || t.id;
+        return (ticketId && tId && String(ticketId) === String(tId)) ||
+          (numId && tDb && String(numId) === String(tDb));
+      };
+
+      // Optimistic state update
+      setSupportTickets((prev) => prev.filter((t) => !matchTicket(t)));
+      setRawSupportTickets((prev) => prev.filter((t) => !matchTicket(t)));
+
+      const res = await api.delete(`/support/tickets/${ticketId}`);
+      await fetchTickets();
+      window.dispatchEvent(new CustomEvent('app:state-changed'));
+      addLog({
+        action: "Ticket Deletion",
+        detail: `Deleted support ticket ${ticketId}.`,
+        type: "system",
+      });
+      return res.data;
+    } catch (error) {
+      console.error("Failed to delete support ticket:", error);
+      await fetchTickets();
+      throw error;
+    }
+  };
+
+  const addGuestRequest = async (request) => {
+    try {
+      const formattedTime = formatDateTime(request.date, request.time);
+      const userRole = String(currentUser?.role?.name || currentUser?.role || "")
+        .toLowerCase()
+        .replace(/\s+/g, "_");
+      const isClientRole = [
+        "client",
+        "customer",
+        "admin",
+        "saas_client",
+      ].includes(userRole);
+      const payload = {
+        client_id:
+          request.clientId ||
+          (isClientRole
+            ? currentUser.clientId || currentUser.company_id
+            : clients.find((c) => c.name === request.client)?.id || null),
+        guest: request.guest || "Guest",
+        requested_by: request.requestedBy || currentUser?.name || "Staff",
+        request_details: request.request || request.details || "",
+        delivery_time: formattedTime,
+        priority: (request.priority || "medium").toLowerCase(),
+        status: (request.status || "pending").toLowerCase(),
+      };
+      console.log('[GuestRequest] Creating:', payload);
+      const res = await api.post("/support/guest-requests", payload);
+      if (res.data?.success) {
+        const createdReq = res.data.data;
+        const newReq = {
+          ...createdReq,
+          id: createdReq.requestId || createdReq.id,
+          requestId: createdReq.requestId || createdReq.id,
+          db_id: createdReq.id || createdReq.db_id,
+          request: createdReq.request_details || createdReq.request || payload.request_details,
+          requestedBy: createdReq.requested_by || payload.requested_by,
+          time: request.time || "",
+          date: request.date || (createdReq.created_at ? createdReq.created_at.split("T")[0] : new Date().toISOString().split("T")[0]),
+          guest: createdReq.guestName || createdReq.guest || payload.guest,
+          priority: (payload.priority || "Medium").charAt(0).toUpperCase() + (payload.priority || "Medium").slice(1),
+          status: payload.status || "pending",
+          client_id: payload.client_id,
+          created_by: currentUser?.id,
+          tenantId: currentUser?.tenantId || 1,
+        };
+        setGuestRequests((prev) => [newReq, ...prev]);
+        setRawGuestRequests((prev) => [newReq, ...prev]);
+        await fetchTickets();
+        window.dispatchEvent(new CustomEvent('app:state-changed'));
+        addLog({
+          action: "Concierge Request",
+          detail: `New guest requirement logged for ${request.guest}.`,
+          type: "system",
+        });
+      }
+    } catch (error) {
+      console.error("Failed to add guest request:", error);
+    }
+  };
+
+  const updateGuestRequest = async (data) => {
+    try {
+      const { id, requestId, ...updateData } = data;
+      const reqId = requestId || id;
+      const normalizedStatus = (updateData.status || "pending").toLowerCase();
+      const updatedItemFields = {
+        ...updateData,
+        status: normalizedStatus,
+        priority: updateData.priority ? (updateData.priority.charAt(0).toUpperCase() + updateData.priority.slice(1)) : undefined,
+        guest: updateData.guest || updateData.guestName,
+        request: updateData.request || updateData.request_details,
+        time: updateData.time,
+        date: updateData.date,
+      };
+      Object.keys(updatedItemFields).forEach(k => updatedItemFields[k] === undefined && delete updatedItemFields[k]);
+
+      const matchReq = (r) =>
+        String(r.id) === String(reqId) ||
+        String(r.requestId) === String(reqId) ||
+        String(r.db_id) === String(reqId);
+
+      // Optimistically update local state immediately
+      setGuestRequests((prev) =>
+        prev.map((r) => (matchReq(r) ? { ...r, ...updatedItemFields } : r))
+      );
+      setRawGuestRequests((prev) =>
+        prev.map((r) => (matchReq(r) ? { ...r, ...updatedItemFields } : r))
+      );
+
+      const formattedTime = formatDateTime(updateData.date, updateData.time);
+      const reqData = {
+        guest: updateData.guest || updateData.guestName || "Guest",
+        requested_by: updateData.requestedBy || updateData.requested_by || "",
+        request_details:
+          updateData.request || updateData.request_details || "",
+        delivery_time: formattedTime,
+        priority: (updateData.priority || "medium").toLowerCase(),
+        status: normalizedStatus,
+      };
+      console.log('[GuestRequest] Updating:', reqId, reqData);
+      await api.put(`/support/guest-requests/${reqId}`, reqData);
+      await fetchTickets();
+      window.dispatchEvent(new CustomEvent('app:state-changed'));
+      addLog({
+        action: "Concierge Update",
+        detail: `Request ${reqId} parameters updated.`,
+        type: "system",
+      });
+    } catch (error) {
+      console.error("Failed to update guest request:", error);
+    }
+  };
+
+  const deleteGuestRequest = async (id) => {
+    try {
+      const matchReq = (r) =>
+        String(r.id) === String(id) ||
+        String(r.requestId) === String(id) ||
+        String(r.db_id) === String(id);
+
+      setGuestRequests((prev) => prev.filter((r) => !matchReq(r)));
+      setRawGuestRequests((prev) => prev.filter((r) => !matchReq(r)));
+
+      await api.delete(`/support/guest-requests/${id}`);
+      await fetchTickets();
+      window.dispatchEvent(new CustomEvent('app:state-changed'));
+      addLog({
+        action: "Concierge Request Cancelled",
+        detail: `Removed guest requirement reference ${id}.`,
+        type: "system",
+      });
+    } catch (error) {
+      console.error("Failed to delete guest request:", error);
+    }
+  };
+
+  const recordWorkSession = (session) => {
+    // session = { userId, userName, start, end, durationHours }
+    const entry = {
+      id: `SESS-${Date.now()}`,
+      userId: session.userId,
+      userName: session.userName,
+      period: `${new Date(session.start).toLocaleDateString()} ${new Date(session.start).toLocaleTimeString()} - ${new Date(session.end).toLocaleTimeString()}`,
+      date: new Date().toISOString().split("T")[0],
+      hours: Number(session.durationHours).toFixed(2),
+      total: `$${(session.durationHours * 25).toFixed(2)}`, // Base calculated rate $25/hr
+      status: "Logged",
+      type: "Service Record",
+    };
+    setPayHistory((prev) => [entry, ...prev]);
+    addLog({
+      action: "Shift Hours Logged",
+      detail: `${session.userName} completed ${session.durationHours.toFixed(2)}h shift. Pay added to cycle.`,
+      type: "system",
+    });
+  };
+
+  const addLeaveRequest = async (requestData) => {
+    try {
+      if (!requestData?.start || !requestData?.end) {
+        return { success: false, message: "Please specify both commencement and conclusion dates." };
+      }
+      const payload = {
+        user_id: requestData.userId || currentUser?.id,
+        company_id: requestData.tenantId || currentUser?.tenantId || currentUser?.company_id || 1,
+        leave_type: requestData.type || "Vacation",
+        start_date: requestData.start,
+        end_date: requestData.end,
+        hours: requestData.hours || 8,
+        reason: requestData.reason || "No reason provided",
+      };
+      const res = await api.post("/staff/leave", payload);
+      if (res.data?.success) {
+        await fetchLeaveRequests();
+        addLog({
+          action: "Leave Requested",
+          detail: `Submitted ${requestData.type || 'Vacation'} request.`,
+          type: "system",
+        });
+        return { success: true, data: res.data?.data };
+      }
+      return { success: false, message: res.data?.message || "Failed to submit leave request" };
+    } catch (error) {
+      console.error("Failed to add leave request:", error);
+      const errMsg = error?.response?.data?.message || error?.message || "Failed to add leave request";
+      return { success: false, message: errMsg };
+    }
+  };
+
+  const fetchUrgentTasks = React.useCallback(async () => {
+    try {
+      const res = await api.get('/logistics/urgent');
+      if (res.data?.success) {
+        setUrgentTasks(res.data.data.map(t => ({
+          ...t,
+          id: t.alertId || t.id,
+        })));
+      }
+    } catch (error) {
+      console.error("Failed to fetch urgent tasks:", error);
+    }
+  }, []);
+
+  const addUrgentTask = async (task) => {
+    try {
+      const res = await api.post('/logistics/urgent', task);
+      if (res.data?.success) {
+        setUrgentTasks((prev) => [{ ...task, id: res.data.data.id }, ...prev]);
+        addLog({
+          action: "Urgent Task Logged",
+          detail: task.task,
+          type: "alert",
+        });
+      }
+    } catch (error) {
+      console.error("Failed to add urgent task:", error);
+    }
+  };
+
+  const updateUrgentTask = async (updated) => {
+    try {
+      await api.put(`/logistics/urgent/${updated.id}`, updated);
+      setUrgentTasks((prev) => prev.map((t) => (t.id === updated.id ? updated : t)));
+    } catch (error) {
+      console.error("Failed to update urgent task:", error);
+    }
+  };
+
+  const deleteUrgentTask = async (id) => {
+    try {
+      await api.delete(`/logistics/urgent/${id}`);
+      setUrgentTasks((prev) => prev.filter((t) => t.id !== id));
+    } catch (error) {
+      console.error("Failed to delete urgent task:", error);
+    }
+  };
+
+  const updateLeaveRequest = async (reqData) => {
+    try {
+      const statusMap = {
+        Approved: "approved",
+        Rejected: "rejected",
+        Pending: "pending",
+      };
+      const newStatus = reqData.status ? (statusMap[reqData.status] || reqData.status.toLowerCase()) : undefined;
+      const postData = {
+        status: newStatus,
+        leave_type: reqData.type || reqData.leave_type,
+        start_date: reqData.start || reqData.start_date,
+        end_date: reqData.end || reqData.end_date,
+        hours: reqData.hours,
+        reason: reqData.reason,
+      };
+      const res = await api.put(`/staff/leave/${reqData.id}`, postData);
+
+      if (res.data?.success) {
+        await fetchLeaveRequests();
+        if (fetchStaff) await fetchStaff();
+        if (fetchCustomerUsers) await fetchCustomerUsers({ include_all: 1, include_client_role: 1 });
+
+        // Refresh current user state if current logged in user was the leave recipient
+        if (currentUser && Number(reqData.userId || reqData.user_id) === Number(currentUser.id)) {
+          try {
+            const profileRes = await api.get('/auth/me');
+            if (profileRes.data?.success && profileRes.data?.data) {
+              setCurrentUser(prev => ({ ...prev, ...profileRes.data.data }));
+            }
+          } catch (e) {
+            console.warn('Profile refresh fallback after leave update failed', e);
+          }
+        }
+
+        addLog({
+          action: "Leave Updated",
+          detail: `Leave request ${reqData.id} updated to ${newStatus}.`,
+          type: "system",
+        });
+        return { success: true, data: res.data?.data };
+      }
+      return { success: false, message: res.data?.message || "Failed to update leave request" };
+    } catch (error) {
+      console.error("Failed to update leave request:", error);
+      const errMsg = error?.response?.data?.message || error?.message || "Failed to update leave request";
+      return { success: false, message: errMsg };
+    }
+  };
+
+  const deleteLeaveRequest = async (id) => {
+    try {
+      const res = await api.delete(`/staff/leave/${id}`);
+      if (res.data?.success) {
+        await fetchLeaveRequests();
+        if (fetchStaff) await fetchStaff();
+        addLog({
+          action: "Leave Request Deleted",
+          detail: `Deleted leave request ${id}.`,
+          type: "system",
+        });
+      }
+    } catch (error) {
+      console.error("Failed to delete leave request:", error);
+      throw error;
+    }
+  };
+
+  const generateSaaSInvoice = (client) => {
+    const invId = `SaaS-${Math.floor(1000 + Math.random() * 9000)}`;
+    const newInvoice = {
+      id: invId,
+      clientId: client.id,
+      clientName: client.name,
+      totalAmount:
+        client.plan === "Platinum"
+          ? 4999
+          : client.plan === "Executive"
+            ? 2499
+            : 999,
+      paidAmount: 0,
+      status: "Unpaid",
+      date: new Date().toISOString().split("T")[0],
+      type: "SaaS Subscription",
+      orderId: `WS-${client.id}`,
+    };
+    setInvoices((prev) => [newInvoice, ...prev]);
+    addLog({
+      action: "SaaS Invoice Generated",
+      detail: `Subscription invoice ${invId} issued for ${client.name}.`,
+      type: "finance",
+    });
+    return newInvoice;
+  };
+
+  console.log("GlobalData Provider providing:", {
+    fetchSubscriptionRequests,
+    fetchSupportingDocs,
+  });
+  const reportSecurityEvent = useCallback(async (data) => {
+    try {
+      await api.post('/security', data);
+      addLog({
+        action: data.eventType === 'PANIC' ? 'Emergency Panic' : 'Security Breach',
+        detail: `Security event logged: ${data.eventType}`,
+        type: 'alert'
+      });
+      fetchSecurityEvents();
+      return true;
+    } catch (error) {
+      console.error("Failed to report security event:", error);
+      return false;
+    }
+  }, [addLog]);
+
+  const fetchSecurityEvents = useCallback(async () => {
+    try {
+      const res = await api.get('/security');
+      if (res.data?.success) {
+        setSecurityEvents(res.data.data);
+      }
+    } catch (error) {
+      console.error("Failed to fetch security events:", error);
+    }
+  }, []);
+
+  const resolveSecurityEvent = useCallback(async (id) => {
+    try {
+      await api.put(`/security/${id}/resolve`);
+      setSecurityEvents(prev => prev.map(e => e.id === id ? { ...e, status: 'Resolved' } : e));
+      return true;
+    } catch (error) {
+      console.error("Failed to resolve security event:", error);
+      return false;
+    }
+  }, []);
+
+  const syncGlobalState = useCallback(async () => {
+    try {
+      if (queryClient) {
+        queryClient.invalidateQueries();
+      }
+      await Promise.allSettled([
+        fetchDashboardStats(),
+        fetchOrders(),
+        fetchProjects(),
+        fetchMissions(),
+        fetchDeliveries(),
+        fetchChauffeurRequests(),
+        fetchClients(),
+        fetchCustomerUsers(),
+        fetchInventory(),
+        fetchLuxuryItems(),
+        fetchTickets(),
+      ]);
+    } catch (err) {
+      console.error("Error synchronizing global state:", err);
+    }
+  }, [
+    queryClient,
+    fetchDashboardStats,
+    fetchOrders,
+    fetchProjects,
+    fetchMissions,
+    fetchDeliveries,
+    fetchChauffeurRequests,
+    fetchClients,
+    fetchCustomerUsers,
+    fetchInventory,
+    fetchLuxuryItems,
+    fetchTickets,
+  ]);
+
+  useEffect(() => {
+    let debounceTimer = null;
+    const handleStateChanged = () => {
+      if (debounceTimer) clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(() => {
+        if (syncGlobalState) syncGlobalState();
+      }, 500);
+    };
+    window.addEventListener('app:state-changed', handleStateChanged);
+    return () => {
+      if (debounceTimer) clearTimeout(debounceTimer);
+      window.removeEventListener('app:state-changed', handleStateChanged);
+    };
+  }, [syncGlobalState]);
+
+  return (
+    <GlobalDataContext.Provider
+      value={{
+        // Auth & User
+        currentUser,
+        setCurrentUser,
+        activatePersonalMembership,
+        cancelPersonalMembership,
+        hasPermission,
+        menuPermissions,
+        setMenuPermissions,
+        hasMenuPermission,
+        roles,
+
+        // Notifications
+        notifications,
+        unreadCount,
+        fetchNotifications,
+        markNotificationRead,
+        markAllNotificationsRead,
+
+        // Clients
+        clients,
+        setClients,
+        fetchClients,
+        addClient,
+        updateClient,
+        deleteClient,
+        updateClientBranding,
+
+        // Staff & Assignments
+        users,
+        setUsers,
+        fetchStaff,
+        addUser,
+        updateUser,
+        deleteUser,
+        toggleAvailability,
+        reviewStaff,
+        customerUsers,
+        fetchCustomerUsers,
+        staffAssignments,
+        addStaffAssignment,
+        updateAssignment,
+        updateMission,
+        fetchSupportingDocs,
+        clockIn,
+        clockOut,
+        payHistory,
+        setPayHistory,
+        fetchPayHistory,
+        recordWorkSession,
+        getVacationBalance,
+        workStatusOptions: ["Probation", "Full Time", "Part Time", "Inactive"],
+        leaveRequests,
+        fetchLeaveRequests,
+        addLeaveRequest,
+        updateLeaveRequest,
+        deleteLeaveRequest,
+        teams,
+        setTeams,
+        // Inventory
+        inventory,
+        setInventory,
+        fetchInventory,
+        addInventory,
+        updateInventory,
+        deleteInventory,
+        issueInventory,
+        recordLoss,
+        fetchInventoryAlerts,
+        inventoryAlerts,
+        acknowledgeInventoryAlert,
+        luxuryItems,
+        setLuxuryItems,
+        fetchLuxuryItems,
+        addLuxuryItem,
+        updateLuxuryItem,
+        deleteLuxuryItem,
+        stockMovements,
+        fetchStockMovements,
+        addStockEntry,
+        issueStock,
+
+        // Procurement
+        vendors,
+        marketplaceVendors,
+        setVendors,
+        fetchVendors,
+        addVendor,
+        updateVendor,
+        deleteVendor,
+        purchaseRequests,
+        setPurchaseRequests,
+        addPurchaseRequest,
+        updatePurchaseRequest,
+        deletePurchaseRequest,
+        fetchPurchaseRequests,
+        quotes,
+        setQuotes,
+        addQuote,
+        updateQuote,
+        deleteQuote,
+        fetchProcurement,
+        fetchQuotes,
+        purchaseOrders,
+        setPurchaseOrders,
+        addPurchaseOrder,
+        updatePurchaseOrder,
+        receiveGoodsAgainstPO,
+        approvePOReceipt,
+        reverseGoodsReceipt,
+        fetchPurchaseOrders,
+        cart,
+        addToCart,
+        removeFromCart,
+        clearCart,
+
+        // Orders, Missions & Projects
+        orders,
+        setOrders,
+        fetchOrders,
+        addOrder,
+        updateOrder,
+        deleteOrder,
+        launchMissionFromOrder,
+        assignOrderToStage,
+        missions,
+        setMissions,
+        fetchMissions,
+        updateMissionStatus,
+        submitMissionPOD,
+        assignMissionDriver,
+        deleteMission,
+        projects,
+        setProjects,
+        fetchProjects,
+        addProject,
+        updateProject,
+        deleteProject,
+        convertOrderToProject,
+        convertProjectToMission,
+
+        // Logistics & Fleet
+        fleet,
+        setFleet,
+        fetchFleet,
+        addFleet,
+        updateFleet,
+        deleteFleet,
+        dispatchVehicle,
+        deliveries,
+        setDeliveries,
+        fetchDeliveries,
+        addDelivery,
+        updateDelivery,
+        deleteDelivery,
+        confirmDeliveryReceipt,
+        routes,
+        setRoutes,
+        fetchRoutes,
+        addRoute,
+        updateRoute,
+        deleteRoute,
+        urgentTasks,
+        fetchUrgentTasks,
+        addUrgentTask,
+        updateUrgentTask,
+        deleteUrgentTask,
+        deliveryPricing,
+        setDeliveryPricing,
+        updateDeliveryPricing: updateDeliveryPricingTier,
+        shippingModePricing,
+        updateShippingModePricing,
+        updateDeliveryTiers,
+        tracking,
+        fetchTracking,
+        addTracking,
+        updateTracking,
+        deleteTracking,
+        warehouses,
+        setWarehouses,
+        fetchWarehouses,
+        addWarehouse,
+        updateWarehouse,
+        deleteWarehouse,
+
+        // Concierge & Support
+        guestRequests,
+        setGuestRequests,
+        fetchTickets,
+        addGuestRequest,
+        updateGuestRequest,
+        deleteGuestRequest,
+        events,
+        setEvents,
+        addEvent,
+        updateEvent,
+        deleteEvent,
+        chauffeurRequests,
+        setChauffeurRequests,
+        fetchChauffeurRequests,
+        addChauffeurRequest,
+        updateChauffeurRequest,
+        deleteChauffeurRequest,
+        supportTickets,
+        rawSupportTickets,
+        addSupportTicket,
+        updateSupportTicket,
+        deleteSupportTicket,
+        fetchTicketById,
+
+        // Finance
+        invoices,
+        setInvoices,
+        fetchFinance,
+        addInvoice,
+        updateInvoice,
+        deleteInvoice,
+        generateSaaSInvoice,
+        settleInvoice,
+        generateInvoiceFromOrder,
+        payments,
+        setPayments,
+        getRevenueChartData,
+        revenueFilter,
+        setRevenueFilter,
+
+        // Admin & Plans
+        accessPlans,
+        setAccessPlans,
+        fetchAccessPlans,
+        addPlan,
+        updatePlan,
+        deletePlan,
+        activePlan,
+        setActivePlan,
+        saasRequests,
+        submitSaaSRequest,
+        processSaaSRequest,
+        subscriptionRequests,
+        fetchSubscriptionRequests,
+        dispatchSubscriptionRequest,
+        updateSubscriptionRequest,
+        deleteSubscriptionRequest,
+
+        // Audits & Logs
+        audits,
+        fetchAudits,
+        addAudit,
+        updateAudit,
+        deleteAudit,
+        logs,
+        addLog,
+        fetchDashboardLogs,
+
+        // Dashboard & Settings
+        dashboardStats,
+        fetchDashboardStats,
+        lossAssessments,
+        fetchLossAssessments,
+        systemSettings,
+        fetchSystemSettings,
+        setSystemSettings,
+
+        // Utility
+        syncGlobalState,
+        refreshData: syncGlobalState,
+        fetchInitialData,
+        reportSecurityEvent,
+        securityEvents,
+        fetchSecurityEvents,
+        resolveSecurityEvent,
+      }}
+    >
+      {children}
+    </GlobalDataContext.Provider>
+  );
+};
+
+export const useData = () => {
+  const context = useContext(GlobalDataContext);
+  if (!context)
+    throw new Error("useData must be used within GlobalDataProvider");
+  return context;
+};

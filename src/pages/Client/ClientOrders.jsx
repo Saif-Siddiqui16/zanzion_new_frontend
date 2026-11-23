@@ -1,0 +1,1446 @@
+import React, { useState, useEffect, useMemo } from 'react';
+import { useNavigate } from 'react-router-dom';
+import Table from '../../components/Table';
+import {
+    ShoppingBag, Search, Filter, Download, Clock, CheckCircle2,
+    FileCheck, Plus, ChevronRight, Zap, Car, Calendar, Users,
+    Sparkles, Printer, ShieldCheck, Eye, X, ArrowUpRight, RotateCcw
+} from 'lucide-react';
+import { useData } from '../../context/GlobalDataContext';
+import { motion, AnimatePresence } from 'framer-motion';
+
+import OrderModal from '../../components/OrderModal';
+import StatusBadge from '../../components/StatusBadge';
+import { displayOrderStatus, isoDateSlice, formatDateDisplayDMY } from '../../utils/orderWorkflow';
+import { normalizeRole, roleCanCreateInstitutionalOrder } from '../../utils/authUtils';
+import { useUpdateOrder } from '../../hooks/api/useOrders';
+import { compareOrdersNewestFirst } from '../../utils/apiHelpers';
+import api from '../../services/api/setupAxios.js';
+
+const normalizeOrderId = (val) => {
+    if (!val) return '';
+    const s = String(val).trim();
+    const digitsOnly = s.replace(/\D/g, '');
+    const withoutYear = digitsOnly.replace(/^202[0-9]/, '');
+    const clean = (withoutYear || digitsOnly).replace(/^0+/, '');
+    return clean || digitsOnly;
+};
+
+const CATEGORY_CONFIG = {
+    'Marketplace Order': { label: 'Marketplace Order', icon: ShoppingBag, color: 'bg-info/10 text-info border-info/20' },
+    'Chauffeur Booking': { label: 'Chauffeur Booking', icon: Car, color: 'bg-accent/10 text-accent border-accent/20' },
+    'Event Request': { label: 'Event Request', icon: Calendar, color: 'bg-warning/10 text-warning border-warning/20' },
+    'Guest Request': { label: 'Guest Request', icon: Users, color: 'bg-purple-500/10 text-purple-400 border-purple-500/20' },
+    'Luxury Item Request': { label: 'Luxury Sourcing', icon: Sparkles, color: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' },
+    'Custom Order': { label: 'Custom Requisition', icon: Zap, color: 'bg-amber-500/10 text-amber-400 border-amber-500/20' },
+};
+
+const ClientOrders = () => {
+    const navigate = useNavigate();
+    const {
+        orders = [],
+        projects = [],
+        missions = [],
+        chauffeurRequests = [],
+        events = [],
+        guestRequests = [],
+        luxuryItems = [],
+        deliveries = [],
+        currentUser,
+        clients = [],
+        supportTickets = [],
+        rawSupportTickets = [],
+        addOrder,
+        fetchOrders,
+        fetchProjects,
+        fetchMissions,
+        fetchClients,
+        fetchDeliveries,
+        fetchChauffeurRequests,
+        fetchLuxuryItems,
+        fetchTickets,
+        syncGlobalState
+    } = useData();
+    const updateOrderMutation = useUpdateOrder();
+
+    const userRole = localStorage.getItem('userRole') || 'client';
+    const portalRole = normalizeRole(currentUser?.role || userRole);
+    const canStaffCreateOrderHere = roleCanCreateInstitutionalOrder(portalRole);
+    const isBusinessClient = portalRole === 'client' || portalRole === 'saas_client';
+
+    // Persist and restore cached summary stats to prevent flickering partial sums on initial load
+    const cachedStats = useMemo(() => {
+        try {
+            const raw = localStorage.getItem('client_orders_summary');
+            return raw ? JSON.parse(raw) : null;
+        } catch { return null; }
+    }, []);
+
+    useEffect(() => {
+        if (fetchOrders) fetchOrders();
+        if (fetchClients) fetchClients();
+        if (fetchChauffeurRequests) fetchChauffeurRequests();
+        if (fetchDeliveries) fetchDeliveries();
+        if (fetchTickets) fetchTickets();
+
+        const handleStateChanged = () => {
+            if (fetchOrders) fetchOrders();
+            if (fetchClients) fetchClients();
+            if (fetchChauffeurRequests) fetchChauffeurRequests();
+            if (fetchDeliveries) fetchDeliveries();
+            if (fetchTickets) fetchTickets();
+        };
+        window.addEventListener('app:state-changed', handleStateChanged);
+
+        const interval = setInterval(() => {
+            if (syncGlobalState) syncGlobalState();
+        }, 3000);
+
+        return () => {
+            window.removeEventListener('app:state-changed', handleStateChanged);
+            clearInterval(interval);
+        };
+    }, []);
+
+    const [searchTerm, setSearchTerm] = useState('');
+    const [statusFilter, setStatusFilter] = useState('All');
+    const [categoryFilter, setCategoryFilter] = useState('All');
+    const [isOrderModalOpen, setIsOrderModalOpen] = useState(false);
+    const [modalType, setModalType] = useState('view');
+    const [selectedOrder, setSelectedOrder] = useState(null);
+    const [selectedTransaction, setSelectedTransaction] = useState(null);
+    const [isProofModalOpen, setIsProofModalOpen] = useState(false);
+    const [localTickets, setLocalTickets] = useState([]);
+
+    useEffect(() => {
+        let mounted = true;
+        api.get(`/support/tickets?_t=${Date.now()}`)
+            .then(res => {
+                if (!mounted) return;
+                const raw = res.data?.data ?? res.data;
+                if (Array.isArray(raw)) setLocalTickets(raw);
+            })
+            .catch(() => {});
+    return () => { mounted = false; };
+    }, []);
+
+    // Persist and restore cached client id to avoid cold-start delays before fetchClients completes
+    const cachedClientId = useMemo(() => {
+        try {
+            return localStorage.getItem('user_client_id') || localStorage.getItem('clientId') || null;
+        } catch { return null; }
+    }, []);
+
+    // Match client/customer record for current user
+    const myClient = useMemo(() => {
+        const found = (clients || []).find(c => {
+            const cId = String(c.id).replace('CLT-', '');
+            const uClientId = currentUser?.clientId ? String(currentUser.clientId).replace('CLT-', '') : null;
+            if (currentUser?.email && c.email?.toLowerCase() === currentUser?.email?.toLowerCase()) return true;
+            if (uClientId && uClientId !== '1' && cId === uClientId) return true;
+            if (currentUser?.name && c.name?.toLowerCase() === currentUser?.name?.toLowerCase() && c.name?.toLowerCase() !== 'zanezion') return true;
+            return false;
+        });
+        if (found?.id) {
+            try { localStorage.setItem('user_client_id', String(found.id)); } catch {}
+        }
+        return found;
+    }, [clients, currentUser]);
+
+    const myClientId = (myClient?.id && String(myClient.id) !== '1')
+        ? String(myClient.id)
+        : (currentUser?.clientId && String(currentUser.clientId) !== '1' 
+            ? String(currentUser.clientId) 
+            : (cachedClientId && String(cachedClientId) !== '1' ? String(cachedClientId) : null));
+    const myName = (currentUser?.name || myClient?.name || '').toLowerCase().trim();
+    const myEmail = (currentUser?.email || myClient?.email || '').toLowerCase().trim();
+    const myUserId = String(currentUser?.id || '').trim();
+
+    // Helper to check ownership of any record strictly by ID, email, or client association (NEVER generic companyId 1)
+    const isMyRecord = (item) => {
+        if (!item) return false;
+        const itemClientId = String(item.clientId || item.client_id || item.metadata?.clientId || item.metadata?.client_id || item.client?.id || '').trim();
+        const itemCustId = String(item.customer_id || item.customerId || item.created_by || item.createdById || item.userId || item.user_id || item.metadata?.customer_id || item.metadata?.user_id || item.metadata?.userId || '').trim();
+        const itemEmail = String(item.email || item.client_email || item.clientEmail || item.customer_email || item.customerEmail || item.metadata?.email || item.metadata?.customer_email || item.metadata?.client_email || item.client?.email || item.clientObj?.email || '').toLowerCase().trim();
+
+        if (myUserId && itemCustId && itemCustId === myUserId) return true;
+        if (myClientId && myClientId !== '1' && itemClientId && myClientId === itemClientId) return true;
+        if (myEmail && itemEmail && (itemEmail === myEmail || itemEmail.includes(myEmail) || myEmail.includes(itemEmail))) return true;
+
+        if (myName && myName !== 'zanezion') {
+            const clientNameCandidate = typeof item.client === 'string' ? item.client : (item.client?.companyName || item.client?.name || '');
+            const itemOwner = String(item.owner || item.owner_name || item.clientName || item.client_name || item.customer_name || clientNameCandidate || item.metadata?.clientName || item.metadata?.client_name || '').toLowerCase().trim();
+            if (itemOwner && (itemOwner === myName || itemOwner.includes(myName) || myName.includes(itemOwner))) return true;
+        }
+
+        return false;
+    };
+
+    // Combine all transaction types into a unified list
+    const allTransactions = useMemo(() => {
+        const unified = [];
+
+        // 1. Marketplace & Custom Orders (Exclude internal Project records)
+        (orders || []).filter(o => {
+            const typeStr = String(o.orderType || o.type || '').toUpperCase();
+            return typeStr !== 'PROJECT' && isMyRecord(o);
+        }).forEach(o => {
+            const isCustom = o.order_kind === 'custom_request' || o.orderKind === 'custom_request' || String(o.type || '').toLowerCase().includes('custom');
+
+            // Collect all identifiers for Order o
+            const oIdStr = String(o.id || '');
+            const oRawIdStr = String(o.rawId || o.id || '').replace(/\D/g, '');
+
+            // 1. Find linked projects (by exact orderRef or orderId)
+            const linkedProjects = (projects || []).filter(p => {
+                const pRef = String(p.orderRef || p.order_ref || p.orderId || p.order_id || p.metadata?.orderRef || p.metadata?.order_ref || p.metadata?.orderId || '');
+                const pId = String(p.id || '');
+            return (
+                    (pRef && (pRef === oIdStr || pRef === oRawIdStr || pRef === `ORD-${oIdStr}` || pRef === `ORD-${oRawIdStr}`)) ||
+                    (pId && (pId === oIdStr || pId === oRawIdStr))
+                );
+            });
+            const linkedProjectIds = linkedProjects.map(p => String(p.id));
+
+            // 2. Find linked mission (by orderId, projectId, or project match)
+            const linkedMission = (missions || []).find(m => {
+                const mOrderId = String(m.orderId || m.order_id || m.order_id_raw || m.metadata?.orderId || m.metadata?.orderRef || '');
+                const mProjectId = String(m.projectId || m.project_id || m.metadata?.projectId || m.metadata?.projectRef || '');
+            return (
+                    mOrderId === oIdStr ||
+                    mOrderId === oRawIdStr ||
+                    mOrderId === `ORD-${oIdStr}` ||
+                    mOrderId === `ORD-${oRawIdStr}` ||
+                    linkedProjectIds.includes(mOrderId) ||
+                    linkedProjectIds.includes(mProjectId)
+                );
+            });
+
+            // 3. Find linked delivery (by orderId, missionId, or project match)
+            const linkedDelivery = (deliveries || []).find(d => {
+                const dOrderId = String(d.orderId || d.order_id_raw || d.order_id || '');
+                const dMissionId = String(d.mission_id || d.missionId || '');
+            return (
+                    dOrderId === oIdStr ||
+                    dOrderId === oRawIdStr ||
+                    dOrderId === `ORD-${oIdStr}` ||
+                    dOrderId === `ORD-${oRawIdStr}` ||
+                    linkedProjectIds.includes(dOrderId) ||
+                    (linkedMission && (dMissionId === String(linkedMission.id) || dOrderId === String(linkedMission.orderId)))
+                );
+            });
+
+            // Robustly parse items from all possible locations
+            let meta = o.metadata;
+            if (typeof meta === 'string') {
+                try { meta = JSON.parse(meta); } catch { meta = {}; }
+            }
+            meta = meta || {};
+            const metaItems = meta.customItems || meta.custom_items || meta.manifestItems || meta.items || meta.cart || meta.package_details || o.customItems || [];
+            const metaItemsList = Array.isArray(metaItems) ? metaItems : [];
+
+            let rawItems = o.items;
+            if (typeof rawItems === 'string') {
+                try { rawItems = JSON.parse(rawItems); } catch { rawItems = []; }
+            }
+            if (!Array.isArray(rawItems) || rawItems.length === 0) {
+                rawItems = metaItemsList;
+            }
+
+            // Check linked delivery remarks if rawItems is still empty
+            if (!Array.isArray(rawItems) || rawItems.length === 0) {
+                if (linkedDelivery) {
+                    let delRemarks = linkedDelivery.remarks;
+                    if (typeof delRemarks === 'string') {
+                        try { delRemarks = JSON.parse(delRemarks); } catch { delRemarks = {}; }
+                    }
+                    delRemarks = delRemarks || {};
+                    let pkgDetails = delRemarks.package_details || delRemarks.manifestItems || linkedDelivery.items;
+                    if (typeof pkgDetails === 'string') {
+                        try { pkgDetails = JSON.parse(pkgDetails); } catch { pkgDetails = []; }
+                    }
+                    if (Array.isArray(pkgDetails) && pkgDetails.length > 0) {
+                        rawItems = pkgDetails;
+                    }
+                }
+            }
+
+            // Check o.remarks if rawItems is still empty
+            if (!Array.isArray(rawItems) || rawItems.length === 0) {
+                let oRemarks = o.remarks;
+                if (typeof oRemarks === 'string') {
+                    try { oRemarks = JSON.parse(oRemarks); } catch { oRemarks = {}; }
+                }
+                oRemarks = oRemarks || {};
+                let pkgDetails = oRemarks.package_details || oRemarks.manifestItems;
+                if (typeof pkgDetails === 'string') {
+                    try { pkgDetails = JSON.parse(pkgDetails); } catch { pkgDetails = []; }
+                }
+                if (Array.isArray(pkgDetails) && pkgDetails.length > 0) {
+                    rawItems = pkgDetails;
+                }
+            }
+
+            // Normalize each item: extract name, qty, and unit price with priority for purchased manifest name
+            let normalizedItems = (Array.isArray(rawItems) ? rawItems : []).map((itm, idx) => {
+                const metaMatch = metaItemsList[idx] || metaItemsList.find(m => (m.itemId && itm.itemId && m.itemId === itm.itemId) || (m.id && itm.itemId && m.id === itm.itemId) || (m.name && itm.name && m.name === itm.name));
+                const name = metaMatch?.name || itm.name || itm.item?.name || itm.itemName || itm.title || itm.productName || itm.description || `Item ${idx + 1}`;
+                const qty = parseInt(itm.qty || itm.quantity || metaMatch?.qty || metaMatch?.quantity || 1, 10) || 1;
+                const unitPrice = parseFloat(
+                    itm.unitPrice !== undefined ? itm.unitPrice :
+                        itm.price !== undefined ? itm.price :
+                            metaMatch?.unitPrice !== undefined ? metaMatch.unitPrice :
+                                metaMatch?.price !== undefined ? metaMatch.price :
+                                    itm.unit_price !== undefined ? itm.unit_price :
+                                        itm.item?.price !== undefined ? itm.item.price :
+                                            itm.chauffeurFee !== undefined ? itm.chauffeurFee :
+                                                itm.chauffeur_fee !== undefined ? itm.chauffeur_fee :
+                                                    (itm.totalPrice ? itm.totalPrice / qty : (itm.total ? itm.total / qty : 0))
+                ) || 0;
+                return { name, qty, price: unitPrice };
+            });
+
+            // Calculate total from order fields or sum of line items
+            let orderTotal = parseFloat(o.total ?? o.total_amount ?? o.totalAmount ?? o.estimated_total ?? o.amount ?? o.subtotal ?? 0) || 0;
+            const computedItemsSum = normalizedItems.reduce((acc, it) => acc + (it.price * it.qty), 0);
+            if (orderTotal === 0 && computedItemsSum > 0) {
+                orderTotal = computedItemsSum;
+            }
+
+            if (normalizedItems.length === 0) {
+                let meta = o.metadata;
+                if (typeof meta === 'string') {
+                    try { meta = JSON.parse(meta); } catch { meta = {}; }
+                }
+                meta = meta || {};
+                const fallbackName = o.product || meta.product || o.notes || meta.notes || meta.delivery_instructions || o.delivery_instructions || (o.vendor_name ? `${o.vendor_name} Order` : 'Marketplace Item');
+                normalizedItems = [{
+                    name: fallbackName,
+                    qty: 1,
+                    price: orderTotal
+                }];
+            } else if (normalizedItems.length === 1 && normalizedItems[0].price === 0 && orderTotal > 0) {
+                normalizedItems[0].price = orderTotal;
+            }
+
+            const isChauffeurOrder = o.orderType === 'CHAUFFEUR' || o.missionType === 'Chauffeur' || String(o.orderType).toUpperCase() === 'CHAUFFEUR' || String(o.id || '').startsWith('CH-');
+            if (isChauffeurOrder) return;
+
+            const dbSt = String(o.status || '').toLowerCase().trim();
+            let effectiveStatus = dbSt || 'pending';
+
+            // Cross-reference any accepted / resolved dispute tickets for this order
+            const allAvailableTickets = [
+                ...(Array.isArray(supportTickets) ? supportTickets : []),
+                ...(Array.isArray(rawSupportTickets) ? rawSupportTickets : []),
+                ...(Array.isArray(localTickets) ? localTickets : [])
+            ];
+
+            const oNorm = normalizeOrderId(o.id || o.rawId || o.orderNumber);
+
+            const matchingAcceptedTickets = allAvailableTickets.filter(t => {
+                if (!t) return false;
+
+                // 1. Check all possible order IDs on the ticket
+                const tOrderCandidates = [
+                    t.order_id,
+                    t.orderId,
+                    t.dispute_data?.orderId,
+                    t.dispute_data?.orderNumber,
+                    t.orderNumber,
+                    t.order_number
+                ];
+                let isMatch = tOrderCandidates.some(c => c && normalizeOrderId(c) === oNorm);
+
+                // 2. Parse from description/subject/messages
+                const descText = `${t.description || ''} ${t.subject || ''} ${Array.isArray(t.messages) ? t.messages.map(m => m.text || '').join(' ') : ''}`;
+                if (!isMatch && descText) {
+                    const orderRegexMatch = descText.match(/Order:\s*([A-Za-z0-9-]+)/i) || descText.match(/ORD-[A-Za-z0-9-]+/i);
+                    if (orderRegexMatch && normalizeOrderId(orderRegexMatch[1] || orderRegexMatch[0]) === oNorm) {
+                        isMatch = true;
+                    }
+                }
+
+                if (!isMatch) return false;
+
+                const dispStatus = String(t.dispute_status || '').toLowerCase().trim();
+                const tStatus = String(t.status || '').toLowerCase().trim();
+                const isRejected = dispStatus === 'rejected' || tStatus === 'rejected';
+                if (isRejected) return false;
+
+                const isDisputeAccepted = dispStatus === 'accepted';
+                const isResolvedRefund = (tStatus === 'resolved' || tStatus === 'accepted' || tStatus === 'closed') && (
+                    Number(t.refund_amount) > 0 || 
+                    Number(t.dispute_data?.requestedRefundAmount) > 0 ||
+                    String(t.category || '').toLowerCase().includes('refund') ||
+                    descText.toLowerCase().includes('refund')
+                );
+
+                return isDisputeAccepted || isResolvedRefund;
+            });
+
+            const ticketRefundAmount = matchingAcceptedTickets.reduce((acc, t) => {
+                const descText = `${t.description || ''} ${t.subject || ''} ${Array.isArray(t.messages) ? t.messages.map(m => m.text || '').join(' ') : ''}`;
+                let descRefundAmt = 0;
+                const amtMatch = descText.match(/Requested Amount:\s*\$?([\d,]+(?:\.\d+)?)/i) || 
+                                 descText.match(/Refund Qty:.*?=\s*\$?([\d,]+(?:\.\d+)?)/i) ||
+                                 descText.match(/refund.*?\$?([\d,]+(?:\.\d+)?)/i);
+                if (amtMatch && amtMatch[1]) {
+                    descRefundAmt = parseFloat(amtMatch[1].replace(/,/g, '')) || 0;
+                }
+                const directAmt = parseFloat(t.refund_amount ?? t.dispute_data?.requestedRefundAmount ?? t.dispute_data?.refund_amount ?? 0) || 0;
+                const amt = directAmt > 0 ? directAmt : descRefundAmt;
+                return Math.max(acc, amt);
+            }, 0);
+
+            const directRefundAmount = parseFloat(o.refunded_amount ?? meta?.refunded_amount ?? 0) || 0;
+            const refundAmountVal = Math.max(directRefundAmount, ticketRefundAmount);
+
+            const refundStatusVal = (refundAmountVal >= orderTotal && orderTotal > 0)
+                ? 'FULL'
+                : (refundAmountVal > 0 ? 'PARTIAL' : (o.refund_status || meta?.refund_status || null));
+            const netOrderTotal = Math.max(0, orderTotal - refundAmountVal);
+
+            if (refundStatusVal === 'FULL' || ['refunded'].includes(dbSt)) {
+                effectiveStatus = 'Refunded';
+            } else if (refundStatusVal === 'PARTIAL' || ['partially refunded', 'partially_refunded'].includes(dbSt) || refundAmountVal > 0) {
+                effectiveStatus = 'Partially Refunded';
+            } else if (['completed', 'delivered', 'done'].includes(dbSt)) {
+                effectiveStatus = 'completed';
+            } else if (['cancelled', 'rejected', 'canceled'].includes(dbSt)) {
+                effectiveStatus = 'cancelled';
+            } else if (['operation', 'operations'].includes(dbSt)) {
+                effectiveStatus = 'operation';
+            } else if (['logistics'].includes(dbSt)) {
+                effectiveStatus = 'logistics';
+            } else if (['concierge'].includes(dbSt)) {
+                effectiveStatus = 'concierge';
+            } else if (['procurement'].includes(dbSt)) {
+                effectiveStatus = 'procurement';
+            } else if (['inventory'].includes(dbSt)) {
+                effectiveStatus = 'inventory';
+            } else if (['in_transit', 'en_route', 'out_for_delivery', 'dispatched'].includes(dbSt)) {
+                effectiveStatus = 'in_transit';
+            } else if (['assigned', 'accepted'].includes(dbSt)) {
+                effectiveStatus = 'assigned';
+            } else if (['pending', 'created', 'admin_review', 'pending_review', 'submitted', 'draft'].includes(dbSt)) {
+                effectiveStatus = 'pending';
+            } else if (linkedDelivery) {
+                const delSt = String(linkedDelivery.status || '').toLowerCase();
+                if (['delivered', 'completed'].includes(delSt)) {
+                    effectiveStatus = 'completed';
+                } else if (['in_transit', 'en_route', 'on_way'].includes(delSt)) {
+                    effectiveStatus = 'in_transit';
+                } else if (['assigned', 'accepted'].includes(delSt)) {
+                    effectiveStatus = 'assigned';
+                }
+            }
+
+            const orderCreated = o.createdAt || o.created_at || o.order_date || o.requestDate || o.date || null;
+            unified.push({
+                id: o.id ? (String(o.id).startsWith('ORD-') ? o.id : `ORD-${o.id}`) : 'ORD-000',
+                rawId: o.id,
+                category: isCustom ? 'Custom Order' : 'Marketplace Order',
+                serviceType: o.type || (isCustom ? 'Custom Requisition' : 'Marketplace Purchase'),
+                items: normalizedItems,
+                total: orderTotal,
+                netTotal: netOrderTotal,
+                refunded_amount: refundAmountVal,
+                refund_status: refundStatusVal,
+                createdAt: orderCreated,
+                created_at: orderCreated,
+                requestDate: orderCreated,
+                dueDate: o.due_date || o.dueDate || null,
+                status: effectiveStatus,
+                location: linkedDelivery?.dropLocation || o.deliveryAddress || o.location || o.dropLocation || 'Client Address',
+                pickupLocation: linkedDelivery?.pickupLocation || o.pickupLocation || o.pickup_location || null,
+                deliveryType: (o.deliveryType && o.deliveryType !== 'Road') ? o.deliveryType : (o.delivery_mode || o.mode || meta?.delivery_mode || meta?.deliveryType || meta?.delivery_type || o.deliveryType || 'Road'),
+                transport_asset: o.transport_asset || o.transportAsset || meta?.transport_asset || meta?.transportAsset || null,
+                transport_asset_custom: o.transport_asset_custom || o.transportAssetCustom || o.charterDetails || meta?.transport_asset_custom || meta?.charter_details || meta?.transportAssetCustom || null,
+                island_location: o.island_location || o.islandLocation || meta?.island_location || meta?.islandLocation || null,
+                driverName: linkedDelivery?.driver || o.driverName || null,
+                source: 'orders',
+                originalRecord: o
+            });
+        });
+
+        // 2. Chauffeur Bookings
+        (chauffeurRequests || []).filter(isMyRecord).forEach(req => {
+            const numDays = req.numberOfDays ? (parseInt(req.numberOfDays, 10) || 1) : 1;
+            const isDaily = req.serviceType === 'Daily Service';
+            const calcQty = isDaily && numDays > 0 ? numDays : 1;
+            const feeVal = parseFloat(req.chauffeurFee ?? req.chauffeur_fee ?? req.total_amount ?? 120);
+            const unitPrice = req.unitPrice ? parseFloat(req.unitPrice) : (isDaily && numDays > 1 ? Number((feeVal / numDays).toFixed(2)) : feeVal);
+            const totalFee = isDaily && numDays > 1 && feeVal === unitPrice ? Number((unitPrice * numDays).toFixed(2)) : feeVal;
+
+            const reqOrderDate = req.createdAt || req.created_at || req.order_date || req.date || req.requestDate || req.originalRecord?.createdAt || req.originalRecord?.created_at || req.originalRecord?.order_date || null;
+            unified.push({
+                id: req.id ? (String(req.id).startsWith('CH-') ? req.id : `CH-ORD-${req.id}`) : 'CH-000',
+                rawId: req.id,
+                category: 'Chauffeur Booking',
+                serviceType: `Chauffeur Protocol (${req.serviceType || 'VIP Service'})`,
+                items: [{
+                    name: `VIP Chauffeur Service (${req.serviceType || 'One Way'})${isDaily ? ` - ${numDays} Day(s)` : ''} - Pickup: ${req.pickupLocation || 'Nassau'}`,
+                    qty: calcQty,
+                    price: unitPrice,
+                    total: totalFee
+                }],
+                total: totalFee,
+                createdAt: reqOrderDate,
+                created_at: reqOrderDate,
+                requestDate: reqOrderDate || req.dueDate,
+                dueDate: req.dueDate || req.returnDate || null,
+                status: req.status || req.chauffeur_status || 'pending',
+                location: req.pickupLocation ? `${req.pickupLocation} -> ${req.dropLocation || 'Destination'}` : 'Nassau Hub',
+                driverName: req.driverName || 'Awaiting Driver Assignment',
+                plateNumber: req.plateNumber || '',
+                source: 'chauffeur',
+                originalRecord: req
+            });
+        });
+
+        // 3. Event Requests
+        (events || []).filter(isMyRecord).forEach(evt => {
+            const formattedId = evt.id ? (String(evt.id).startsWith('EVT-') ? evt.id : `EVT-${String(evt.id).padStart(3, '0')}`) : 'EVT-000';
+            unified.push({
+                id: formattedId,
+                rawId: evt.id,
+                category: 'Event Request',
+                serviceType: evt.locationType || 'Private Residence Event',
+                items: [{ name: evt.title || evt.request || evt.name || 'Concierge Event Coordination', qty: 1 }],
+                total: parseFloat(evt.budget || evt.total || evt.estimatedCost || 0),
+                requestDate: evt.createdAt || evt.created_at || evt.date,
+                dueDate: evt.date || null,
+                status: evt.status || 'planned',
+                location: evt.location || 'Private Residence',
+                guestCount: evt.guestCount || evt.guests || 0,
+                source: 'events',
+                originalRecord: evt
+            });
+        });
+
+        // 4. Guest Requests
+        (guestRequests || []).filter(isMyRecord).forEach(g => {
+            const formattedId = g.id ? (String(g.id).startsWith('GST-') ? g.id : `GST-${String(g.id).padStart(3, '0')}`) : 'GST-000';
+            unified.push({
+                id: formattedId,
+                rawId: g.id,
+                category: 'Guest Request',
+                serviceType: `Concierge Requisition (${g.requestType || 'Personal Guest Service'})`,
+                items: [{ name: g.details || g.request || g.title || 'Guest Hospitality Task', qty: 1 }],
+                total: parseFloat(g.cost || g.amount || g.total || 0),
+                requestDate: g.createdAt || g.created_at || g.requestDate,
+                dueDate: g.dueDate || null,
+                status: g.status || 'pending',
+                location: g.pickupLocation || g.dropLocation || 'On Site Concierge',
+                source: 'guest',
+                originalRecord: g
+            });
+        });
+
+        // 5. Luxury Sourcing Requests
+        (luxuryItems || []).filter(isMyRecord).forEach(lux => {
+            const formattedId = lux.id ? (String(lux.id).startsWith('LUX-') ? lux.id : `LUX-${String(lux.id).padStart(3, '0')}`) : 'LUX-000';
+            unified.push({
+                id: formattedId,
+                rawId: lux.id,
+                category: 'Luxury Item Request',
+                serviceType: `Bespoke Sourcing (${lux.category || 'High-Value Asset'})`,
+                items: [{ name: lux.itemName || lux.title || 'Private Asset Procurement', qty: parseInt(lux.quantity || 1, 10) }],
+                total: parseFloat(lux.estimatedPrice || lux.price || lux.total || 0),
+                requestDate: lux.createdAt || lux.created_at,
+                dueDate: lux.targetDate || null,
+                status: lux.status || 'sourcing',
+                location: lux.deliveryLocation || 'Vault / Direct Courier',
+                source: 'luxury',
+                originalRecord: lux
+            });
+        });
+
+        const seen = new Set();
+        return unified.filter(tx => {
+            const numId = tx.rawId ? String(tx.rawId).replace(/\D/g, '') : '';
+            const key = numId && tx.category === 'Chauffeur Booking' ? `chauffeur-db-${numId}` : `${tx.source}-${tx.id}`;
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+        }).sort(compareOrdersNewestFirst);
+    }, [orders, chauffeurRequests, events, guestRequests, luxuryItems, supportTickets, rawSupportTickets, localTickets, myClientId, myName, myEmail, portalRole]);
+
+    // Filter transactions based on category, status, and search query
+    const filteredTransactions = useMemo(() => {
+        return allTransactions.filter(tx => {
+            // Category Filter
+            if (categoryFilter !== 'All' && tx.category !== categoryFilter) return false;
+
+            // Status Filter
+            const st = String(tx.status || '').toLowerCase();
+            const isClosedStatus = ['completed', 'delivered', 'cancelled', 'canceled', 'done', 'refunded', 'partially refunded', 'partially_refunded'].includes(st);
+            if (statusFilter === 'Active' && isClosedStatus) return false;
+            if (statusFilter === 'Closed' && !isClosedStatus) return false;
+
+            // Search Query
+            if (searchTerm.trim() !== '') {
+                const q = searchTerm.toLowerCase();
+                const matchId = String(tx.id || '').toLowerCase().includes(q);
+                const matchCat = String(tx.category || '').toLowerCase().includes(q);
+                const matchType = String(tx.serviceType || '').toLowerCase().includes(q);
+                const matchItem = tx.items.some(i => String(i.name || '').toLowerCase().includes(q));
+                if (!matchId && !matchCat && !matchType && !matchItem) return false;
+            }
+
+            return true;
+        });
+    }, [allTransactions, categoryFilter, statusFilter, searchTerm]);
+
+    const hasDueDate = filteredTransactions.some(tx => tx.dueDate);
+
+    // Columns for Table component
+    const columns = [
+        {
+            header: "Transaction ID",
+            accessor: "id",
+            render: (tx) => (
+                <div className="flex items-center gap-2">
+                    <span className="font-black text-white italic tracking-tighter text-sm">{tx.id}</span>
+                </div>
+            )
+        },
+        {
+            header: "Service Category",
+            accessor: "category",
+            render: (tx) => {
+                const cfg = CATEGORY_CONFIG[tx.category] || CATEGORY_CONFIG['Custom Order'];
+                const Icon = cfg.icon;
+            return (
+                    <div className="flex flex-col gap-1 items-start">
+                        <span className={`inline-flex items-center gap-1.5 px-3 py-1 border rounded-lg text-[10px] font-black uppercase tracking-wider italic ${cfg.color}`}>
+                            <Icon size={12} />
+                            {tx.category}
+                        </span>
+                        {tx.deliveryType && tx.category !== 'Chauffeur Booking' && (
+                            <span className="text-[9px] font-bold text-muted/70 tracking-wider uppercase">
+                                {tx.deliveryType === 'Air' ? '✈ Air Protocol' : tx.deliveryType === 'Sea' ? '🛥 Sea Protocol' : '🚚 Road Protocol'}
+                            </span>
+                        )}
+                    </div>
+                );
+            }
+        },
+        {
+            header: "Description / Items",
+            accessor: "items",
+            render: (tx) => {
+                const firstItem = tx.items[0];
+                const primaryName = firstItem?.name || tx.serviceType || 'Transaction Service';
+                if (tx.items.length <= 1) {
+                    return <span className="font-bold text-white text-xs truncate max-w-[220px] block">{primaryName}</span>;
+                }
+            return (
+                    <div className="flex items-center gap-2">
+                        <span className="font-bold text-white text-xs truncate max-w-[180px]">{primaryName}</span>
+                        <span className="px-2 py-0.5 bg-white/5 rounded-md text-[9px] font-black text-muted uppercase">+{tx.items.length - 1} More</span>
+                    </div>
+                );
+            }
+        },
+        {
+            header: "Total Value",
+            accessor: "total",
+            render: (tx) => (
+                <div className="flex flex-col">
+                    <span className="font-black text-white italic tracking-tighter text-sm font-mono">
+                        ${(tx.netTotal !== undefined ? tx.netTotal : tx.total).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                    </span>
+                    {tx.refunded_amount > 0 && (
+                        <span className="text-[9px] font-bold text-amber-400 font-mono">
+                            <span className="line-through text-muted/60 mr-1">${tx.total.toFixed(2)}</span>
+                            -${tx.refunded_amount.toFixed(2)} refund
+                        </span>
+                    )}
+                </div>
+            )
+        },
+        {
+            header: "Request Date",
+            accessor: "requestDate",
+            render: (tx) => (
+                <span className="text-secondary font-black italic text-xs">
+                    {formatDateDisplayDMY(tx.requestDate) || '—'}
+                </span>
+            )
+        },
+        ...(hasDueDate ? [{
+            header: "Due / Service Date",
+            accessor: "dueDate",
+            render: (tx) => (
+                <span className="text-white font-black italic text-xs">
+                    {formatDateDisplayDMY(tx.dueDate) || '—'}
+                </span>
+            )
+        }] : []),
+        {
+            header: "Status",
+            accessor: "status",
+            render: (tx) => <StatusBadge status={tx.status} />
+        },
+    ];
+
+    const handleViewTransaction = (tx) => {
+        setSelectedTransaction(tx);
+        setIsProofModalOpen(true);
+    };
+
+    const handleSaveOrder = async (orderData, orderId) => {
+        const targetId = orderId || selectedOrder?.id || orderData?.id;
+        if (targetId) {
+            try {
+                await updateOrderMutation.mutateAsync({ id: targetId, orderData });
+                setIsOrderModalOpen(false);
+                if (fetchOrders) fetchOrders();
+            } catch (err) {
+                console.error('Failed to update order:', err);
+            }
+            return;
+        }
+
+        if (!roleCanCreateInstitutionalOrder(portalRole) && !isBusinessClient) {
+            window.alert('Only authorised staff can create orders on behalf of clients. Use Marketplace to shop, or contact your representative.');
+            setIsOrderModalOpen(false);
+            return;
+        }
+        await addOrder({
+            ...orderData,
+            clientId: orderData.clientId || myClient?.id || currentUser?.id,
+            client: orderData.client || myClient?.name || currentUser?.name,
+            email: orderData.email || myClient?.email || currentUser?.email,
+            order_date: isoDateSlice(orderData.requestDate),
+            due_date: isoDateSlice(orderData.dueDate),
+        });
+        setIsOrderModalOpen(false);
+        if (fetchOrders) fetchOrders();
+    };
+
+    const handlePrintProof = () => {
+        if (!selectedTransaction) return;
+
+        const tx = selectedTransaction;
+        const itemsHtml = (tx.items || []).map((item, idx) => {
+            const qty = parseInt(item.qty || 1) || 1;
+            const unitPrice = parseFloat(item.price ?? item.unitPrice ?? item.unit_price ?? 0) || 0;
+            const lineTotal = unitPrice * qty;
+            return `
+                <tr>
+                    <td style="padding:10px 12px;border-bottom:1px solid #e5e7eb;color:#111827;font-size:13px;">${idx + 1}. ${item.name || item.itemName || 'Service Entry'}</td>
+                    <td style="padding:10px 12px;border-bottom:1px solid #e5e7eb;text-align:center;color:#374151;font-size:13px;">${qty}</td>
+                    <td style="padding:10px 12px;border-bottom:1px solid #e5e7eb;text-align:right;color:#374151;font-size:13px;">$${unitPrice.toLocaleString('en-US', { minimumFractionDigits: 2 })}</td>
+                    <td style="padding:10px 12px;border-bottom:1px solid #e5e7eb;text-align:right;font-weight:700;color:#111827;font-size:13px;">$${(lineTotal || unitPrice || 0).toLocaleString('en-US', { minimumFractionDigits: 2 })}</td>
+                </tr>`;
+        }).join('');
+
+        const printHtml = `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8"/>
+    <title>Proof of Transaction — ${tx.id}</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Segoe UI', Arial, sans-serif; color: #111827; background: #fff; padding: 40px; }
+        .header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 32px; padding-bottom: 20px; border-bottom: 2px solid #111827; }
+        .brand { font-size: 22px; font-weight: 900; letter-spacing: -0.5px; text-transform: uppercase; }
+        .brand span { color: #b8860b; }
+        .doc-title { text-align: right; }
+        .doc-title h1 { font-size: 16px; font-weight: 800; text-transform: uppercase; letter-spacing: 1px; color: #111; }
+        .doc-title p { font-size: 11px; color: #6b7280; margin-top: 2px; }
+        .section { margin-bottom: 24px; }
+        .section-title { font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: 2px; color: #6b7280; margin-bottom: 10px; }
+        .info-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px; padding: 16px; }
+        .info-cell label { display: block; font-size: 9px; font-weight: 800; text-transform: uppercase; letter-spacing: 1.5px; color: #9ca3af; margin-bottom: 4px; }
+        .info-cell p { font-size: 13px; font-weight: 700; color: #111827; }
+        .ref-box { background: #fffbeb; border: 1px solid #f59e0b; border-radius: 8px; padding: 16px 20px; display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; }
+        .ref-box .ref-id { font-size: 22px; font-weight: 900; color: #111827; }
+        .ref-box .ref-label { font-size: 9px; font-weight: 800; text-transform: uppercase; letter-spacing: 2px; color: #b8860b; margin-bottom: 4px; }
+        .ref-box .cat-label { font-size: 11px; font-weight: 700; color: #374151; }
+        table { width: 100%; border-collapse: collapse; }
+        thead th { background: #111827; color: #fff; padding: 10px 12px; font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: 1px; text-align: left; }
+        thead th:nth-child(2) { text-align: center; }
+        thead th:nth-child(3), thead th:nth-child(4) { text-align: right; }
+        .total-row { background: #f9fafb; }
+        .total-row td { padding: 14px 12px; font-size: 15px; font-weight: 900; }
+        .status-badge { display: inline-block; padding: 3px 10px; border-radius: 4px; font-size: 11px; font-weight: 700; background: #dcfce7; color: #166534; text-transform: uppercase; }
+        .footer { margin-top: 40px; padding-top: 16px; border-top: 1px solid #e5e7eb; display: flex; justify-content: space-between; align-items: center; }
+        .footer p { font-size: 10px; color: #9ca3af; }
+        .verified-stamp { border: 2px solid #166534; border-radius: 6px; padding: 6px 14px; color: #166534; font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: 2px; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="brand">ZANE<span>ZION</span><br/><span style="font-size:11px;font-weight:400;letter-spacing:3px;color:#6b7280;">PLATFORM MANAGEMENT SYSTEM</span></div>
+        <div class="doc-title">
+            <h1>Official Proof of Transaction</h1>
+            <p>Verified Institutional Record</p>
+            <p style="margin-top:6px;font-size:11px;color:#374151;">Printed: ${new Date().toLocaleString('en-US', { dateStyle: 'long', timeStyle: 'short' })}</p>
+        </div>
+    </div>
+
+    <div class="ref-box">
+        <div>
+            <div class="ref-label">Transaction Reference</div>
+            <div class="ref-id">${tx.id}</div>
+        </div>
+        <div style="text-align:right;">
+            <div class="ref-label">Category</div>
+            <div class="cat-label">${tx.category || '—'}</div>
+            <div style="margin-top:8px;"><span class="status-badge">${tx.status || 'N/A'}</span></div>
+        </div>
+    </div>
+
+    <div class="section">
+        <div class="section-title">Transaction Overview</div>
+        <div class="info-grid">
+            <div class="info-cell">
+                <label>Client Name</label>
+                <p>${tx.client || tx.clientName || '—'}</p>
+            </div>
+            <div class="info-cell">
+                <label>Request Date</label>
+                <p>${tx.requestDate ? new Date(tx.requestDate).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }) : '—'}</p>
+            </div>
+            <div class="info-cell">
+                <label>Due / Service Date</label>
+                <p>${tx.dueDate ? new Date(tx.dueDate).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }) : '—'}</p>
+            </div>
+            ${tx.location ? `<div class="info-cell" style="grid-column:span 3;"><label>Service / Delivery Location</label><p>${tx.location}</p></div>` : ''}
+            ${tx.deliveryType && tx.category !== 'Chauffeur Booking' ? `<div class="info-cell" style="grid-column:span 3;"><label>Logistics Mode & Protocol</label><p>${tx.deliveryType === 'Air' ? '✈ Air Charter Protocol' : tx.deliveryType === 'Sea' ? '🛥 Sea Marine Protocol' : '🚚 Road Courier & Ground Transport Protocol'}${tx.transport_asset ? ` — ${tx.transport_asset}` : ''}${tx.island_location ? ` (Location: ${tx.island_location})` : ''}</p></div>` : ''}
+        </div>
+    </div>
+
+    <div class="section">
+        <div class="section-title">Itemized Service Breakdown</div>
+        <table>
+            <thead>
+                <tr>
+                    <th>Description</th>
+                    <th>Qty</th>
+                    <th>Unit Price</th>
+                    <th>Line Total</th>
+                </tr>
+            </thead>
+            <tbody>
+                ${itemsHtml}
+                ${tx.refunded_amount > 0 ? `
+                <tr style="background:#fffbeb;">
+                    <td colspan="3" style="text-align:right;color:#b45309;font-size:12px;font-weight:700;padding:8px 12px;">Dispute Refund Issued</td>
+                    <td style="text-align:right;color:#b45309;font-weight:700;padding:8px 12px;">-$${tx.refunded_amount.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+                </tr>
+                <tr class="total-row">
+                    <td colspan="3" style="text-align:right;color:#111827;font-size:12px;font-weight:900;padding:14px 12px;">Net Settled Fiscal Amount</td>
+                    <td style="text-align:right;color:#111827;padding:14px 12px;">$${(tx.netTotal !== undefined ? tx.netTotal : tx.total).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+                </tr>
+                ` : `
+                <tr class="total-row">
+                    <td colspan="3" style="text-align:right;color:#6b7280;font-size:12px;font-weight:600;padding:14px 12px;">Total Settled Fiscal Amount</td>
+                    <td style="text-align:right;color:#111827;padding:14px 12px;">$${tx.total.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+                </tr>
+                `}
+            </tbody>
+        </table>
+    </div>
+
+    <div class="footer">
+        <div>
+            <p>ZaneZion Platform Management System</p>
+            <p>This document is system-generated and serves as an official proof of transaction.</p>
+        </div>
+        <div class="verified-stamp">✓ Verified Record</div>
+    </div>
+</body>
+</html>`;
+
+        const printWindow = window.open('', '_blank', 'width=900,height=700');
+        if (!printWindow) {
+            window.print();
+            return;
+        }
+        printWindow.document.write(printHtml);
+        printWindow.document.close();
+        printWindow.focus();
+        setTimeout(() => {
+            printWindow.print();
+        }, 500);
+    };
+
+
+    useEffect(() => {
+        if (allTransactions.length > 0 && (orders || []).length > 0) {
+            try {
+                const total = filteredTransactions.reduce((acc, tx) => acc + (tx.netTotal !== undefined ? tx.netTotal : tx.total), 0);
+                const active = allTransactions.filter(tx => !['completed', 'delivered', 'cancelled', 'done'].includes(String(tx.status || '').toLowerCase())).length;
+                localStorage.setItem('client_orders_summary', JSON.stringify({
+                    total,
+                    count: allTransactions.length,
+                    active
+                }));
+            } catch {}
+        }
+    }, [allTransactions, filteredTransactions, orders]);
+
+    const liveTotal = filteredTransactions.reduce((acc, tx) => acc + (tx.netTotal !== undefined ? tx.netTotal : tx.total), 0);
+    const displayTotal = (orders || []).length > 0 ? liveTotal : (cachedStats?.total ?? liveTotal);
+
+    const liveLogsCount = allTransactions.length;
+    const displayLogsCount = (orders || []).length > 0 ? liveLogsCount : (cachedStats?.count ?? liveLogsCount);
+
+    const liveActiveCount = allTransactions.filter(tx => !['completed', 'delivered', 'cancelled', 'done'].includes(String(tx.status || '').toLowerCase())).length;
+    const displayActiveCount = (orders || []).length > 0 ? liveActiveCount : (cachedStats?.active ?? liveActiveCount);
+
+    return (
+        <div className="space-y-10 animate-fade-in pb-10">
+            <div className="no-print space-y-8">
+                {/* Header Section */}
+                <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+                    <div>
+                        <h1 className="text-2xl md:text-3xl font-black tracking-tighter text-white italic uppercase flex items-center gap-3">
+                            <ShieldCheck className="text-accent" size={28} />
+                            Order History & Service Records
+                        </h1>
+                        <p className="text-secondary text-[10px] md:text-xs mt-1 font-black uppercase tracking-[0.2em] opacity-70">
+                            Single source of truth & official proof of transaction for Marketplace Orders, Chauffeur Bookings, Events, Guest Requests, and Luxury Sourcing.
+                        </p>
+                    </div>
+                    <div className="flex flex-col sm:flex-row gap-3">
+                        <div className="relative">
+                            <input
+                                type="text"
+                                placeholder="Search transaction history..."
+                                className="bg-[#141417] border border-white/5 rounded-xl py-2.5 pl-10 pr-4 text-xs text-white placeholder:text-muted/40 focus:outline-none focus:border-accent/40 w-full sm:w-64 transition-all font-bold"
+                                value={searchTerm}
+                                onChange={(e) => setSearchTerm(e.target.value)}
+                            />
+                            <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-muted/40" size={14} />
+                        </div>
+                        {canStaffCreateOrderHere && (
+                            <button
+                                type="button"
+                                onClick={() => { setSelectedOrder(null); setModalType('add'); setIsOrderModalOpen(true); }}
+                                className="btn-primary text-[10px] px-6 flex items-center gap-2"
+                            >
+                                <Plus size={14} /> Create Requisition
+                            </button>
+                        )}
+                    </div>
+                </div>
+
+                {/* Metrics Dashboard */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
+                    <div className="glass-card p-6 border-l-4 border-l-accent">
+                        <p className="text-[10px] text-accent font-black uppercase tracking-widest mb-1">Total Transaction Value</p>
+                        <p className="text-2xl font-black text-white italic font-heading tracking-tighter">
+                            ${displayTotal.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                        </p>
+                    </div>
+
+                    <div className="glass-card p-6 border-l-4 border-l-info">
+                        <p className="text-[10px] text-info font-black uppercase tracking-widest mb-1">Active Services & Missions</p>
+                        <p className="text-2xl font-black text-white italic font-heading tracking-tighter">
+                            {displayActiveCount.toString().padStart(2, '0')}
+                        </p>
+                    </div>
+
+                    <div className="glass-card p-6 border-l-4 border-l-warning">
+                        <p className="text-[10px] text-warning font-black uppercase tracking-widest mb-1">Total Verified Proof Records</p>
+                        <p className="text-2xl font-black text-white italic font-heading tracking-tighter">
+                            {displayLogsCount.toString().padStart(2, '0')} Logs
+                        </p>
+                    </div>
+
+                    <div className="glass-card p-6 border-l-4 border-l-success">
+                        <p className="text-[10px] text-success font-black uppercase tracking-widest mb-1">Institutional Status</p>
+                        <p className="text-2xl font-black text-success italic text-glow font-heading tracking-tighter">
+                            Verified Client
+                        </p>
+                    </div>
+                </div>
+
+                {/* Filters Section */}
+                <div className="glass-card p-6 space-y-4">
+                    <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+                        {/* Category Tabs */}
+                        <div className="flex flex-wrap gap-2">
+                            <span className="text-[10px] font-black uppercase tracking-widest text-muted self-center mr-2 hidden sm:inline">Category:</span>
+                            {['All', 'Marketplace Order', 'Chauffeur Booking', 'Event Request', 'Guest Request', 'Luxury Item Request', 'Custom Order'].map((cat) => (
+                                <button
+                                    key={cat}
+                                    type="button"
+                                    onClick={() => setCategoryFilter(cat)}
+                                    className={`px-3.5 py-1.5 rounded-lg text-[10px] font-black uppercase tracking-wider transition-all ${categoryFilter === cat
+                                        ? 'bg-accent text-black shadow-lg shadow-accent/20'
+                                        : 'bg-white/5 text-muted hover:text-white hover:bg-white/10'
+                                        }`}
+                                >
+                                    {cat === 'All' ? 'All Services' : cat}
+                                </button>
+                            ))}
+                        </div>
+
+                        {/* Status Filter */}
+                        <div className="flex bg-background border border-white/10 p-1 rounded-xl w-fit">
+                            {['All', 'Active', 'Closed'].map((filter) => (
+                                <button
+                                    key={filter}
+                                    type="button"
+                                    onClick={() => setStatusFilter(filter)}
+                                    className={`px-4 py-1.5 rounded-lg text-[10px] font-black uppercase tracking-widest transition-all ${statusFilter === filter
+                                        ? 'bg-white/15 text-white shadow'
+                                        : 'text-muted hover:text-white'
+                                        }`}
+                                >
+                                    {filter} Status
+                                </button>
+                            ))}
+                        </div>
+                    </div>
+                </div>
+
+                {/* Mobile Card View */}
+                <div className="lg:hidden grid grid-cols-1 gap-4">
+                    {filteredTransactions.length === 0 ? (
+                        <div className="glass-card p-8 text-center border-dashed border-2 border-white/5">
+                            <FileCheck size={40} className="text-muted mx-auto mb-3 opacity-20" />
+                            <p className="text-muted font-black uppercase tracking-widest text-xs italic">No transaction records match criteria.</p>
+                        </div>
+                    ) : (
+                        filteredTransactions.map((tx) => {
+                            const cfg = CATEGORY_CONFIG[tx.category] || CATEGORY_CONFIG['Custom Order'];
+                            const Icon = cfg.icon;
+                        return (
+                                <div key={`${tx.source}-${tx.id}`} className="glass-card p-5 space-y-4 hover:border-accent/30 transition-all">
+                                    <div className="flex justify-between items-start gap-2">
+                                        <div>
+                                            <span className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded border text-[9px] font-black uppercase tracking-widest ${cfg.color} mb-2`}>
+                                                <Icon size={10} /> {tx.category}
+                                            </span>
+                                            <p className="text-sm font-black text-white italic tracking-tighter">{tx.id}</p>
+                                        </div>
+                                        <StatusBadge status={tx.status} />
+                                    </div>
+
+                                    <div className="bg-white/[0.02] border border-white/5 rounded-xl p-3">
+                                        <p className="text-xs font-bold text-white truncate">{tx.items[0]?.name || tx.serviceType}</p>
+                                        {tx.items.length > 1 && (
+                                            <p className="text-[10px] text-muted font-bold mt-1">+{tx.items.length - 1} additional service item(s)</p>
+                                        )}
+                                    </div>
+
+                                    <div className="grid grid-cols-2 gap-4">
+                                        <div>
+                                            <p className="text-[9px] text-muted font-black uppercase tracking-widest mb-0.5">Request Date</p>
+                                            <p className="text-xs font-black text-secondary italic">{formatDateDisplayDMY(tx.requestDate) || '—'}</p>
+                                        </div>
+                                        <div>
+                                            <p className="text-[9px] text-muted font-black uppercase tracking-widest mb-0.5">Total Fiscal Amount</p>
+                                            <p className="text-xs font-black text-white italic">${tx.total.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
+                                        </div>
+                                    </div>
+
+                                    <div className="flex justify-between items-center pt-3 border-t border-white/5">
+                                        <span className="text-[10px] text-muted/60 font-black uppercase tracking-widest">{tx.serviceType}</span>
+                                        <button
+                                            type="button"
+                                            onClick={() => handleViewTransaction(tx)}
+                                            className="text-accent hover:text-accent-light transition-colors flex items-center gap-1.5 text-xs font-black uppercase tracking-wider"
+                                        >
+                                            <Eye size={14} /> View Proof
+                                        </button>
+                                    </div>
+                                </div>
+                            );
+                        })
+                    )}
+                </div>
+
+                {/* Table View (Desktop) */}
+                <div className="glass-card p-6 sm:p-8 hidden lg:block">
+                    <div className="mb-6 flex items-center justify-between">
+                        <h3 className="text-lg font-black text-white italic uppercase tracking-tighter flex items-center gap-2">
+                            <FileCheck size={20} className="text-accent" />
+                            Official Transaction Ledger
+                        </h3>
+                        <p className="text-[10px] font-black text-muted uppercase tracking-widest">
+                            Showing {filteredTransactions.length} of {allTransactions.length} Verified Records
+                        </p>
+                    </div>
+                    {filteredTransactions.length === 0 ? (
+                        <div className="py-16 text-center border-dashed border-2 border-white/5 rounded-2xl">
+                            <FileCheck size={48} className="text-muted mx-auto mb-3 opacity-20" />
+                            <p className="text-muted font-black uppercase tracking-[0.2em] text-xs italic">No transaction records found matching your filters.</p>
+                        </div>
+                    ) : (
+                        <Table
+                            columns={columns}
+                            data={filteredTransactions}
+                            actions={true}
+                            onView={(tx) => handleViewTransaction(tx)}
+                        />
+                    )}
+                </div>
+
+                {/* Verification Protocol Note */}
+                <div className="glass-card p-6 flex flex-col md:flex-row items-center justify-between gap-6 border-l-4 border-l-accent">
+                    <div className="flex items-center gap-4">
+                        <div className="w-12 h-12 bg-accent/20 rounded-2xl flex items-center justify-center text-accent">
+                            <ShieldCheck size={26} />
+                        </div>
+                        <div>
+                            <h4 className="font-bold text-white text-sm italic uppercase tracking-tight">Institutional Proof Protocol</h4>
+                            <p className="text-xs text-secondary">
+                                All service records, chauffeur manifests, concierge requests, and marketplace purchases are digitally verified and immutable.
+                            </p>
+                        </div>
+                    </div>
+                    <button
+                        onClick={() => navigate('/dashboard/audits')}
+                        className="btn-secondary text-xs shrink-0"
+                    >
+                        Audit Network Records
+                    </button>
+                </div>
+            </div>
+
+            {/* Proof of Transaction Modal */}
+            <AnimatePresence>
+                {isProofModalOpen && selectedTransaction && (
+                    <div className="fixed inset-0 z-50 overflow-y-auto overscroll-contain">
+                        <motion.div
+                            initial={{ opacity: 0 }}
+                            animate={{ opacity: 1 }}
+                            exit={{ opacity: 0 }}
+                            className="fixed inset-0 bg-black/90 backdrop-blur-md"
+                            onClick={() => setIsProofModalOpen(false)}
+                        />
+                        <div className="relative z-10 flex min-h-[100dvh] items-center justify-center p-4 py-8">
+                            <motion.div
+                                initial={{ scale: 0.95, opacity: 0, y: 20 }}
+                                animate={{ scale: 1, opacity: 1, y: 0 }}
+                                exit={{ scale: 0.95, opacity: 0, y: 20 }}
+                                className="w-full max-w-2xl bg-sidebar border border-white/10 rounded-3xl shadow-2xl overflow-hidden my-auto flex flex-col"
+                            >
+                                {/* Modal Header */}
+                                <div className="p-6 border-b border-white/10 flex items-center justify-between bg-white/[0.02]">
+                                    <div className="flex items-center gap-3">
+                                        <div className="w-10 h-10 rounded-xl bg-accent/20 flex items-center justify-center text-accent">
+                                            <ShieldCheck size={22} />
+                                        </div>
+                                        <div>
+                                            <h3 className="text-xl font-black text-white uppercase italic tracking-tighter">Official Proof of Transaction</h3>
+                                            <p className="text-[10px] text-accent font-black tracking-widest uppercase">Verified Institutional Record</p>
+                                        </div>
+                                    </div>
+                                    <button
+                                        type="button"
+                                        onClick={() => setIsProofModalOpen(false)}
+                                        className="p-2.5 bg-white/5 border border-white/10 rounded-full text-muted hover:text-white transition-all"
+                                    >
+                                        <X size={18} />
+                                    </button>
+                                </div>
+
+                                {/* Proof Body */}
+                                <div className="p-6 sm:p-8 space-y-6 max-h-[75vh] overflow-y-auto custom-scrollbar">
+                                    {/* Record Banner */}
+                                    <div className="p-5 rounded-2xl bg-accent/10 border border-accent/20 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+                                        <div>
+                                            <p className="text-[10px] font-black text-accent uppercase tracking-widest">Transaction Reference</p>
+                                            <h4 className="text-2xl font-black text-white italic tracking-tighter mt-0.5">{selectedTransaction.id}</h4>
+                                        </div>
+                                        <div className="text-right">
+                                            <p className="text-[10px] font-black text-muted uppercase tracking-widest">Category</p>
+                                            <span className="text-xs font-black text-white uppercase tracking-wider">{selectedTransaction.category}</span>
+                                        </div>
+                                    </div>
+
+                                    {/* Overview Grid */}
+                                    <div className="grid grid-cols-2 sm:grid-cols-3 gap-4 p-4 rounded-2xl bg-white/[0.02] border border-white/5">
+                                        <div>
+                                            <p className="text-[9px] font-black text-muted uppercase tracking-widest">Request Date</p>
+                                            <p className="text-xs font-black text-white italic">{formatDateDisplayDMY(selectedTransaction.requestDate) || '—'}</p>
+                                        </div>
+                                        <div>
+                                            <p className="text-[9px] font-black text-muted uppercase tracking-widest">Due / Service Date</p>
+                                            <p className="text-xs font-black text-white italic">{formatDateDisplayDMY(selectedTransaction.dueDate) || '—'}</p>
+                                        </div>
+                                        <div>
+                                            <p className="text-[9px] font-black text-muted uppercase tracking-widest">Fulfillment Status</p>
+                                            <div className="mt-1"><StatusBadge status={selectedTransaction.status} /></div>
+                                        </div>
+                                    </div>
+
+                                    {/* Location / Route Info */}
+                                    {(selectedTransaction.pickupLocation || selectedTransaction.pickup_location || selectedTransaction.location || selectedTransaction.deliveryAddress || selectedTransaction.delivery_address) && (
+                                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 p-4 rounded-2xl bg-white/[0.02] border border-white/5">
+                                            {(selectedTransaction.pickupLocation || selectedTransaction.pickup_location) && (
+                                                <div>
+                                                    <p className="text-[9px] font-black text-muted uppercase tracking-widest mb-1">Starting / Pickup Location</p>
+                                                    <p className="text-xs font-bold text-white">{selectedTransaction.pickupLocation || selectedTransaction.pickup_location}</p>
+                                                </div>
+                                            )}
+                                            {(selectedTransaction.location || selectedTransaction.deliveryAddress || selectedTransaction.delivery_address) && (
+                                                <div>
+                                                    <p className="text-[9px] font-black text-muted uppercase tracking-widest mb-1">Destination / Delivery Location</p>
+                                                    <p className="text-xs font-bold text-white">{selectedTransaction.location || selectedTransaction.deliveryAddress || selectedTransaction.delivery_address}</p>
+                                                </div>
+                                            )}
+                                            {(selectedTransaction.totalDistance || selectedTransaction.total_distance) && (
+                                                <div className="sm:col-span-2">
+                                                    <p className="text-[9px] font-black text-accent uppercase tracking-widest mb-1">Total Route Distance</p>
+                                                    <p className="text-xs font-black text-accent">{selectedTransaction.totalDistance || selectedTransaction.total_distance} km</p>
+                                                </div>
+                                            )}
+                                        </div>
+                                    )}
+
+                                    {/* Logistics Transport & Delivery Protocol Details */}
+                                    {(() => {
+                                        const isChauffeur = selectedTransaction.category === 'Chauffeur Booking' || String(selectedTransaction.id || '').startsWith('CH-');
+                                        if (isChauffeur) return null;
+
+                                        const orig = selectedTransaction.originalRecord || {};
+                                        let origMeta = orig.metadata;
+                                        if (typeof origMeta === 'string') {
+                                            try { origMeta = JSON.parse(origMeta); } catch { origMeta = {}; }
+                                        }
+                                        origMeta = origMeta || {};
+
+                                        const rawMode = (selectedTransaction.deliveryType && selectedTransaction.deliveryType !== 'Road')
+                                            ? selectedTransaction.deliveryType
+                                            : (origMeta.delivery_mode || origMeta.deliveryType || origMeta.delivery_type || orig.delivery_mode || orig.deliveryType || selectedTransaction.deliveryType || 'Road');
+
+                                        const isAir = String(rawMode).toLowerCase().includes('air');
+                                        const isSea = String(rawMode).toLowerCase().includes('sea');
+                                        const delType = isAir ? 'Air' : isSea ? 'Sea' : 'Road';
+
+                                        const tAsset = selectedTransaction.transport_asset || orig.transport_asset || orig.transportAsset || origMeta.transport_asset || origMeta.transportAsset;
+                                        const tAssetCustom = selectedTransaction.transport_asset_custom || orig.transport_asset_custom || orig.transportAssetCustom || orig.charterDetails || origMeta.transport_asset_custom || origMeta.charter_details || origMeta.transportAssetCustom;
+                                        const islLoc = selectedTransaction.island_location || orig.island_location || orig.islandLocation || origMeta.island_location || origMeta.islandLocation;
+
+                                    return (
+                                            <div className="p-4 rounded-2xl bg-accent/5 border border-accent/20 space-y-3">
+                                                <div className="flex items-center justify-between">
+                                                    <p className="text-[10px] font-black text-accent uppercase tracking-widest flex items-center gap-1.5">
+                                                        {delType === 'Air' && '✈ Logistics Mode: Air Charter Protocol'}
+                                                        {delType === 'Sea' && '🛥 Logistics Mode: Sea Marine Protocol'}
+                                                        {delType === 'Road' && '🚚 Logistics Mode: Road Courier & Ground Transport Protocol'}
+                                                    </p>
+                                                    <span className="px-2 py-0.5 rounded-full text-[9px] font-black uppercase bg-accent/20 text-accent border border-accent/30">
+                                                        {tAsset || (delType === 'Air' ? 'Air Charter' : delType === 'Sea' ? 'Marine Fleet' : 'Ground Courier')}
+                                                    </span>
+                                                </div>
+                                                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+                                                    <div>
+                                                        <p className="text-[9px] font-bold text-muted uppercase">Fleet / Asset Type</p>
+                                                        <p className="font-bold text-white">
+                                                            {tAsset || (delType === 'Air' ? 'Charter Jet / Cargo Aircraft' : delType === 'Sea' ? 'Sea Cargo / Marine Vessel' : 'Standard Road Fleet / Courier')}
+                                                        </p>
+                                                    </div>
+                                                    {islLoc ? (
+                                                        <div>
+                                                            <p className="text-[9px] font-bold text-muted uppercase">
+                                                                {delType === 'Air' ? 'Island / Airstrip Location' : delType === 'Sea' ? 'Island / Marina Location' : 'Dispatch Terminal Location'}
+                                                            </p>
+                                                            <p className="font-bold text-white">{islLoc}</p>
+                                                        </div>
+                                                    ) : (
+                                                        <div>
+                                                            <p className="text-[9px] font-bold text-muted uppercase">Dispatch Protocol</p>
+                                                            <p className="font-bold text-white">
+                                                                {selectedTransaction.driverName ? `Assigned Courier: ${selectedTransaction.driverName}` : `${delType} Transit Priority Protocol`}
+                                                            </p>
+                                                        </div>
+                                                    )}
+                                                    {tAssetCustom && (
+                                                        <div className="sm:col-span-2">
+                                                            <p className="text-[9px] font-bold text-muted uppercase">
+                                                                {delType === 'Air' ? 'Charter Specs / Tail Number / Instructions' : delType === 'Sea' ? 'Vessel Specs / Marina Details / Instructions' : 'Ground Logistics Notes / Instructions'}
+                                                            </p>
+                                                            <p className="font-black text-accent">{tAssetCustom}</p>
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            </div>
+                                        );
+                                    })()}
+
+                                    {/* Chauffeur / Passenger Info */}
+                                    {(() => {
+                                        const typeStr = String(selectedTransaction.type || selectedTransaction.orderType || '').toLowerCase();
+                                        const catStr = String(selectedTransaction.category || '').toLowerCase();
+                                        const kindStr = String(selectedTransaction.orderKind || selectedTransaction.order_kind || '').toLowerCase();
+                                        const firstItem = String(selectedTransaction.items?.[0]?.name || selectedTransaction.items?.[0]?.itemName || selectedTransaction.product || '').toLowerCase();
+
+                                        if (
+                                            typeStr.includes('marketplace') ||
+                                            typeStr.includes('procurement') ||
+                                            typeStr.includes('provisioning') ||
+                                            typeStr.includes('inventory') ||
+                                            typeStr.includes('delivery') ||
+                                            typeStr.includes('product') ||
+                                            kindStr.includes('marketplace')
+                                        ) {
+                                            return null;
+                                        }
+
+                                        const isChauffeur = catStr.includes('chauffeur') || typeStr.includes('chauffeur') || firstItem.includes('chauffeur service') || firstItem.startsWith('vip chauffeur');
+                                        if (!isChauffeur) return null;
+                                        const c0 = (selectedTransaction.customItems && selectedTransaction.customItems[0]) || (selectedTransaction.metadata?.customItems && selectedTransaction.metadata.customItems[0]) || {};
+                                        const passName = (c0.passengerName && String(c0.passengerName).toLowerCase() !== 'personal client') ? c0.passengerName : (selectedTransaction.passengerName || selectedTransaction.passengerInfo?.name || c0.guestName || '');
+                                        const passPax = c0.numberOfPassengers || c0.passengers || selectedTransaction.numberOfPassengers || selectedTransaction.passengers || selectedTransaction.passengerCount || 1;
+                                        const passLuggage = c0.luggage || selectedTransaction.luggage || (c0.bags ? `Yes — ${c0.bags} bag(s)` : 'Standard');
+                                        const rawAmenities = c0.amenities || selectedTransaction.amenities || selectedTransaction.metadata?.amenities || [];
+                                        const amenList = Array.isArray(rawAmenities) ? rawAmenities : (typeof rawAmenities === 'string' && rawAmenities.trim() ? rawAmenities.split(',').map(s => s.trim()) : []);
+
+                                    return (
+                                            <div className="space-y-3 p-4 rounded-2xl bg-accent/5 border border-accent/20">
+                                                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                                    <div>
+                                                        <p className="text-[9px] font-black text-accent uppercase tracking-widest">No. of Passengers</p>
+                                                        <p className="text-xs font-bold text-white">
+                                                            {passPax} PAX {passName ? `(${passName})` : ''}
+                                                        </p>
+                                                    </div>
+                                                    <div>
+                                                        <p className="text-[9px] font-black text-accent uppercase tracking-widest">Luggage Protocol</p>
+                                                        <p className="text-xs font-bold text-white">
+                                                            {passLuggage}
+                                                        </p>
+                                                    </div>
+                                                    <div className="sm:col-span-2">
+                                                        <p className="text-[9px] font-black text-accent uppercase tracking-widest">Service Protocol & Pricing</p>
+                                                        <p className="text-xs font-bold text-white">
+                                                            {selectedTransaction.serviceType || c0.serviceType || 'One Way'}
+                                                            {(selectedTransaction.serviceType === 'Round Trip' || c0.serviceType === 'Round Trip') ? ' (2× Round Trip Rate applied)' : (selectedTransaction.numberOfDays > 1 || selectedTransaction.dailyDays > 1 || c0.numberOfDays > 1) ? ` (${selectedTransaction.numberOfDays || selectedTransaction.dailyDays || c0.numberOfDays} Days)` : ''}
+                                                        </p>
+                                                    </div>
+                                                </div>
+                                                {amenList.length > 0 && (
+                                                    <div className="pt-2 border-t border-accent/10">
+                                                        <p className="text-[9px] font-black text-accent uppercase tracking-widest mb-1.5">Selected Amenities</p>
+                                                        <div className="flex flex-wrap gap-1.5">
+                                                            {amenList.map((am, i) => (
+                                                                <span key={i} className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-accent/15 text-accent border border-accent/30">
+                                                                    {am}
+                                                                </span>
+                                                            ))}
+                                                        </div>
+                                                    </div>
+                                                )}
+                                            </div>
+                                        );
+                                    })()}
+
+                                    {/* Itemized Breakdown */}
+                                    <div className="space-y-3">
+                                        <h4 className="text-xs font-black text-muted uppercase tracking-widest">Itemized Service Breakdown</h4>
+                                        <div className="space-y-2">
+                                            {selectedTransaction.items.map((item, idx) => {
+                                                const qty = parseInt(item.qty || 1) || 1;
+                                                const unitPrice = parseFloat(item.price ?? item.unitPrice ?? item.unit_price ?? 0) || 0;
+                                                const lineTotal = unitPrice * qty;
+                                            return (
+                                                    <div key={idx} className="p-3.5 bg-white/[0.03] border border-white/5 rounded-xl">
+                                                        <div className="flex items-center justify-between gap-3">
+                                                            <div className="flex items-center gap-3 min-w-0">
+                                                                <div className="w-8 h-8 shrink-0 rounded-lg bg-accent/10 flex items-center justify-center text-accent text-xs font-black">
+                                                                    {qty}x
+                                                                </div>
+                                                                <span className="text-xs font-bold text-white truncate">{item.name || item.itemName || 'Service Entry'}</span>
+                                                            </div>
+                                                            <div className="text-right shrink-0">
+                                                                {qty > 1 && unitPrice > 0 && (
+                                                                    <p className="text-[10px] text-muted font-bold mb-0.5">
+                                                                        {qty} × ${unitPrice.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                                                                    </p>
+                                                                )}
+                                                                <span className="text-xs font-black text-white italic">
+                                                                    ${(lineTotal || unitPrice || 0).toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                                                                </span>
+                                                            </div>
+                                                        </div>
+                                                    </div>
+                                                );
+                                            })}
+                                        </div>
+                                    </div>
+
+                                    {/* Financial Total & Refund Breakdown */}
+                                    <div className="p-5 rounded-2xl bg-white/5 border border-white/10 space-y-3">
+                                        <div className="flex items-center justify-between">
+                                            <div>
+                                                <p className="text-[10px] font-black text-muted uppercase tracking-widest">Total Settled Fiscal Amount</p>
+                                                <p className="text-xs text-secondary font-bold">Includes all service charges, tariffs & logistics</p>
+                                            </div>
+                                            <p className="text-2xl font-black text-white italic tracking-tighter font-mono">
+                                                ${(selectedTransaction.netTotal !== undefined ? selectedTransaction.netTotal : selectedTransaction.total).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                                            </p>
+                                        </div>
+
+                                        {selectedTransaction.refunded_amount > 0 && (
+                                            <div className="pt-2 border-t border-white/5 flex items-center justify-between text-xs font-bold text-amber-400">
+                                                <span>Dispute Refund Settled</span>
+                                                <span className="font-mono">-${selectedTransaction.refunded_amount.toFixed(2)}</span>
+                                            </div>
+                                        )}
+                                    </div>
+                                </div>
+
+                                {/* Modal Actions */}
+                                <div className="p-6 border-t border-white/10 flex items-center justify-between bg-white/[0.02] flex-wrap gap-3">
+                                    <div className="flex items-center gap-3">
+                                        <button
+                                            type="button"
+                                            onClick={handlePrintProof}
+                                            className="btn-secondary text-xs px-6 flex items-center gap-2"
+                                        >
+                                            <Printer size={16} /> Print Official Proof
+                                        </button>
+                                        {selectedTransaction.category === 'Marketplace Order' && ['completed', 'delivered', 'done', 'partially refunded', 'partially_refunded'].includes(String(selectedTransaction.status || '').toLowerCase()) && (
+                                            <button
+                                                type="button"
+                                                onClick={() => {
+                                                    setIsProofModalOpen(false);
+                                                    navigate(`/dashboard/support?category=Return%20%2F%20Refund%20Request&orderId=${selectedTransaction.rawId || selectedTransaction.id}`);
+                                                }}
+                                                className="px-4 py-2.5 bg-accent/15 border border-accent/40 text-accent hover:bg-accent hover:text-black rounded-xl text-xs font-black uppercase tracking-wider transition-all flex items-center gap-2 cursor-pointer shadow-md shadow-accent/10"
+                                            >
+                                                <RotateCcw size={14} /> Request Refund / Return
+                                            </button>
+                                        )}
+                                    </div>
+                                    <button
+                                        type="button"
+                                        onClick={() => setIsProofModalOpen(false)}
+                                        className="btn-primary text-xs px-8"
+                                    >
+                                        Close Proof Record
+                                    </button>
+                                </div>
+                            </motion.div>
+                        </div>
+                    </div>
+                )}
+            </AnimatePresence>
+
+            {/* Standard Order Modal (for manual creation by staff) */}
+            <OrderModal
+                isOpen={isOrderModalOpen}
+                onClose={() => setIsOrderModalOpen(false)}
+                modalType={modalType}
+                selectedOrder={selectedOrder}
+                onSave={handleSaveOrder}
+                onDelete={null}
+                role={currentUser?.role || userRole}
+            />
+        </div>
+    );
+};
+
+export default ClientOrders;

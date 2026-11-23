@@ -1,0 +1,2919 @@
+import React, { useState, useEffect } from 'react';
+import { swalSuccess, swalError, swalWarning, swalInfo, swalConfirm, swalCredentials, swalCopied, swalLoading } from '../../utils/swal';
+import { useLocation, useNavigate } from 'react-router-dom';
+import {
+    Clock, CheckCircle, MapPin, DollarSign,
+    Calendar, FileText, Upload, Play, Pause,
+    CheckCircle2, AlertCircle, TrendingUp,
+    Map as MapIcon, ClipboardList, Smartphone,
+    User, Shield, Navigation, Plus,
+    Camera, ImagePlus, X, ScanLine, Truck,
+    Check, ToggleLeft, ToggleRight, Search, History,
+    Edit2, Trash2, Car
+} from 'lucide-react';
+import Modal from '../../components/Modal';
+import { motion, AnimatePresence } from 'framer-motion';
+import { useData } from '../../context/GlobalDataContext';
+import StatusBadge from '../../components/StatusBadge';
+import CustomDatePicker from '../../components/CustomDatePicker';
+import { normalizeRole } from '../../utils/authUtils';
+import { useChauffeurMissions, useUpdateChauffeurMission } from '../../hooks/api/useChauffeur';
+import { useDeliveries } from '../../hooks/api/useLogistics';
+import { useQueryClient } from '@tanstack/react-query';
+import { notifyStateChanged, setUpdatedChauffeurItem } from '../../utils/stateSyncHelper';
+import api from '../../services/api/setupAxios';
+import { calculateOSRMRouteDistance } from '../../utils/distanceHelper';
+import { isOrderHeldFromFieldStaff } from '../../utils/accountManagerService';
+
+const DriverEtaDisplay = ({ pickupLocation, status, driverName }) => {
+    const [eta, setEta] = useState(null);
+    const [loading, setLoading] = useState(false);
+
+    useEffect(() => {
+        if (!pickupLocation || !driverName) {
+            setEta(null);
+            return;
+        }
+
+        let isMounted = true;
+        const fetchEta = async () => {
+            setLoading(true);
+            try {
+                const res = await calculateOSRMRouteDistance("Nassau Hub", pickupLocation);
+                if (res && isMounted) {
+                    setEta(res.durationMins);
+                }
+            } catch (err) {
+                console.error("Failed to calculate ETA:", err);
+            } finally {
+                if (isMounted) setLoading(false);
+            }
+        };
+
+        fetchEta();
+        return () => { isMounted = false; };
+    }, [pickupLocation, status, driverName]);
+
+    const normStatus = String(status || '').toLowerCase().replace(/\s+/g, '_');
+    if (['completed', 'delivered', 'arrived'].includes(normStatus)) {
+        return (
+            <div className="flex items-center gap-2 mt-2 px-3 py-1.5 rounded-lg bg-success/20 border border-success/30 text-success text-[10px] font-black uppercase tracking-wider w-fit">
+                <CheckCircle size={12} />
+                <span>Driver Arrived</span>
+            </div>
+        );
+    }
+
+    if (!driverName) return null;
+
+    if (loading) {
+        return (
+            <div className="text-[10px] text-muted font-bold mt-2 flex items-center gap-1.5 animate-pulse">
+                <Clock size={12} className="animate-spin text-accent" />
+                <span>Calculating driver ETA...</span>
+            </div>
+        );
+    }
+
+    if (eta !== null) {
+        return (
+            <div className="flex flex-col gap-1 mt-2">
+                <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-accent/20 border border-accent/30 text-accent text-[10px] font-black uppercase tracking-wider w-fit">
+                    <Clock size={12} />
+                    <span>ETA: ~{eta} mins ({Math.round(eta * 1.2)} km away)</span>
+                </div>
+            </div>
+        );
+    }
+
+    return (
+        <div className="flex items-center gap-2 mt-2 px-3 py-1.5 rounded-lg bg-white/5 border border-white/10 text-secondary text-[10px] font-black uppercase tracking-wider w-fit">
+            <Clock size={12} />
+            <span>ETA: ~15 mins (Nassau Area)</span>
+        </div>
+    );
+};
+
+const EmployeePortal = () => {
+    const {
+        currentUser,
+        users = [],
+        staffAssignments, updateAssignment, updateMission, fetchStaff, fetchSupportingDocs,
+        payHistory, addLog, recordWorkSession, fetchPayHistory,
+        leaveRequests, addLeaveRequest, updateLeaveRequest, deleteLeaveRequest, fetchLeaveRequests,
+        getVacationBalance, toggleAvailability,
+        deliveries, updateDelivery, fetchDeliveries, reportSecurityEvent,
+        missions, fetchMissions,
+        chauffeurRequests, fetchChauffeurRequests, updateChauffeurRequest,
+        fleet, fetchFleet, syncGlobalState,
+        securityEvents, fetchSecurityEvents,
+        hasMenuPermission, clients = []
+    } = useData();
+
+    const queryClient = useQueryClient();
+    const { data: chauffeurData } = useChauffeurMissions(1, 100);
+    const allChauffeurOrders = chauffeurData?.data || [];
+    const updateChauffeurMutation = useUpdateChauffeurMission();
+
+    const location = useLocation();
+    const navigate = useNavigate();
+    const queryParams = new URLSearchParams(location.search);
+    const activeTab = queryParams.get('tab') || (location.pathname.includes('/leave') ? 'leave' : location.pathname.includes('/payroll') ? 'pay' : 'dashboard');
+
+    const userRole = normalizeRole(currentUser?.role);
+    const hasStaffTerminal = ['superadmin', 'staff', 'operations', 'logistics', 'inventory'].includes(userRole);
+
+    useEffect(() => {
+        const handleStateChanged = () => {
+            queryClient.invalidateQueries({ queryKey: ['chauffeurMissions'] });
+            if (fetchDeliveries) fetchDeliveries();
+            if (fetchMissions) fetchMissions();
+            if (fetchChauffeurRequests) fetchChauffeurRequests();
+            if (fetchFleet) fetchFleet();
+        };
+        window.addEventListener('app:state-changed', handleStateChanged);
+        return () => window.removeEventListener('app:state-changed', handleStateChanged);
+    }, [queryClient, fetchDeliveries, fetchMissions, fetchChauffeurRequests, fetchFleet]);
+
+    useEffect(() => {
+        console.log('[StaffPortal] Synchronizing operational data for tab:', activeTab);
+        if (fetchSupportingDocs) fetchSupportingDocs();
+        if (fetchDeliveries) fetchDeliveries();
+        if (fetchChauffeurRequests) fetchChauffeurRequests();
+        if (fetchFleet) fetchFleet();
+        if (fetchPayHistory) fetchPayHistory();
+        if (fetchLeaveRequests) fetchLeaveRequests();
+        if (fetchSecurityEvents) fetchSecurityEvents();
+    }, [activeTab]);
+
+    useEffect(() => {
+        let interval;
+        if (activeTab === 'leave' && fetchLeaveRequests) {
+            interval = setInterval(() => {
+                fetchLeaveRequests();
+            }, 5000);
+        }
+        return () => {
+            if (interval) clearInterval(interval);
+        };
+    }, [activeTab]);
+
+    const [isLeaveModalOpen, setIsLeaveModalOpen] = useState(false);
+    const [leaveFormData, setLeaveFormData] = useState({ type: 'Vacation', start: '', end: '', reason: '' });
+    const [editingLeaveRequest, setEditingLeaveRequest] = useState(null);
+    const [searchTerm, setSearchTerm] = useState('');
+
+    // Security States
+    const [isSecurityModalOpen, setIsSecurityModalOpen] = useState(false);
+    const [securityModalType, setSecurityModalType] = useState('panic'); // 'panic' or 'breach'
+    const [breachFormData, setBreachFormData] = useState({ type: 'Unauthorized Access', detail: '', location: currentUser?.location || '' });
+
+    // Mission Details States
+    const [isMissionModalOpen, setIsMissionModalOpen] = useState(false);
+    const [selectedMission, setSelectedMission] = useState(null);
+    const [podTargetDelivery, setPodTargetDelivery] = useState(null);
+    const [showDeliveryPodModal, setShowDeliveryPodModal] = useState(false);
+    const [deliveryPodData, setDeliveryPodData] = useState({ receiverName: '', photo: null, notes: '' });
+    const [isSubmittingDeliveryPod, setIsSubmittingDeliveryPod] = useState(false);
+
+
+    const isUserDriverMatch = (d) => {
+        if (!currentUser || !d) return false;
+        const currentUserId = String(currentUser.id || '');
+        const currentEmpId = String(currentUser.employeeId || currentUser.employee_id || currentUser.id || '');
+        const currentNames = [
+            currentUser.name,
+            currentUser.fullName,
+            currentUser.full_name,
+            currentUser.username,
+            currentUser.email
+        ].filter(Boolean).map(n => String(n).toLowerCase().trim());
+
+        const targetAssignedTo = d.assignedTo ? String(d.assignedTo) : '';
+        const targetAssignedDriver = d.assigned_driver ? String(d.assigned_driver) : '';
+        const targetDriverId = d.driverId ? String(d.driverId) : (d.driver_id ? String(d.driver_id) : (d.driver_user_id ? String(d.driver_user_id) : ''));
+        const nestedDriverId = String(d.customItems?.[0]?.driver_user_id || d.customItems?.[0]?.driverId || d.items?.[0]?.driver_user_id || d.items?.[0]?.driverId || '');
+
+        const targetIds = [targetAssignedTo, targetAssignedDriver, targetDriverId, nestedDriverId].filter(Boolean);
+        const matchId = targetIds.some(id => id === currentUserId || id === currentEmpId);
+
+        const dDriverName = String(
+            d.driver || 
+            d.driverName || 
+            d.assigned_driver_name || 
+            d.assignedDriverName || 
+            d.metadata?.driverName || 
+            d.customItems?.[0]?.driverName || 
+            d.items?.[0]?.driverName || 
+            ''
+        ).toLowerCase().trim();
+
+        const matchName = Boolean(
+            dDriverName && currentNames.some(cn => 
+                cn === dDriverName || 
+                cn.includes(dDriverName) || 
+                dDriverName.includes(cn)
+            )
+        );
+
+        return Boolean(matchId || matchName);
+    };
+
+    // Filter assignments for the current user - prioritize ID and robust name matching
+    const myAssignments = staffAssignments.filter(a => {
+        const cId = String(currentUser?.id || '');
+        const cEmpId = String(currentUser?.employeeId || currentUser?.employee_id || '');
+        const asgId = String(a.assigneeId || '');
+        const asgEmpId = String(a.employeeId || '');
+        const matchId = (asgId && (asgId === cId || asgId === cEmpId)) || (asgEmpId && (asgEmpId === cId || asgEmpId === cEmpId));
+
+        const cNames = [
+            currentUser?.name,
+            currentUser?.fullName,
+            currentUser?.full_name,
+            currentUser?.username,
+            currentUser?.email
+        ].filter(Boolean).map(n => String(n).trim().toLowerCase());
+
+        const asgName = String(a.assignee || '').trim().toLowerCase();
+        const matchName = asgName && cNames.some(cn => cn === asgName || asgName.includes(cn) || cn.includes(asgName));
+
+        return Boolean(matchId || matchName);
+    });
+
+    // Add real deliveries assigned to this driver
+    const myDeliveries = deliveries.filter(d => {
+        const isMine = isUserDriverMatch(d);
+        const isLogisticsMission = String(d.mission_type || d.missionType || '').toLowerCase() !== 'chauffeur';
+        const st = String(d.status || '').toLowerCase().replace(/\s+/g, '_');
+        const isActiveOrAccepted = ['assigned', 'accepted', 'en_route', 'in_transit', 'dispatched', 'planned'].includes(st);
+        return isMine && isLogisticsMission && isActiveOrAccepted;
+    });
+
+    // Chauffeur missions assigned to this driver from BOTH deliveries and allChauffeurOrders/chauffeurRequests
+    const myChauffeurMissions = React.useMemo(() => {
+        const fromDeliveries = (deliveries || []).filter(d => {
+            const isMine = isUserDriverMatch(d);
+            const isChauffeur = String(d.mission_type || d.missionType || '').toLowerCase() === 'chauffeur';
+            const st = String(d.status || '').toLowerCase().replace(/\s+/g, '_');
+            const isNotCompleted = !['completed', 'delivered', 'cancelled', 'rejected', 'canceled'].includes(st);
+            return isMine && isChauffeur && isNotCompleted;
+        });
+
+        const rawChauffeurList = (allChauffeurOrders && allChauffeurOrders.length > 0) ? allChauffeurOrders : (chauffeurRequests || []);
+
+        const fromChauffeur = (rawChauffeurList || []).filter(c => {
+            const isMine = isUserDriverMatch(c);
+            const st = String(c.status || c.chauffeur_status || '').toLowerCase().replace(/\s+/g, '_');
+            const isNotCompleted = !['completed', 'delivered', 'cancelled', 'rejected', 'canceled'].includes(st);
+            return isMine && isNotCompleted;
+        }).map(c => {
+            let meta = c.metadata;
+            if (typeof meta === 'string') {
+                try { meta = JSON.parse(meta); } catch { meta = {}; }
+            }
+            meta = meta || {};
+            const c0 = c.customItems?.[0] || meta.customItems?.[0] || c.items?.[0] || {};
+
+            const resolvedVehicle = c.plateNumber || c.vehicleId || c.vehicle || c.vehicleRef || meta.plateNumber || meta.vehicleId || meta.vehicle || meta.vehicleRef || c0.plateNumber || c0.vehicleId || c0.vehicle || '';
+            const resolvedDriverName = c.driverName || c.driver || meta.driverName || meta.driver || c0.driverName || c0.driver || currentUser?.name;
+            const resolvedDriverId = c.driver_user_id || c.driverId || meta.driver_user_id || meta.driverId || c0.driver_user_id || c0.driverId;
+            const resolvedPickup = c.pickupLocation || c.pickup_location || meta.pickupLocation || meta.pickup_location || c0.pickupLocation || c0.pickup_location || 'Pickup Point';
+            const resolvedDrop = c.dropLocation || c.drop_location || c.location || meta.dropLocation || meta.drop_location || meta.location || c0.dropLocation || c0.drop_location || 'Destination';
+            const resolvedClient = c.clientName || c.client?.companyName || c.client?.name || meta.clientName || meta.client?.companyName || meta.client?.name || c.guestName || c.passengerName || c0.clientName || 'Personal Client';
+            const resolvedFee = Number(c.chauffeurFee || c.chauffeur_fee || c.totalAmount || c.total || meta.chauffeurFee || meta.chauffeur_fee || c0.chauffeurFee || c0.totalPrice || 120) || 120;
+            const resolvedServiceType = c.serviceType || meta.serviceType || c0.serviceType || 'One Way';
+            const resolvedDate = c.dueDate || c.executionDate || c.date || meta.dueDate || meta.executionDate || c0.dueDate;
+            const resolvedTime = c.pickupTime || c.time || meta.pickupTime || c0.pickupTime;
+            const resolvedPax = c.numberOfPassengers || c.passengers || meta.numberOfPassengers || meta.passengers || c0.numberOfPassengers || 1;
+            const resolvedPaxName = c.passengerName || c.guestName || meta.passengerName || meta.guestName || c0.passengerName || resolvedClient;
+            const resolvedLuggage = c.luggage || meta.luggage || c0.luggage || 'No';
+            const resolvedBags = c.bags ?? meta.bags ?? c0.bags ?? 0;
+            const resolvedStops = c.stops || meta.stops || c0.stops || 'No';
+            const resolvedStopLocations = c.stopLocations || meta.stopLocations || c0.stopLocations || '';
+            const resolvedAmenities = c.amenities || meta.amenities || c0.amenities || [];
+            const resolvedStatus = c.status || c.chauffeur_status || 'assigned';
+            const resolvedChauffeurStatus = c.chauffeur_status || c.status || 'assigned';
+
+            return {
+                ...c,
+                ...meta,
+                id: c.db_id || c.id,
+                db_id: c.db_id || c.id,
+                rawId: c.db_id || c.id,
+                order_id_raw: c.db_id || c.id,
+                orderId: c.orderNumber || (c.id ? `ORD-${c.id}` : 'CHAUFFEUR'),
+                orderNumber: c.orderNumber || (c.id ? `ORD-${c.id}` : 'CHAUFFEUR'),
+                mission_type: 'Chauffeur',
+                missionType: 'Chauffeur',
+                orderType: 'CHAUFFEUR',
+                isDirectChauffeurOrder: true,
+                pickupLocation: resolvedPickup,
+                pickup_location: resolvedPickup,
+                dropLocation: resolvedDrop,
+                drop_location: resolvedDrop,
+                location: resolvedDrop,
+                delivery_fee: resolvedFee,
+                chauffeurFee: resolvedFee,
+                chauffeur_fee: resolvedFee,
+                totalAmount: resolvedFee,
+                driverId: resolvedDriverId,
+                driver_user_id: resolvedDriverId,
+                driver: resolvedDriverName,
+                driverName: resolvedDriverName,
+                vehicle: resolvedVehicle,
+                plateNumber: resolvedVehicle,
+                vehicleId: resolvedVehicle,
+                vehicleRef: resolvedVehicle,
+                clientName: resolvedClient,
+                serviceType: resolvedServiceType,
+                dueDate: resolvedDate,
+                pickupTime: resolvedTime,
+                numberOfPassengers: resolvedPax,
+                passengers: resolvedPax,
+                passengerName: resolvedPaxName,
+                luggage: resolvedLuggage,
+                bags: resolvedBags,
+                stops: resolvedStops,
+                stopLocations: resolvedStopLocations,
+                amenities: resolvedAmenities,
+                status: resolvedStatus,
+                chauffeur_status: resolvedChauffeurStatus
+            };
+        });
+
+        const merged = [...fromChauffeur];
+        fromDeliveries.forEach(dItem => {
+            const dOrderId = String(dItem.order_id_raw || dItem.order?.id || '').replace(/\D/g, '');
+            const dOrderNum = String(dItem.orderNumber || dItem.orderId || dItem.order?.orderNumber || '').replace(/\D/g, '');
+            const dText = String(dItem.orderNumber || dItem.orderId || dItem.order?.orderNumber || '').trim().toLowerCase();
+
+            const existingIdx = merged.findIndex(m => {
+                const mOrderId = String(m.order_id_raw || m.rawId || m.db_id || m.id || '').replace(/\D/g, '');
+                const mOrderNum = String(m.orderNumber || m.orderId || '').replace(/\D/g, '');
+                const mText = String(m.orderNumber || m.orderId || '').trim().toLowerCase();
+
+                const isIdMatch = (dOrderId && mOrderId && (dOrderId === mOrderId || dOrderId.endsWith(mOrderId) || mOrderId.endsWith(dOrderId)));
+                const isNumMatch = (dOrderNum && mOrderNum && (dOrderNum === mOrderNum || dOrderNum.endsWith(mOrderNum) || mOrderNum.endsWith(dOrderNum)));
+                const isTextMatch = (dText && mText && dText === mText);
+                const isDirectMatch = String(m.id) === String(dItem.id);
+
+                return isIdMatch || isNumMatch || isTextMatch || isDirectMatch;
+            });
+
+            if (existingIdx === -1) {
+                merged.push(dItem);
+            } else {
+                // Merge in any delivery specifics if missing on chauffeur order
+                merged[existingIdx] = {
+                    ...dItem,
+                    ...merged[existingIdx],
+                    vehicle: merged[existingIdx].vehicle || dItem.vehicle || dItem.vehicleRef,
+                    vehicleRef: merged[existingIdx].vehicleRef || dItem.vehicleRef || dItem.vehicle,
+                    plateNumber: merged[existingIdx].plateNumber || dItem.plateNumber || dItem.vehicleRef || dItem.vehicle,
+                    driver: merged[existingIdx].driver || dItem.driver || dItem.driverName,
+                    driverName: merged[existingIdx].driverName || dItem.driverName || dItem.driver
+                };
+            }
+        });
+        return merged;
+    }, [deliveries, allChauffeurOrders, chauffeurRequests, currentUser]);
+
+    const openDeliveryQueue = (deliveries || []).filter((d) => {
+        const isLogisticsMission = String(d.mission_type || d.missionType || '').toLowerCase() !== 'chauffeur';
+        const s = String(d.status || '').toLowerCase().replace(/\s+/g, '_');
+        const isAssignedOrFinished = ['assigned', 'accepted', 'en_route', 'in_transit', 'dispatched', 'delivered', 'completed'].includes(s);
+        const isOpenStatus = ['pending', 'pending_pickup', 'pending_review', 'ready_for_delivery', 'unassigned', 'open', 'logistics', ''].includes(s);
+        const hasAssignedDriver = !!(
+            d.assignedTo || 
+            d.assigned_driver || 
+            d.driverId || 
+            d.driver_id || 
+            (typeof d.driver === 'string' && d.driver.trim() && !['unassigned', 'null', 'undefined', 'n/a', 'assign personnel...'].includes(d.driver.trim().toLowerCase()))
+        );
+
+        // Strict tenant isolation: SaaS staff only sees their tenant's open delivery missions
+        const currentTenantId = currentUser?.tenantId ?? currentUser?.company_id ?? currentUser?.companyId ?? currentUser?.tenant_id;
+        const dTenantId = d.tenantId ?? d.tenant_id ?? d.company_id ?? d.companyId;
+        if (currentTenantId && Number(currentTenantId) !== 1) {
+            if (dTenantId != null && Number(dTenantId) !== Number(currentTenantId)) return false;
+        }
+
+        return isLogisticsMission && isOpenStatus && !hasAssignedDriver && !isAssignedOrFinished;
+    });
+
+    const pendingAssignments = staffAssignments.filter(a => 
+        String(a.status || '').toLowerCase() === 'pending' && 
+        !a.assigneeId && 
+        (!a.assignee || a.assignee === 'System' || a.assignee === 'Unassigned')
+    );
+
+    const isMatchingUserLeave = React.useCallback((r) => {
+        if (!currentUser || !r) return false;
+        const matchId = (r.userId && String(r.userId) === String(currentUser.id)) ||
+                        (r.user_id && String(r.user_id) === String(currentUser.id));
+        const matchName = r.name && currentUser.name && String(r.name).trim().toLowerCase() === String(currentUser.name).trim().toLowerCase();
+        const matchEmail = r.email && currentUser.email && String(r.email).trim().toLowerCase() === String(currentUser.email).trim().toLowerCase();
+        return Boolean(matchId || matchName || matchEmail);
+    }, [currentUser]);
+
+    const myApprovedLeaveHours = React.useMemo(() => {
+        return (leaveRequests || [])
+            .filter(r => isMatchingUserLeave(r) && String(r.status).toLowerCase() === 'approved')
+            .reduce((sum, r) => {
+                let calcH = r.hours;
+                if (r.start && r.end) {
+                    const s = new Date(r.start);
+                    const e = new Date(r.end);
+                    const diffDays = Math.max(1, Math.floor(Math.abs(e.getTime() - s.getTime()) / (1000 * 60 * 60 * 24)) + 1);
+                    calcH = diffDays * 24;
+                }
+                return sum + (Number(calcH) || 24);
+            }, 0);
+    }, [leaveRequests, isMatchingUserLeave]);
+
+    // Dedicated vacation quota assigned to this specific staff member
+    const dedicatedVacationHours = React.useMemo(() => {
+        const isCorrupt = (v) => v === undefined || v === null || isNaN(Number(v)) || Number(v) >= 5000 || Number(v) <= 0;
+
+        // 1. Check user from users directory in GlobalDataContext
+        const matched = (users || []).find(u =>
+            (u.id && currentUser?.id && String(u.id) === String(currentUser.id)) ||
+            (u.email && currentUser?.email && String(u.email).toLowerCase() === String(currentUser.email).toLowerCase())
+        );
+
+        let matchedBank = matched?.bankingInfo;
+        if (typeof matchedBank === 'string') {
+            try { matchedBank = JSON.parse(matchedBank); } catch (_) { matchedBank = {}; }
+        }
+        const listQuota = matchedBank?.vacationQuota ?? matched?.vacationQuota;
+        if (!isCorrupt(listQuota)) {
+            return Number(listQuota);
+        }
+
+        // 2. Check bankingInfo on currentUser
+        let curBank = currentUser?.bankingInfo;
+        if (typeof curBank === 'string') {
+            try { curBank = JSON.parse(curBank); } catch (_) { curBank = {}; }
+        }
+        const currentQuota = curBank?.vacationQuota ?? currentUser?.vacationQuota;
+        if (!isCorrupt(currentQuota)) {
+            return Number(currentQuota);
+        }
+
+        // 3. Check cached localStorage setting
+        const cached = (currentUser?.id ? localStorage.getItem(`dedicated_vacation_${currentUser.id}`) : null) || 
+                       (currentUser?.email ? localStorage.getItem(`dedicated_vacation_${String(currentUser.email).toLowerCase()}`) : null);
+        if (!isCorrupt(cached)) {
+            return Number(cached);
+        }
+
+        // 4. If vacationBalance is clean, quota is balance + already approved leave deductions
+        const rawBal = matched?.vacationBalance ?? currentUser?.vacationBalance;
+        if (!isCorrupt(rawBal)) {
+            return Number(rawBal) + (myApprovedLeaveHours > 0 ? myApprovedLeaveHours : 0);
+        }
+
+        return 80;
+    }, [currentUser, users, myApprovedLeaveHours]);
+
+    // Remaining vacation hours: Dedicated Quota - Approved Deductions
+    const remainingVacationHours = Math.max(0, dedicatedVacationHours - myApprovedLeaveHours);
+
+    // Filtered assignments based on search
+    const filteredMyAssignments = myAssignments.filter(asg =>
+        asg.task?.toLowerCase().includes(searchTerm.toLowerCase()) ||
+        asg.location?.toLowerCase().includes(searchTerm.toLowerCase()) ||
+        String(asg.id || '').toLowerCase().includes(searchTerm.toLowerCase())
+    );
+
+    const filteredPendingAssignments = pendingAssignments.filter(asg =>
+        asg.task?.toLowerCase().includes(searchTerm.toLowerCase()) ||
+        asg.location?.toLowerCase().includes(searchTerm.toLowerCase()) ||
+        String(asg.id || '').toLowerCase().includes(searchTerm.toLowerCase())
+    );
+
+    const myPayHistory = payHistory.filter(p => {
+        const payUserId = p.userId || p.user_id || p.created_by || p.requested_by;
+        if (payUserId) {
+            return String(payUserId) === String(currentUser?.id);
+        }
+        return p.userName === currentUser?.name;
+    });
+
+    const totalYTD = myPayHistory.reduce((acc, p) => acc + parseFloat((p.total || "0").replace('$', '').replace(',', '') || 0), 0);
+
+    const activeDeliveriesCount = myDeliveries.filter(d =>
+        !['delivered', 'completed', 'cancelled'].includes(String(d.status || '').toLowerCase().replace(/\s+/g, '_'))
+    ).length + myChauffeurMissions.filter(c =>
+        !['delivered', 'completed', 'cancelled'].includes(String(c.status || '').toLowerCase().replace(/\s+/g, '_'))
+    ).length;
+
+    const handleAcceptMission = async (del) => {
+        try {
+            swalLoading('Accepting Mission...', 'The mission is accepting, please wait...');
+            const isChauffeur = del.isDirectChauffeurOrder || del.orderType === 'CHAUFFEUR' || String(del.mission_type || del.missionType || '').toLowerCase() === 'chauffeur';
+            const rawId = del.db_id || del.order_id_raw || del.rawId || del.id;
+            const targetId = String(rawId).replace(/\D/g, '') || String(rawId);
+
+            if (isChauffeur) {
+                await api.put(`/orders/${targetId}/status`, { status: 'assigned' }).catch(() =>
+                    api.patch(`/orders/${targetId}/status`, { status: 'assigned' })
+                );
+                setUpdatedChauffeurItem(targetId, { status: 'assigned', chauffeur_status: 'assigned' });
+                notifyStateChanged(queryClient, ['chauffeurMissions', 'orders', 'deliveries', 'dashboardStats']);
+                window.dispatchEvent(new CustomEvent('app:state-changed', { detail: { source: 'staff-portal', orderId: targetId } }));
+                if (updateChauffeurRequest) {
+                    await updateChauffeurRequest({ ...del, id: targetId, db_id: targetId, status: 'assigned', chauffeur_status: 'assigned' }).catch(() => {});
+                }
+            } else {
+                await updateDelivery({
+                    ...del,
+                    status: 'assigned',
+                    assigned_driver: currentUser?.id,
+                    driverId: currentUser?.id,
+                    driver: currentUser?.name
+                });
+            }
+            if (syncGlobalState) await syncGlobalState();
+            await new Promise(resolve => setTimeout(resolve, 500));
+            swalSuccess('Mission Accepted', 'Mission assigned to your roster successfully.');
+        } catch (err) {
+            swalError('Error', err?.response?.data?.message || err?.message || 'Failed to accept mission.');
+        }
+    };
+
+    const handleRejectMission = async (del) => {
+        try {
+            swalLoading('Rejecting Mission...', 'The mission is rejecting, please wait...');
+            const isChauffeur = del.isDirectChauffeurOrder || del.orderType === 'CHAUFFEUR' || String(del.mission_type || del.missionType || '').toLowerCase() === 'chauffeur';
+            const rawId = del.db_id || del.order_id_raw || del.rawId || del.id;
+            const targetId = String(rawId).replace(/\D/g, '') || String(rawId);
+
+            if (isChauffeur) {
+                await api.put(`/orders/${targetId}/status`, { status: 'pending' }).catch(() =>
+                    api.patch(`/orders/${targetId}/status`, { status: 'pending' })
+                );
+                setUpdatedChauffeurItem(targetId, { status: 'pending', chauffeur_status: 'pending', driverName: null, driver_user_id: null, driverId: null });
+                notifyStateChanged(queryClient, ['chauffeurMissions', 'orders', 'deliveries', 'dashboardStats']);
+                window.dispatchEvent(new CustomEvent('app:state-changed', { detail: { source: 'staff-portal', orderId: targetId } }));
+                if (updateChauffeurRequest) {
+                    await updateChauffeurRequest({ ...del, id: targetId, db_id: targetId, status: 'pending', chauffeur_status: 'pending', driverName: null, driver_user_id: null, driverId: null }).catch(() => {});
+                }
+            } else {
+                await updateDelivery({
+                    ...del,
+                    status: 'pending',
+                    assigned_driver: null,
+                    assignedTo: null,
+                    driverId: null,
+                    driver: null
+                });
+            }
+            if (syncGlobalState) await syncGlobalState();
+            await new Promise(resolve => setTimeout(resolve, 500));
+            swalInfo('Mission Rejected', 'You have rejected this mission. It remains available for other staff.');
+        } catch (err) {
+            swalError('Error', err?.response?.data?.message || err?.message || 'Failed to reject mission.');
+        }
+    };
+
+    const handleStartTrip = async (del) => {
+        try {
+            const isChauffeur = del.isDirectChauffeurOrder || del.orderType === 'CHAUFFEUR' || String(del.mission_type || del.missionType || '').toLowerCase() === 'chauffeur';
+            const rawId = del.db_id || del.order_id_raw || del.rawId || del.id;
+            const targetId = String(rawId).replace(/\D/g, '') || String(rawId);
+
+            if (isChauffeur) {
+                await api.put(`/orders/${targetId}/status`, { status: 'en_route' }).catch(() =>
+                    api.patch(`/orders/${targetId}/status`, { status: 'en_route' })
+                );
+                setUpdatedChauffeurItem(targetId, { status: 'en_route', chauffeur_status: 'en_route' });
+                if (updateChauffeurRequest) {
+                    await updateChauffeurRequest({ ...del, id: targetId, db_id: targetId, status: 'en_route', chauffeur_status: 'en_route' }).catch(() => {});
+                }
+            } else {
+                await updateDelivery({
+                    ...del,
+                    status: 'en_route'
+                });
+                const cleanOrderId = String(del.orderId || del.order?.id || del.order_id || '').replace(/^#|^ORD-/i, '');
+                if (cleanOrderId) {
+                    await api.put(`/orders/${cleanOrderId}/status`, { status: 'in_transit' }).catch(() =>
+                        api.patch(`/orders/${cleanOrderId}/status`, { status: 'in_transit' }).catch(() => {})
+                    );
+                }
+            }
+
+            notifyStateChanged(queryClient, ['chauffeurMissions', 'orders', 'deliveries', 'dashboardStats']);
+            window.dispatchEvent(new CustomEvent('app:state-changed', { detail: { source: 'staff-portal', orderId: targetId, status: 'en_route' } }));
+            if (syncGlobalState) await syncGlobalState();
+
+            swalSuccess('Trip Started', 'Mission status updated to En Route.');
+        } catch (err) {
+            swalError('Error', err?.response?.data?.message || err?.message || 'Failed to start trip.');
+        }
+    };
+
+    const handleArriveTrip = async (del) => {
+        try {
+            const isChauffeur = del.isDirectChauffeurOrder || del.orderType === 'CHAUFFEUR' || String(del.mission_type || del.missionType || '').toLowerCase() === 'chauffeur';
+            const rawId = del.db_id || del.order_id_raw || del.rawId || del.id;
+            const targetId = String(rawId).replace(/\D/g, '') || String(rawId);
+
+            if (isChauffeur) {
+                await api.put(`/orders/${targetId}/status`, { status: 'arrived' }).catch(() =>
+                    api.patch(`/orders/${targetId}/status`, { status: 'arrived' })
+                );
+                setUpdatedChauffeurItem(targetId, { status: 'arrived', chauffeur_status: 'arrived' });
+                if (updateChauffeurRequest) {
+                    await updateChauffeurRequest({ ...del, id: targetId, db_id: targetId, status: 'arrived', chauffeur_status: 'arrived' }).catch(() => {});
+                }
+            } else {
+                await updateDelivery({
+                    ...del,
+                    status: 'arrived'
+                });
+                const cleanOrderId = String(del.orderId || del.order?.id || del.order_id || '').replace(/^#|^ORD-/i, '');
+                if (cleanOrderId) {
+                    await api.put(`/orders/${cleanOrderId}/status`, { status: 'arrived' }).catch(() =>
+                        api.patch(`/orders/${cleanOrderId}/status`, { status: 'arrived' }).catch(() => {})
+                    );
+                }
+            }
+
+            notifyStateChanged(queryClient, ['chauffeurMissions', 'orders', 'deliveries', 'dashboardStats']);
+            window.dispatchEvent(new CustomEvent('app:state-changed', { detail: { source: 'staff-portal', orderId: targetId, status: 'arrived' } }));
+            if (syncGlobalState) await syncGlobalState();
+
+            swalSuccess('Arrived at Destination', 'Trip status updated to Arrived. Passengers may now disembark.');
+        } catch (err) {
+            swalError('Error', err?.response?.data?.message || err?.message || 'Failed to update status to Arrived.');
+        }
+    };
+
+    const handleDeliveryPhotoUpload = (e) => {
+        const file = e.target.files?.[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onloadend = () => {
+            setDeliveryPodData(prev => ({ ...prev, photo: reader.result }));
+        };
+        reader.readAsDataURL(file);
+    };
+
+    const handleCompleteMission = async (del, proofData = null) => {
+        try {
+            const isChauffeur = del.isDirectChauffeurOrder || del.orderType === 'CHAUFFEUR' || String(del.mission_type || del.missionType || '').toLowerCase() === 'chauffeur';
+            const rawId = del.db_id || del.order_id_raw || del.rawId || del.id;
+            const targetId = String(rawId).replace(/\D/g, '') || String(rawId);
+
+            if (isChauffeur) {
+                await api.put(`/orders/${targetId}/status`, { status: 'completed' }).catch(() =>
+                    api.patch(`/orders/${targetId}/status`, { status: 'completed' })
+                );
+                setUpdatedChauffeurItem(targetId, { status: 'completed', chauffeur_status: 'completed' });
+                if (updateChauffeurRequest) {
+                    await updateChauffeurRequest({ ...del, id: targetId, db_id: targetId, status: 'completed', chauffeur_status: 'completed' }).catch(() => {});
+                }
+            } else {
+                // If non-chauffeur (marketplace delivery) and no proof was provided yet, open POD modal
+                if (!proofData) {
+                    setPodTargetDelivery(del);
+                    setDeliveryPodData({
+                        receiverName: del.clientName || del.client?.name || del.client?.companyName || '',
+                        photo: null,
+                        notes: ''
+                    });
+                    setShowDeliveryPodModal(true);
+                    return;
+                }
+
+                // If proof was provided, submit POD to backend
+                try {
+                    const missionId = del.mission_id || del.missionId || targetId;
+                    await api.post(`/missions/${missionId}/pod`, {
+                        receiverName: proofData.receiverName || 'Verified Client',
+                        signature: proofData.signature || 'Electronic Driver Handover',
+                        photoUrl: proofData.photo,
+                        photo: proofData.photo,
+                        notes: proofData.notes || 'Delivered via Driver Portal'
+                    }).catch(() => 
+                        api.post(`/deliveries/${targetId}/pod`, {
+                            receiverName: proofData.receiverName || 'Verified Client',
+                            signature: proofData.signature || 'Electronic Driver Handover',
+                            photoUrl: proofData.photo,
+                            photo: proofData.photo,
+                            notes: proofData.notes || 'Delivered via Driver Portal'
+                        })
+                    );
+                } catch (_) {}
+
+                await updateDelivery({
+                    ...del,
+                    status: 'Delivered',
+                    deliveredAt: new Date().toISOString(),
+                    pod: proofData
+                });
+
+                const cleanOrderId = String(del.orderId || del.order?.id || del.order_id || '').replace(/^#|^ORD-/i, '');
+                if (cleanOrderId && !cleanOrderId.startsWith('DEL-')) {
+                    await api.put(`/orders/${cleanOrderId}/status`, { status: 'completed' }).catch(() =>
+                        api.patch(`/orders/${cleanOrderId}/status`, { status: 'completed' }).catch(() => {})
+                    );
+                }
+            }
+
+            notifyStateChanged(queryClient, ['chauffeurMissions', 'orders', 'deliveries', 'dashboardStats', 'missions']);
+            window.dispatchEvent(new CustomEvent('app:state-changed', { detail: { source: 'staff-portal', orderId: targetId, status: 'completed' } }));
+            if (syncGlobalState) await syncGlobalState();
+
+            swalSuccess('Mission Completed', 'Proof of delivery submitted and order marked as completed.');
+        } catch (err) {
+            swalError('Error', err?.response?.data?.message || err?.message || 'Failed to complete mission.');
+        }
+    };
+
+    const handleSubmitDeliveryPOD = async (e) => {
+        e?.preventDefault();
+        if (!podTargetDelivery) return;
+        if (!deliveryPodData.receiverName.trim()) {
+            swalError('Receiver Name Required', 'Please enter the name of the person receiving the order.');
+            return;
+        }
+        if (!deliveryPodData.photo) {
+            swalError('Proof Photo Required', 'Please capture or upload a proof of delivery photo.');
+            return;
+        }
+
+        setIsSubmittingDeliveryPod(true);
+        try {
+            await handleCompleteMission(podTargetDelivery, deliveryPodData);
+            setShowDeliveryPodModal(false);
+            setPodTargetDelivery(null);
+            setDeliveryPodData({ receiverName: '', photo: null, notes: '' });
+        } finally {
+            setIsSubmittingDeliveryPod(false);
+        }
+    };
+
+    const handleStatusChange = async (asg, newStatus, proofData = null) => {
+        if (newStatus === 'view_details') {
+            const matchingDel = deliveries.find(d => 
+                (asg.orderId && d.orderId === asg.orderId) || 
+                (asg.deliveryId && d.id === asg.deliveryId) || 
+                (asg.id && d.taskRef === asg.id) ||
+                (asg.rawId && d.id === asg.rawId)
+            );
+            if (matchingDel) {
+                setSelectedMission(matchingDel);
+                setIsMissionModalOpen(true);
+            } else {
+                setSelectedMission({
+                    ...asg,
+                    mission_type: 'General Task',
+                    pickup_location: 'Central Command',
+                    drop_location: asg.location,
+                    delivery_instructions: asg.detail || asg.task
+                });
+                setIsMissionModalOpen(true);
+            }
+            return;
+        }
+
+        try {
+            const updatedAsg = { ...asg, status: newStatus, ...proofData };
+
+            if (asg.source === 'delivery' || String(asg.id).startsWith('DEL-')) {
+                const rawId = asg.db_id || asg.rawId || asg.id;
+                const isAlreadyAssigned = String(asg.status).toLowerCase() === 'assigned';
+                let finalStatus = newStatus;
+                
+                if (newStatus === 'in_progress') {
+                    finalStatus = isAlreadyAssigned ? 'en_route' : 'assigned';
+                } else if (newStatus === 'Completed') {
+                    finalStatus = 'Delivered';
+                }
+
+                const payload = {
+                    id: rawId,
+                    status: finalStatus,
+                    ...proofData,
+                };
+
+                if (newStatus === 'in_progress' || newStatus === 'assigned') {
+                    payload.assigned_driver = currentUser?.id;
+                    payload.driverId = currentUser?.id;
+                    payload.driver = currentUser?.name;
+                } else if (newStatus === 'pending') {
+                    payload.assigned_driver = null;
+                    payload.assignedTo = null;
+                    payload.driverId = null;
+                    payload.driver = null;
+                }
+
+                await updateDelivery(payload);
+
+                if (newStatus === 'in_progress' || newStatus === 'assigned') {
+                    swalSuccess('Mission Accepted', 'Mission assigned to your roster successfully.');
+                } else if (newStatus === 'pending') {
+                    swalInfo('Mission Rejected', 'You have rejected this mission. It remains available for other staff.');
+                } else if (newStatus === 'en_route') {
+                    swalSuccess('Trip Started', 'Mission status updated to En Route.');
+                } else if (newStatus === 'Completed' || newStatus === 'Delivered') {
+                    swalSuccess('Mission Completed', 'Mission marked as delivered successfully.');
+                }
+
+                addLog({
+                    action: `Mission ${newStatus}`,
+                    detail: `${currentUser?.name || 'User'} updated mission ${asg.id} to ${newStatus}.`,
+                    type: 'system'
+                });
+                return;
+            }
+            
+            if (asg.source === 'mission') {
+                const isAlreadyAssigned = String(asg.status).toLowerCase() === 'assigned';
+                const finalStatus = (newStatus === 'in_progress' && !isAlreadyAssigned) ? 'assigned' : newStatus;
+                
+                const payload = {
+                    id: asg.id,
+                    rawId: asg.rawId,
+                    status: finalStatus,
+                    assigneeId: (newStatus === 'in_progress' || newStatus === 'assigned') ? currentUser?.id : asg.assigneeId,
+                    assignee: (newStatus === 'in_progress' || newStatus === 'assigned') ? currentUser?.name : asg.assignee,
+                    ...proofData
+                };
+                await updateMission(payload);
+
+                if (newStatus === 'in_progress' || newStatus === 'assigned') {
+                    swalSuccess('Mission Accepted', 'Mission assigned to your roster successfully.');
+                } else if (newStatus === 'pending') {
+                    swalInfo('Mission Rejected', 'You have rejected this mission.');
+                } else {
+                    swalSuccess('Status Updated', `Mission updated to ${newStatus}.`);
+                }
+
+                addLog({
+                    action: `Mission ${newStatus}`,
+                    detail: `${currentUser?.name || 'User'} updated mission ${asg.id} to ${newStatus}.`,
+                    type: 'system'
+                });
+                return;
+            }
+
+            if (asg.status === 'Pending' && !asg.assigneeId) {
+                updatedAsg.assigneeId = currentUser?.id;
+                updatedAsg.assignee = currentUser?.name;
+            }
+
+            await updateAssignment(updatedAsg);
+
+            if (newStatus === 'in_progress' || newStatus === 'assigned') {
+                swalSuccess('Task Accepted', 'Task assigned to your roster successfully.');
+            } else if (newStatus === 'pending') {
+                swalInfo('Task Rejected', 'You have rejected this task.');
+            } else {
+                swalSuccess('Task Updated', `Task status updated to ${newStatus}.`);
+            }
+
+            addLog({
+                action: `Task ${newStatus}`,
+                detail: `${currentUser?.name || 'User'} updated task ${asg.id} to ${newStatus}.`,
+                type: 'system'
+            });
+        } catch (err) {
+            swalError('Error', err?.response?.data?.message || err?.message || 'Failed to update status.');
+        }
+    };
+
+    const completedTodayCount = myAssignments.filter(a => {
+        if (a.status !== 'Completed') return false;
+        const date = new Date(a.updatedAt || a.date);
+        const today = new Date();
+        return date.toDateString() === today.toDateString();
+    }).length;
+
+    const dashboardStats = [
+        { 
+            label: "Remaining Tasks", 
+            value: myAssignments.filter(a => !['Completed', 'Cancelled'].includes(a.status)).length.toString(), 
+            icon: ClipboardList, 
+            color: "text-accent" 
+        },
+        { 
+            label: "Completed Today", 
+            value: completedTodayCount.toString(), 
+            icon: CheckCircle2, 
+            color: "text-success" 
+        },
+        {
+            label: "Active Deliveries",
+            value: String(activeDeliveriesCount).padStart(2, '0'),
+            subValue: 'Assigned routes in progress',
+            icon: Truck,
+            color: "text-warning"
+        },
+    ];
+
+    return (
+        <div className="space-y-8 pb-12">
+            {/* Header — check-in/out lives in top navbar (StaffClockBar) for all eligible roles */}
+            <div className="flex flex-col xl:flex-row xl:items-center justify-between gap-6">
+                <div className="flex-shrink-0">
+                    <h1 className="text-3xl md:text-4xl font-black tracking-tighter text-white italic uppercase flex items-center gap-3">
+                        <Smartphone className="text-accent shrink-0" size={32} strokeWidth={2.5} /> Staff Terminal
+                    </h1>
+                    <p className="text-secondary text-[10px] md:text-xs mt-1 font-black uppercase tracking-[0.2em] opacity-80 flex items-center gap-2">
+                        <User size={12} className="text-accent/50" /> {currentUser?.name || 'Authorized Officer'} 
+                        <span className="opacity-30">|</span> 
+                        <MapPin size={12} className="text-accent/50" /> {currentUser?.location || 'Central Command'}
+                    </p>
+                </div>
+
+                <div className="flex flex-col lg:flex-row items-stretch lg:items-center gap-4 flex-1">
+                    <div className="relative flex-1 group min-w-[300px]">
+                        <Search className="absolute left-5 top-1/2 -translate-y-1/2 text-muted group-focus-within:text-accent transition-all duration-300" size={20} />
+                        <input
+                            type="text"
+                            placeholder="Interrogate tasks, locations, or operational IDs..."
+                            value={searchTerm}
+                            onChange={(e) => setSearchTerm(e.target.value)}
+                            className="w-full bg-white/5 border border-white/10 rounded-2xl py-4 pl-14 pr-6 text-sm focus:outline-none focus:border-accent/50 focus:bg-white/[0.08] italic font-medium transition-all shadow-inner"
+                        />
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-3 bg-white/[0.03] p-2 rounded-2xl border border-white/10 backdrop-blur-xl">
+                        <div className="px-4 py-1.5 flex flex-col items-center border-r border-white/10 min-w-[100px]">
+                            <p className="text-[9px] font-black text-muted uppercase tracking-widest mb-1 opacity-70">Deducted Hours</p>
+                            <p className="text-base font-black text-danger italic tracking-tighter tabular-nums flex items-center gap-1.5">
+                                <Clock size={13} className="opacity-70" /> {myApprovedLeaveHours}<span className="text-[10px] uppercase opacity-70 not-italic ml-0.5">h</span>
+                            </p>
+                        </div>
+                        <div className="px-4 py-1.5 flex flex-col items-center min-w-[100px]">
+                            <p className="text-[9px] font-black text-muted uppercase tracking-widest mb-1 opacity-70">Remaining Hours</p>
+                            <p className="text-base font-black text-success italic tracking-tighter tabular-nums flex items-center gap-1.5">
+                                <Calendar size={13} className="opacity-70" /> {remainingVacationHours}<span className="text-[10px] uppercase opacity-70 not-italic ml-0.5">h</span>
+                            </p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            {/* Tab Navigation Menu */}
+            <div className="flex items-center gap-2 overflow-x-auto pb-4 mb-4 border-b border-white/10 hide-scrollbar">
+                {[
+                    { id: 'dashboard', label: 'Command Center', icon: Smartphone },
+                    { id: 'assignments', label: 'Operational Queue', icon: ClipboardList },
+                    { id: 'map', label: 'Field Map', icon: MapIcon },
+                    { id: 'leave', label: 'Leave & Absence', icon: Calendar },
+                    { id: 'pay', label: 'Pay & Records', icon: History },
+                    { id: 'security', label: 'Security Logs', icon: Shield }
+                ].filter(tab => hasStaffTerminal || ['leave', 'pay'].includes(tab.id))
+                .map((tab) => (
+                    <button
+                        key={tab.id}
+                        onClick={() => {
+                            const newParams = new URLSearchParams(location.search);
+                            newParams.set('tab', tab.id);
+                            navigate(`${location.pathname}?${newParams.toString()}`);
+                        }}
+                        className={`flex items-center gap-2 px-6 py-3 rounded-2xl text-xs font-black uppercase tracking-widest whitespace-nowrap transition-all ${
+                            activeTab === tab.id
+                                ? 'bg-accent text-black shadow-lg shadow-accent/20'
+                                : 'bg-white/5 text-muted hover:bg-white/10 hover:text-white border border-white/10'
+                        }`}
+                    >
+                        <tab.icon size={16} />
+                        {tab.label}
+                    </button>
+                ))}
+            </div>
+
+            <AnimatePresence mode="wait">
+                {activeTab === 'dashboard' && (
+                    <motion.div
+                        key="dashboard"
+                        initial={{ opacity: 0, y: 10 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        exit={{ opacity: 0, y: -10 }}
+                        className="space-y-8"
+                    >
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                            {dashboardStats.map((stat, idx) => (
+                                <div key={idx} className="glass-card p-6 flex items-center gap-4 group hover:border-accent/30 transition-all">
+                                    <div className={`w-12 h-12 rounded-2xl bg-white/[0.03] border border-white/5 flex items-center justify-center ${stat.color} group-hover:scale-110 transition-transform`}>
+                                        <stat.icon size={24} />
+                                    </div>
+                                    <div>
+                                        <p className="text-[10px] text-secondary font-black uppercase tracking-widest mb-1">{stat.label}</p>
+                                        <p className="text-2xl font-black text-white italic font-heading tracking-tighter">{stat.value}</p>
+                                        {stat.subValue && <p className="text-[9px] text-accent mt-1 font-black uppercase tracking-widest italic">{stat.subValue}</p>}
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+
+                        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+                            <div className="lg:col-span-2 space-y-6">
+                                <div className="glass-card p-6 border-accent/10">
+                                    <h3 className="text-lg font-black text-white italic uppercase tracking-tighter mb-6 flex items-center gap-2">
+                                        <Navigation size={20} className="text-accent" /> Priority Queue
+                                    </h3>
+                                    <div className="space-y-4">
+                                        {filteredMyAssignments.filter(a => a.status !== 'Completed').map(asg => (
+                                            <TaskCard key={asg.id} asg={asg} onAction={handleStatusChange} />
+                                        ))}
+                                        {filteredMyAssignments.filter(a => a.status !== 'Completed').length === 0 && (
+                                            <div className="p-12 text-center border-2 border-dashed border-border rounded-3xl">
+                                                <CheckCircle size={48} className="text-success mx-auto mb-4 opacity-20" />
+                                                <p className="text-secondary font-bold">{searchTerm ? 'No matches found for your search.' : 'No active assignments. Check the Operational Queue.'}</p>
+                                            </div>
+                                        )}
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div className="space-y-6">
+                                <div className="glass-card p-6">
+                                    <h3 className="text-lg font-black text-white italic uppercase tracking-tighter mb-4 flex items-center gap-2">
+                                        <Shield size={18} className="text-accent" /> Security Protocol
+                                    </h3>
+                                    <div className="space-y-2">
+                                        <button
+                                            onClick={() => {
+                                                setSecurityModalType('panic');
+                                                setIsSecurityModalOpen(true);
+                                                reportSecurityEvent({ eventType: 'PANIC', location: 'GPS Broadcast Active', details: 'Immediate extraction requested.' });
+                                            }}
+                                            className="w-full py-4 bg-danger text-white rounded-xl text-xs font-black uppercase tracking-[0.2em] hover:bg-danger/80 transition-all shadow-lg shadow-danger/20 flex items-center justify-center gap-2"
+                                        >
+                                            <AlertCircle size={18} /> Emergency Panic
+                                        </button>
+                                        <button
+                                            onClick={() => {
+                                                setSecurityModalType('breach');
+                                                setIsSecurityModalOpen(true);
+                                            }}
+                                            className="w-full py-4 bg-white/5 border border-border rounded-xl text-[10px] font-black uppercase tracking-widest hover:text-white transition-all"
+                                        >
+                                            Report Security Breach
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </motion.div>
+                )}
+
+                {activeTab === 'assignments' && (
+                    <motion.div
+                        key="assignments"
+                        initial={{ opacity: 0, y: 10 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        className="space-y-6"
+                    >
+                        {/* 1. Assigned Chauffeur Missions Section */}
+                        <div className="glass-card p-6 border-accent/20">
+                            <div className="flex items-center justify-between mb-6">
+                                <h3 className="text-lg font-black text-white italic uppercase tracking-tighter flex items-center gap-2">
+                                    <Car size={20} className="text-accent" /> Assigned Chauffeur Missions
+                                </h3>
+                                {myChauffeurMissions.length > 0 && (
+                                    <span className="text-[10px] font-black uppercase tracking-wider bg-accent/20 text-accent border border-accent/30 px-3 py-1 rounded-full">
+                                        {myChauffeurMissions.length} ASSIGNED
+                                    </span>
+                                )}
+                            </div>
+                            <div className="space-y-4">
+                                {myChauffeurMissions.map(del => {
+                                    const s = String(del.status || del.chauffeur_status || '').toLowerCase().replace(/\s+/g, '_');
+                                    const isCompleted = ['delivered', 'completed'].includes(s);
+                                    const isEnRoute = ['en_route', 'in_transit'].includes(s);
+                                    const isArrived = s === 'arrived';
+                                    const canStart = ['assigned', 'accepted', 'pending', 'pending_review', 'approved'].includes(s);
+                                    return (
+                                        <div key={del.id} className={`p-5 border rounded-2xl flex flex-col md:flex-row justify-between items-start md:items-center gap-4 transition-all ${isCompleted ? 'bg-success/5 border-success/20' : 'bg-accent/5 border-accent/20 hover:border-accent/40'}`}>
+                                            <div className="flex items-center gap-4">
+                                                <div className="w-12 h-12 rounded-xl bg-accent/10 border border-accent/20 flex items-center justify-center text-accent shrink-0">
+                                                    <Car size={24} />
+                                                </div>
+                                                <div>
+                                                    <div className="flex items-center gap-2">
+                                                        <p className="text-sm font-black text-white italic tracking-tighter">VIP Chauffeur Service</p>
+                                                        <span className="text-[8px] font-black uppercase tracking-wider bg-accent/20 text-accent px-2 py-0.5 rounded-full border border-accent/30">
+                                                            Chauffeur
+                                                        </span>
+                                                    </div>
+                                                    <p className="text-[10px] font-black text-accent uppercase tracking-widest italic">{del.orderId || del.id}</p>
+                                                    {(() => {
+                                                        const rawV = String(del.vehicle || del.plateNumber || '').trim();
+                                                        const matchedV = (fleet || []).find(v => {
+                                                            if (!rawV) return false;
+                                                            const vId = String(v.id || '').trim().toLowerCase();
+                                                            const vDbId = String(v.db_id || '').trim().toLowerCase();
+                                                            const vModel = String(v.model || '').trim().toLowerCase();
+                                                            const rLower = rawV.toLowerCase();
+                                                            return rLower === vId || rLower === vDbId || rLower === vModel || rLower.includes(vId) || (vModel && rLower.includes(vModel));
+                                                        });
+                                                        const vDisplay = matchedV?.model ? `${matchedV.model} (${matchedV.id ? '#' + matchedV.id : rawV})` : rawV;
+                                                        if (!vDisplay) return null;
+                                                        return (
+                                                            <p className="text-[11px] font-bold text-white/90 mt-1 flex items-center gap-1.5">
+                                                                <span className="text-[9px] font-black text-muted uppercase">Vehicle:</span>
+                                                                <span className="text-amber-300 font-semibold">{vDisplay}</span>
+                                                            </p>
+                                                        );
+                                                    })()}
+                                                    {(del.dueDate || del.pickupTime) && (
+                                                        <p className="text-[10px] text-muted font-medium mt-0.5">
+                                                            Scheduled: <span className="text-white font-bold">{del.dueDate}</span> {del.pickupTime ? `@ ${del.pickupTime}` : ''}
+                                                        </p>
+                                                    )}
+                                                </div>
+                                            </div>
+                                            <div className="flex-1 border-l border-white/10 pl-4">
+                                                <div className="space-y-1">
+                                                    <div>
+                                                        <p className="text-[8px] font-black text-muted uppercase tracking-[0.2em]">Pickup Point</p>
+                                                        <p className="text-xs text-white font-bold italic">{del.pickupLocation || 'Pickup Point'}</p>
+                                                    </div>
+                                                    <div>
+                                                        <p className="text-[8px] font-black text-muted uppercase tracking-[0.2em]">Destination</p>
+                                                        <p className="text-xs text-secondary italic">{del.dropLocation || del.location || 'Destination'}</p>
+                                                    </div>
+                                                    {del.clientName && (
+                                                        <p className="text-[9px] text-muted">Client: <span className="text-white font-semibold">{del.clientName}</span></p>
+                                                    )}
+                                                </div>
+                                            </div>
+                                            <div className="text-right">
+                                                <p className="text-[10px] font-black text-muted uppercase tracking-widest mb-1">Est. Payment</p>
+                                                <p className="text-sm font-black text-accent italic tracking-tighter">${(parseFloat(del.delivery_fee) || 120).toFixed(2)}</p>
+                                            </div>
+                                            <div className="flex flex-wrap gap-2 justify-end">
+                                                <button
+                                                    type="button"
+                                                    onClick={() => {
+                                                        setSelectedMission(del);
+                                                        setIsMissionModalOpen(true);
+                                                    }}
+                                                    className="p-2 bg-white/5 border border-border rounded-xl text-accent hover:bg-accent/10 transition-all flex items-center gap-2 px-3"
+                                                    title="View Mission Intelligence"
+                                                >
+                                                    <FileText size={16} />
+                                                    <span className="text-[9px] font-black uppercase tracking-widest">View Intel</span>
+                                                </button>
+
+                                                <StatusBadge status={del.status || del.chauffeur_status} />
+
+                                                {(() => {
+                                                    if (canStart) {
+                                                        return (
+                                                            <>
+                                                                <button
+                                                                    type="button"
+                                                                    onClick={() => handleStartTrip(del)}
+                                                                    className="btn-primary py-2 px-4 text-[10px]"
+                                                                >
+                                                                    Start trip
+                                                                </button>
+                                                                <button
+                                                                    type="button"
+                                                                    onClick={() => handleRejectMission(del)}
+                                                                    className="py-2 px-4 rounded-xl text-[10px] font-black uppercase tracking-widest border border-danger/40 text-danger hover:bg-danger/10"
+                                                                >
+                                                                    Decline
+                                                                </button>
+                                                            </>
+                                                        );
+                                                    }
+                                                    if (isEnRoute) {
+                                                        return (
+                                                            <button
+                                                                type="button"
+                                                                onClick={() => handleArriveTrip(del)}
+                                                                className="bg-amber-500 hover:bg-amber-600 text-black py-2 px-4 rounded-xl text-[10px] font-black uppercase tracking-widest hover:scale-105 transition-all shadow-md shadow-amber-500/20"
+                                                            >
+                                                                Arrived
+                                                            </button>
+                                                        );
+                                                    }
+                                                    if (isArrived) {
+                                                        return (
+                                                            <button
+                                                                type="button"
+                                                                onClick={() => handleCompleteMission(del)}
+                                                                className="bg-success text-white py-2 px-4 rounded-xl text-[10px] font-black uppercase tracking-widest hover:scale-105 transition-all shadow-md shadow-success/20"
+                                                            >
+                                                                Mark complete
+                                                            </button>
+                                                        );
+                                                    }
+                                                    return null;
+                                                })()}
+                                            </div>
+                                        </div>
+                                    );
+                                })}
+                                {myChauffeurMissions.length === 0 && (
+                                    <p className="text-center py-6 text-secondary italic border border-dashed border-border rounded-2xl">No chauffeur missions currently assigned to you.</p>
+                                )}
+                            </div>
+                        </div>
+
+                        {/* 2. Assigned Vehicle Dispatches */}
+                        <div className="glass-card p-6">
+                            <h3 className="text-lg font-black text-white italic uppercase tracking-tighter mb-6 flex items-center gap-2">
+                                <Truck size={20} className="text-accent" /> Assigned Vehicle Dispatches
+                            </h3>
+                            <div className="space-y-4">
+                                {myDeliveries.map(del => (
+                                    <div key={del.id} className="p-5 bg-accent/5 border border-accent/20 rounded-2xl flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+                                        <div className="flex items-center gap-4">
+                                            <div className="w-12 h-12 rounded-xl bg-white/5 border border-white/10 flex items-center justify-center text-accent">
+                                                <Truck size={24} />
+                                            </div>
+                                            <div>
+                                                <p className="text-sm font-black text-white italic tracking-tighter">{del.vehicle || 'Institutional Asset'}</p>
+                                                <p className="text-[10px] font-black text-accent uppercase tracking-widest italic">{del.orderId || 'MISSION-ALPHA'}</p>
+                                            </div>
+                                        </div>
+                                        <div className="flex-1 border-l border-white/10 pl-4">
+                                            <p className="text-[8px] font-black text-muted uppercase tracking-[0.2em] mb-1">Manifest</p>
+                                            <p className="text-xs text-secondary italic">
+                                                {del.items ? del.items.map(i => i.name).join(', ') : (del.item || (currentUser?.name || 'User').split(' ').map(n => n[0]).join('').toUpperCase().slice(0, 2))}
+                                            </p>
+                                        </div>
+                                        <div className="text-right">
+                                            <p className="text-[10px] font-black text-muted uppercase tracking-widest mb-1">Destination</p>
+                                            <p className="text-sm font-black text-white italic tracking-tighter">{del.location || 'Client Hub'}</p>
+                                        </div>
+                                        <div className="flex flex-wrap gap-2 justify-end">
+                                            <button
+                                                type="button"
+                                                onClick={() => {
+                                                    setSelectedMission(del);
+                                                    setIsMissionModalOpen(true);
+                                                }}
+                                                className="p-2 bg-white/5 border border-border rounded-xl text-accent hover:bg-accent/10 transition-all flex items-center gap-2 px-3"
+                                                title="View Mission Intelligence"
+                                            >
+                                                <FileText size={16} />
+                                                <span className="text-[9px] font-black uppercase tracking-widest">View Intel</span>
+                                            </button>
+                                            
+                                            <StatusBadge status={del.status} />
+                                            {(() => {
+                                                const s = String(del.status || '').toLowerCase().replace(/\s+/g, '_');
+                                                const mine = isUserDriverMatch(del) || String(del.driverId) === String(currentUser?.id) || del.driver === currentUser?.name;
+                                                const open = ['pending', 'pending_pickup', 'pending_review', ''].includes(s);
+
+                                                if (open) {
+                                                    return (
+                                                        <>
+                                                            <button
+                                                                type="button"
+                                                                onClick={() => handleAcceptMission(del)}
+                                                                className="btn-primary py-2 px-4 text-[10px]"
+                                                            >
+                                                                Accept
+                                                            </button>
+                                                            <button
+                                                                type="button"
+                                                                onClick={() => handleRejectMission(del)}
+                                                                className="py-2 px-4 rounded-xl text-[10px] font-black uppercase tracking-widest border border-danger/40 text-danger hover:bg-danger/10"
+                                                            >
+                                                                Decline
+                                                            </button>
+                                                        </>
+                                                    );
+                                                }
+                                                if (s === 'assigned' && mine) {
+                                                    return (
+                                                        <>
+                                                            <button
+                                                                type="button"
+                                                                onClick={() => handleStartTrip(del)}
+                                                                className="btn-primary py-2 px-4 text-[10px]"
+                                                            >
+                                                                Start trip
+                                                            </button>
+                                                            <button
+                                                                type="button"
+                                                                onClick={() => handleRejectMission(del)}
+                                                                className="py-2 px-4 rounded-xl text-[10px] font-black uppercase tracking-widest border border-danger/40 text-danger hover:bg-danger/10"
+                                                            >
+                                                                Decline
+                                                            </button>
+                                                        </>
+                                                    );
+                                                }
+                                                if ((s === 'en_route' || s === 'in_transit') && mine) {
+                                                    return (
+                                                        <button
+                                                            type="button"
+                                                            onClick={() => handleCompleteMission(del)}
+                                                            className="bg-success text-white py-2 px-4 rounded-xl text-[10px] font-black uppercase tracking-widest hover:scale-105 transition-all"
+                                                        >
+                                                            Mark delivered
+                                                        </button>
+                                                    );
+                                                }
+                                                return null;
+                                            })()}
+                                        </div>
+                                    </div>
+                                ))}
+                                {myDeliveries.length === 0 && (
+                                    <p className="text-center py-6 text-secondary italic border border-dashed border-border rounded-2xl">No active vehicle dispatches assigned.</p>
+                                )}
+                            </div>
+                        </div>
+
+                        {/* 3. My Active Tasks */}
+                        <div className="glass-card p-6">
+                            <h3 className="text-lg font-black text-white italic uppercase tracking-tighter mb-6 flex items-center gap-2">
+                                <ClipboardList size={20} className="text-accent" /> My Active Tasks
+                            </h3>
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                {filteredMyAssignments.filter(a => String(a.status || '').toLowerCase() !== 'completed').map(asg => (
+                                    <TaskCard key={asg.id} asg={asg} onAction={handleStatusChange} />
+                                ))}
+                                {filteredMyAssignments.filter(a => String(a.status || '').toLowerCase() !== 'completed').length === 0 && (
+                                    <p className="col-span-2 text-center py-6 text-secondary italic border border-dashed border-border rounded-2xl">No active operational tasks assigned.</p>
+                                )}
+                            </div>
+                        </div>
+
+                        {/* 4. Open Delivery Queue */}
+                        <div className="glass-card p-6">
+                            <h3 className="text-lg font-black text-white italic uppercase tracking-tighter mb-6">Open Delivery Queue</h3>
+                            <div className="space-y-4 mb-8">
+                                {openDeliveryQueue.map(del => (
+                                    <div key={del.id} className="p-6 bg-warning/[0.03] border border-warning/20 rounded-3xl space-y-6 relative overflow-hidden group hover:border-warning/40 transition-all">
+                                        <div className="absolute top-0 right-0 p-4">
+                                            <div className="px-3 py-1 bg-warning/20 rounded-full">
+                                                <p className="text-[10px] font-black text-warning uppercase tracking-widest italic">EST. EARNING: {parseFloat(del.delivery_fee) > 0 ? `$${parseFloat(del.delivery_fee).toFixed(2)}` : 'Pending Setup'}{del.route_distance ? ` (${del.route_distance} km)` : ''}</p>
+                                            </div>
+                                        </div>
+
+                                        <div className="flex items-center gap-4">
+                                            <div className="w-14 h-14 rounded-2xl bg-warning/10 flex items-center justify-center text-warning shadow-inner">
+                                                <Truck size={28} />
+                                            </div>
+                                            <div>
+                                                <p className="text-lg font-black text-white italic tracking-tighter">{del.mission_type || 'Delivery Mission'}</p>
+                                                <p className="text-[10px] font-black text-warning uppercase tracking-[0.2em] opacity-80">ID: {del.orderId || del.id}</p>
+                                            </div>
+                                        </div>
+
+                                        <div className="grid grid-cols-1 md:grid-cols-2 gap-6 bg-white/[0.02] p-4 rounded-2xl border border-white/5">
+                                            <div className="space-y-4">
+                                                <div className="flex items-start gap-3">
+                                                    <div className="w-6 h-6 rounded-full bg-success/20 flex items-center justify-center shrink-0 mt-1">
+                                                        <div className="w-2 h-2 rounded-full bg-success animate-pulse" />
+                                                    </div>
+                                                    <div>
+                                                        <p className="text-[9px] font-black text-muted uppercase tracking-widest">Pickup Point</p>
+                                                        <p className="text-sm font-bold text-white italic">{del.pickup_location || del.pickupLocation || 'Main Hub'}</p>
+                                                    </div>
+                                                </div>
+                                                <div className="flex items-start gap-3">
+                                                    <div className="w-6 h-6 rounded-full bg-accent/20 flex items-center justify-center shrink-0 mt-1">
+                                                        <MapPin size={12} className="text-accent" />
+                                                    </div>
+                                                    <div>
+                                                        <p className="text-[9px] font-black text-muted uppercase tracking-widest">Destination</p>
+                                                        <p className="text-sm font-bold text-white italic">{del.drop_location || del.dropLocation || del.location || 'Client Site'}</p>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                            <div className="space-y-4 border-l border-white/5 pl-6">
+                                                <div>
+                                                    <p className="text-[9px] font-black text-muted uppercase tracking-widest">Package Intelligence</p>
+                                                    <p className="text-xs text-secondary italic leading-relaxed">
+                                                        {(() => {
+                                                            const raw = del.package_details || del.item || 'Standard Logistic Unit';
+                                                            if (typeof raw === 'string' && raw.startsWith('[')) {
+                                                                try {
+                                                                    const parsed = JSON.parse(raw);
+                                                                    if (Array.isArray(parsed) && parsed.length > 0) {
+                                                                        return parsed.map(p => `${p.name || 'Item'} (x${p.qty || 1})`).join(', ');
+                                                                    }
+                                                                } catch (e) {}
+                                                            }
+                                                            return raw;
+                                                        })()}
+                                                    </p>
+                                                </div>
+                                                <div className="flex items-center gap-4">
+                                                    <div>
+                                                        <p className="text-[9px] font-black text-muted uppercase tracking-widest">Distance</p>
+                                                        <p className="text-xs font-bold text-white">~{del.route_distance || '12.4'} KM</p>
+                                                    </div>
+                                                    <div>
+                                                        <p className="text-[9px] font-black text-muted uppercase tracking-widest">Priority</p>
+                                                        <span className="text-[9px] font-black text-warning uppercase">Standard</span>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </div>
+
+                                        <div className="flex flex-col sm:flex-row gap-3">
+                                            <button
+                                                type="button"
+                                                onClick={() => {
+                                                    setSelectedMission(del);
+                                                    setIsMissionModalOpen(true);
+                                                }}
+                                                className="flex-1 py-4 bg-white/5 border border-white/10 text-accent rounded-2xl text-[10px] font-black uppercase tracking-widest hover:bg-accent/10 transition-all flex items-center justify-center gap-2"
+                                            >
+                                                <FileText size={16} /> View Intel
+                                            </button>
+                                            <button
+                                                type="button"
+                                                onClick={() => handleAcceptMission(del)}
+                                                className="flex-[1.5] py-4 bg-accent text-black rounded-2xl text-[10px] font-black uppercase tracking-widest hover:scale-[1.02] active:scale-95 transition-all shadow-xl shadow-accent/20 flex items-center justify-center gap-2"
+                                            >
+                                                <Check size={18} /> Accept Mission
+                                            </button>
+                                            <button
+                                                type="button"
+                                                onClick={() => handleRejectMission(del)}
+                                                className="flex-1 py-4 bg-white/5 border border-white/10 text-secondary rounded-2xl text-[10px] font-black uppercase tracking-widest hover:bg-white/10 transition-all flex items-center justify-center gap-2"
+                                            >
+                                                <X size={16} /> Reject
+                                            </button>
+                                        </div>
+                                    </div>
+                                ))}
+                                {openDeliveryQueue.length === 0 && (
+                                    <p className="text-center py-6 text-secondary italic border border-dashed border-border rounded-2xl">No open delivery missions in queue.</p>
+                                )}
+                            </div>
+                        </div>
+
+                        {/* 5. Operational Assignment Queue */}
+                        <div className="glass-card p-6">
+                            <h3 className="text-lg font-black text-white italic uppercase tracking-tighter mb-6">Operational Assignment Queue</h3>
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                {filteredPendingAssignments.map(asg => (
+                                    <TaskCard key={asg.id} asg={asg} onAction={handleStatusChange} />
+                                ))}
+                                {filteredPendingAssignments.length === 0 && (
+                                    <p className="col-span-2 text-center py-6 text-secondary italic border border-dashed border-border rounded-2xl">No matching pending assignments.</p>
+                                )}
+                            </div>
+                        </div>
+                    </motion.div>
+                )}
+
+
+                {activeTab === 'pay' && (
+                    <motion.div
+                        key="pay"
+                        initial={{ opacity: 0, y: 10 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        className="max-w-4xl mx-auto space-y-6"
+                    >
+                        {(() => {
+                            const heldDeliveries = myDeliveries.filter(d => d.payout_status === 'held');
+                            const pendingTotal = heldDeliveries.reduce((acc, d) => acc + (parseFloat(d.delivery_fee) || 0), 0);
+                            const releasedTotal = myDeliveries
+                                .filter(d => d.payout_status === 'released')
+                                .reduce((acc, d) => acc + (parseFloat(d.delivery_fee) || 0), 0);
+
+                            return (
+                                <>
+                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                                        <div className="glass-card p-8 text-center bg-gradient-to-br from-white/[0.05] to-transparent border-accent/20">
+                                            <p className="text-[10px] font-black text-muted uppercase tracking-[0.3em] mb-2">Total Earnings YTD</p>
+                                            <h2 className="text-4xl font-black text-white italic tracking-tighter">${(totalYTD + releasedTotal).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</h2>
+                                            <p className="text-[10px] font-black text-success uppercase mt-2 tracking-widest">Released & Paid</p>
+                                        </div>
+                                        <div className="glass-card p-8 text-center bg-gradient-to-br from-warning/[0.05] to-transparent border-warning/20">
+                                            <p className="text-[10px] font-black text-muted uppercase tracking-[0.3em] mb-2">Earnings on Hold (48h)</p>
+                                            <h2 className="text-4xl font-black text-warning italic tracking-tighter">${pendingTotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</h2>
+                                            <p className="text-[10px] font-black text-secondary uppercase mt-2 tracking-widest">Security Clearance Pending</p>
+                                        </div>
+                                    </div>
+
+                                    <div className="glass-card p-6 border-accent/10">
+                                        <h3 className="text-lg font-black text-white italic uppercase tracking-tighter mb-6 flex items-center gap-2">
+                                            <Clock size={20} className="text-warning" /> Pending Payout Queue
+                                        </h3>
+                                        <div className="space-y-3">
+                                            {heldDeliveries.length > 0 ? heldDeliveries.map(del => {
+                                                const readyAt = new Date(del.payout_ready_at);
+                                                const now = new Date();
+                                                const diff = readyAt - now;
+                                                const hours = Math.max(0, Math.floor(diff / (1000 * 60 * 60)));
+                                                const minutes = Math.max(0, Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60)));
+                                                
+                                                return (
+                                                    <div key={del.id} className="p-4 bg-white/[0.02] border border-border rounded-2xl flex justify-between items-center group">
+                                                        <div className="flex items-center gap-4">
+                                                            <div className="w-10 h-10 rounded-xl bg-warning/10 flex items-center justify-center text-warning">
+                                                                <Truck size={18} />
+                                                            </div>
+                                                            <div>
+                                                                <p className="text-sm font-bold text-white">Mission #{del.id}</p>
+                                                                <p className="text-[9px] text-muted uppercase font-black">{del.dropLocation || 'Delivered'}</p>
+                                                            </div>
+                                                        </div>
+                                                        <div className="flex items-center gap-6">
+                                                            <div className="text-right">
+                                                                <p className="text-[9px] font-black text-muted uppercase tracking-widest mb-0.5">Countdown</p>
+                                                                <p className="text-sm font-black text-accent tabular-nums">
+                                                                    {hours}h {minutes}m
+                                                                </p>
+                                                            </div>
+                                                            <div className="text-right border-l border-white/10 pl-6">
+                                                                <p className="text-sm font-black text-white">${parseFloat(del.delivery_fee || 0).toFixed(2)}</p>
+                                                                <span className="text-[8px] font-black text-warning uppercase tracking-widest">Held</span>
+                                                            </div>
+                                                        </div>
+                                                    </div>
+                                                );
+                                            }) : (
+                                                <div className="p-8 text-center border-2 border-dashed border-border rounded-3xl opacity-50">
+                                                    <CheckCircle2 size={32} className="mx-auto mb-2 text-success" />
+                                                    <p className="text-xs font-bold text-secondary uppercase tracking-widest">No payments currently on hold</p>
+                                                </div>
+                                            )}
+                                        </div>
+                                    </div>
+                                </>
+                            );
+                        })()}
+
+                        <div className="glass-card p-6 border-accent/10">
+                            <h3 className="text-xl font-bold mb-6 flex items-center gap-2 text-accent">
+                                <Shield size={20} /> Registered Settlement Protocol
+                            </h3>
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-6 bg-white/[0.03] p-6 rounded-2xl border border-border">
+                                <div>
+                                    <p className="text-[10px] font-black text-muted uppercase tracking-widest mb-1">Financial Institution</p>
+                                    <p className="text-lg font-bold text-white">{currentUser?.bankingInfo?.bank || 'Vaulted Bank'}</p>
+                                </div>
+                                <div>
+                                    <p className="text-[10px] font-black text-muted uppercase tracking-widest mb-1">Account Identifier</p>
+                                    <p className="text-lg font-bold text-white tracking-widest">{currentUser?.bankingInfo?.account || '**** 0000'}</p>
+                                </div>
+                                <div className="md:col-span-2 pt-4 border-t border-white/5">
+                                    <p className="text-xs text-secondary italic">Payments are processed automatically via bespoke institutional wire transfer every Friday after the 48-hour security hold period.</p>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div className="glass-card p-6">
+                            <h3 className="text-xl font-bold mb-6">Payment History</h3>
+                            <div className="space-y-3">
+                                {myPayHistory.map(pay => (
+                                    <div key={pay.id} className="p-4 bg-white/[0.02] border border-border rounded-2xl flex justify-between items-center group hover:border-accent/30 transition-all">
+                                        <div className="flex items-center gap-4">
+                                            <div className="w-10 h-10 rounded-full bg-white/5 flex items-center justify-center text-secondary">
+                                                <FileText size={18} />
+                                            </div>
+                                            <div>
+                                                <p className="text-sm font-bold text-white">{pay.period}</p>
+                                                <p className="text-[10px] text-muted uppercase font-bold">{pay.date} • {pay.hours} Hours</p>
+                                            </div>
+                                        </div>
+                                        <div className="text-right">
+                                            <p className="text-lg font-black text-white">{pay.total}</p>
+                                            <span className="text-[9px] font-black text-success uppercase tracking-widest">{pay.status}</span>
+                                        </div>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    </motion.div>
+                )}
+
+                {activeTab === 'security' && (
+                    <motion.div
+                        key="security"
+                        initial={{ opacity: 0, y: 10 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        className="space-y-6"
+                    >
+                        <div className="glass-card p-6">
+                            <h3 className="text-lg font-black text-white italic uppercase tracking-tighter mb-6 flex items-center gap-2">
+                                <Shield className="text-accent" size={24} /> My Security Logs
+                            </h3>
+                            
+                            <div className="space-y-4">
+                                {securityEvents?.length === 0 ? (
+                                    <div className="text-center py-12 bg-white/5 rounded-2xl border border-white/10 border-dashed">
+                                        <Shield className="text-muted mx-auto mb-4" size={48} />
+                                        <p className="text-muted font-black italic uppercase tracking-widest text-sm">No Security Events Logged</p>
+                                        <p className="text-[10px] text-muted/70 mt-2 font-medium">No panic or breach events have been reported.</p>
+                                    </div>
+                                ) : (
+                                    securityEvents?.map(event => (
+                                        <div key={event.id} className="bg-background border border-white/10 rounded-2xl p-5 hover:border-accent/30 transition-all flex items-start justify-between gap-4 group">
+                                            <div>
+                                                <div className="flex items-center gap-3 mb-2">
+                                                    <span className={`px-2 py-0.5 rounded-full text-[9px] font-black uppercase tracking-widest ${
+                                                        event.eventType === 'PANIC' ? 'bg-danger/20 text-danger' : 'bg-warning/20 text-warning'
+                                                    }`}>
+                                                        {event.eventType}
+                                                    </span>
+                                                    <p className="text-[10px] font-bold text-muted uppercase tracking-widest">{new Date(event.createdAt).toLocaleString()}</p>
+                                                </div>
+                                                <h4 className="text-white font-bold mb-1">{event.location || 'Unknown Location'}</h4>
+                                                <p className="text-sm text-secondary">{event.details}</p>
+                                            </div>
+                                            <div className="flex items-center shrink-0">
+                                                <span className={`px-3 py-1.5 rounded-full text-[10px] font-black uppercase tracking-widest border ${
+                                                    event.status === 'Resolved' 
+                                                        ? 'bg-success/10 text-success border-success/20' 
+                                                        : 'bg-danger/10 text-danger border-danger/20 animate-pulse'
+                                                }`}>
+                                                    {event.status}
+                                                </span>
+                                            </div>
+                                        </div>
+                                    ))
+                                )}
+                            </div>
+                        </div>
+                    </motion.div>
+                )}
+
+                {activeTab === 'map' && (
+                    <motion.div
+                        key="map"
+                        initial={{ opacity: 0, y: 10 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        className="space-y-6"
+                    >
+                        <div className="glass-card p-6 border-accent/10">
+                            <div className="flex items-center justify-between mb-6">
+                                <h3 className="text-lg font-black text-white italic uppercase tracking-tighter flex items-center gap-2">
+                                    <MapIcon className="text-accent" size={24} /> Tactical Field Map
+                                </h3>
+                                <div className="flex items-center gap-3 px-4 py-2 bg-success/5 border border-success/20 rounded-xl">
+                                    <div className="w-2 h-2 rounded-full bg-success animate-pulse"></div>
+                                    <span className="text-[10px] font-black text-success uppercase tracking-[0.2em]">GPS Active</span>
+                                </div>
+                            </div>
+                            
+                            <div className="relative w-full h-[500px] md:h-[600px] bg-[#050505] rounded-3xl overflow-hidden border border-white/10 flex items-center justify-center">
+                                {/* Map Background Grid Simulation */}
+                                <div className="absolute inset-0 bg-[linear-gradient(to_right,#ffffff05_1px,transparent_1px),linear-gradient(to_bottom,#ffffff05_1px,transparent_1px)] bg-[size:40px_40px]"></div>
+                                <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,transparent_0%,#050505_100%)]"></div>
+
+                                {/* Simulated Staff Location Marker */}
+                                <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-20 flex flex-col items-center">
+                                    <div className="px-3 py-1.5 bg-black/60 backdrop-blur-md border border-accent/30 rounded-xl mb-3 shadow-[0_4px_20px_rgba(0,0,0,0.5)]">
+                                        <p className="text-[10px] font-black text-accent uppercase tracking-[0.2em]">{currentUser?.name || 'My Unit'}</p>
+                                    </div>
+                                    <div className="relative flex items-center justify-center">
+                                        <div className="absolute w-16 h-16 bg-accent/20 rounded-full animate-ping"></div>
+                                        <div className="w-8 h-8 bg-accent border-2 border-[#050505] rounded-full flex items-center justify-center relative z-10 shadow-[0_0_20px_rgba(200,169,106,0.6)]">
+                                            <Navigation size={14} className="text-[#050505] fill-current" />
+                                        </div>
+                                    </div>
+                                </div>
+
+                                {/* Simulated Route / Waypoint */}
+                                {filteredMyAssignments.filter(a => a.status !== 'Completed').map((asg, idx) => {
+                                    const positions = [
+                                        { top: '25%', left: '30%' },
+                                        { top: '70%', left: '60%' },
+                                        { top: '30%', left: '70%' },
+                                        { top: '65%', left: '25%' },
+                                        { top: '40%', left: '80%' },
+                                    ];
+                                    const pos = positions[idx % positions.length];
+                                    return (
+                                        <div key={`asg-${asg.id}`} className="absolute z-10 group" style={pos}>
+                                            <div className="absolute left-1/2 bottom-full mb-3 -translate-x-1/2 opacity-0 group-hover:opacity-100 transition-all whitespace-nowrap bg-black/80 backdrop-blur-md border border-white/10 px-4 py-3 rounded-2xl pointer-events-none z-30 shadow-2xl">
+                                                <p className="text-[10px] font-black text-info uppercase tracking-widest mb-1">Task: {asg.id}</p>
+                                                <p className="text-sm font-bold text-white italic">{asg.task}</p>
+                                                <p className="text-xs text-secondary mt-1"><MapPin size={12} className="inline mr-1" />{asg.location}</p>
+                                            </div>
+                                            <div className="w-10 h-10 rounded-full bg-info/20 border border-info/50 flex items-center justify-center shadow-[0_0_15px_rgba(56,189,248,0.3)] cursor-pointer hover:scale-110 hover:bg-info/30 transition-all relative z-20">
+                                                <ClipboardList size={18} className="text-info" />
+                                            </div>
+                                        </div>
+                                    );
+                                })}
+
+                                {myDeliveries.filter(d => !['delivered', 'completed', 'cancelled'].includes(String(d.status || '').toLowerCase().replace(/\s+/g, '_'))).map((del, idx) => {
+                                    const positions = [
+                                        { top: '35%', left: '65%' },
+                                        { top: '75%', left: '35%' },
+                                        { top: '20%', left: '45%' },
+                                        { top: '60%', left: '80%' },
+                                        { top: '80%', left: '70%' },
+                                    ];
+                                    const pos = positions[idx % positions.length];
+                                    return (
+                                        <div key={`del-${del.id}`} className="absolute z-10 group" style={pos}>
+                                            <div className="absolute left-1/2 bottom-full mb-3 -translate-x-1/2 opacity-0 group-hover:opacity-100 transition-all whitespace-nowrap bg-black/80 backdrop-blur-md border border-white/10 px-4 py-3 rounded-2xl pointer-events-none z-30 shadow-2xl">
+                                                <p className="text-[10px] font-black text-warning uppercase tracking-widest mb-1">Dispatch: {del.orderId || del.id}</p>
+                                                <p className="text-sm font-bold text-white italic">{del.dropLocation || del.location || 'Destination'}</p>
+                                            </div>
+                                            <div className="w-10 h-10 rounded-full bg-warning/20 border border-warning/50 flex items-center justify-center shadow-[0_0_15px_rgba(234,179,8,0.3)] cursor-pointer hover:scale-110 hover:bg-warning/30 transition-all relative z-20">
+                                                <Truck size={18} className="text-warning" />
+                                            </div>
+                                        </div>
+                                    );
+                                })}
+                            </div>
+
+                            <div className="mt-6">
+                                <h4 className="text-[10px] font-black uppercase tracking-widest text-muted mb-4">Active Waypoints</h4>
+                                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                                    {filteredMyAssignments.filter(a => a.status !== 'Completed').map(asg => (
+                                        <div key={`list-asg-${asg.id}`} className="p-4 bg-white/[0.02] border border-white/5 rounded-2xl flex items-start gap-4 hover:border-info/30 transition-all group cursor-pointer" onClick={() => handleStatusChange(asg, 'view_details')}>
+                                            <div className="w-10 h-10 rounded-xl bg-info/10 flex items-center justify-center shrink-0 group-hover:scale-110 transition-transform">
+                                                <ClipboardList size={18} className="text-info" />
+                                            </div>
+                                            <div className="min-w-0">
+                                                <p className="text-[10px] font-black text-info uppercase tracking-widest truncate">{asg.id}</p>
+                                                <p className="text-sm font-bold text-white truncate">{asg.task}</p>
+                                                <p className="text-[10px] text-secondary mt-1 flex items-center gap-1 truncate"><MapPin size={10} className="inline" /> {asg.location}</p>
+                                            </div>
+                                        </div>
+                                    ))}
+                                    {myDeliveries.filter(d => !['delivered', 'completed', 'cancelled'].includes(String(d.status || '').toLowerCase().replace(/\s+/g, '_'))).map(del => (
+                                        <div key={`list-del-${del.id}`} className="p-4 bg-white/[0.02] border border-white/5 rounded-2xl flex items-start gap-4 hover:border-warning/30 transition-all group cursor-pointer" onClick={() => { setSelectedMission(del); setIsMissionModalOpen(true); }}>
+                                            <div className="w-10 h-10 rounded-xl bg-warning/10 flex items-center justify-center shrink-0 group-hover:scale-110 transition-transform">
+                                                <Truck size={18} className="text-warning" />
+                                            </div>
+                                            <div className="min-w-0">
+                                                <p className="text-[10px] font-black text-warning uppercase tracking-widest truncate">{del.orderId || del.id}</p>
+                                                <p className="text-sm font-bold text-white truncate">{del.dropLocation || del.location || 'Destination Point'}</p>
+                                                <p className="text-[10px] text-secondary mt-1 truncate">{del.route_distance ? `${del.route_distance} km away` : 'Calculating ETA...'}</p>
+                                            </div>
+                                        </div>
+                                    ))}
+                                    {filteredMyAssignments.filter(a => a.status !== 'Completed').length === 0 && myDeliveries.filter(d => !['delivered', 'completed', 'cancelled'].includes(String(d.status || '').toLowerCase().replace(/\s+/g, '_'))).length === 0 && (
+                                        <p className="text-sm text-secondary italic col-span-full">No active waypoints on radar.</p>
+                                    )}
+                                </div>
+                            </div>
+                        </div>
+                    </motion.div>
+                )}
+
+                {activeTab === 'leave' && (
+                    <motion.div
+                        key="leave"
+                        initial={{ opacity: 0, y: 10 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        className="space-y-6 max-w-4xl mx-auto"
+                    >
+                        <div className="flex justify-between items-center mb-6">
+                            <h3 className="text-2xl font-bold">Leave & Absence Records</h3>
+                            {(hasMenuPermission('Leave & Absence', 'can_add') || ['operations', 'procurement', 'logistics', 'inventory', 'concierge', 'staff'].includes(userRole)) && (
+                                <button
+                                    onClick={() => {
+                                        setEditingLeaveRequest(null);
+                                        setLeaveFormData({ type: 'Vacation', duration: 'Full Day', hours: 8, start: '', end: '', reason: '' });
+                                        setIsLeaveModalOpen(true);
+                                    }}
+                                    className="btn-primary flex items-center gap-2"
+                                >
+                                    <Plus size={16} /> Request Absence
+                                </button>
+                            )}
+                        </div>
+
+                        {/* Dedicated Quota & Balance Overview Bar */}
+                        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                            <div className="p-4 bg-white/[0.03] border border-white/10 rounded-2xl flex flex-col items-center text-center">
+                                <p className="text-[9px] font-black text-muted uppercase tracking-widest mb-1">Dedicated Quota</p>
+                                <p className="text-2xl font-black text-white italic font-heading tracking-tight flex items-center gap-1">
+                                    {dedicatedVacationHours} <span className="text-xs not-italic text-secondary font-bold">hrs</span>
+                                </p>
+                            </div>
+                            <div className="p-4 bg-white/[0.03] border border-white/10 rounded-2xl flex flex-col items-center text-center">
+                                <p className="text-[9px] font-black text-muted uppercase tracking-widest mb-1">Approved Deductions</p>
+                                <p className="text-2xl font-black text-danger italic font-heading tracking-tight flex items-center gap-1">
+                                    <Clock size={16} className="opacity-70" /> {myApprovedLeaveHours} <span className="text-xs not-italic opacity-70 font-bold">hrs</span>
+                                </p>
+                            </div>
+                            <div className="p-4 bg-white/[0.03] border border-white/10 rounded-2xl flex flex-col items-center text-center">
+                                <p className="text-[9px] font-black text-muted uppercase tracking-widest mb-1">Available Remaining</p>
+                                <p className="text-2xl font-black text-success italic font-heading tracking-tight flex items-center gap-1">
+                                    <Calendar size={16} className="opacity-70" /> {remainingVacationHours} <span className="text-xs not-italic opacity-70 font-bold">hrs</span>
+                                </p>
+                            </div>
+                        </div>
+
+                        <div className="glass-card p-6">
+                            <h4 className="text-sm font-black uppercase tracking-widest text-muted mb-6">My Request History</h4>
+                            <div className="space-y-4">
+                                {leaveRequests.filter(isMatchingUserLeave).map(req => (
+                                    <div key={req.id} className="p-4 bg-white/[0.02] border border-border rounded-2xl flex justify-between items-center group hover:border-accent/30 transition-all">
+                                        <div className="flex items-center gap-4">
+                                            <div className={`w-10 h-10 rounded-xl flex items-center justify-center ${req.status === 'Approved' ? 'bg-success/10 text-success' :
+                                                req.status === 'Rejected' ? 'bg-danger/10 text-danger' :
+                                                    'bg-accent/10 text-accent'
+                                                }`}>
+                                                <Calendar size={18} />
+                                            </div>
+                                            <div>
+                                                <div className="flex items-center gap-2">
+                                                    <p className="text-sm font-bold text-white">{req.type} Protocol</p>
+                                                    {(() => {
+                                                        let calcH = req.hours;
+                                                        if (req.start && req.end) {
+                                                            const s = new Date(req.start);
+                                                            const e = new Date(req.end);
+                                                            const diffDays = Math.max(1, Math.floor(Math.abs(e - s) / (1000 * 60 * 60 * 24)) + 1);
+                                                            calcH = diffDays * 24;
+                                                        }
+                                                        return <span className="text-[10px] bg-white/5 px-2 py-0.5 rounded font-black text-accent">{calcH || 24}h Duration</span>;
+                                                    })()}
+                                                </div>
+                                                <p className="text-[10px] text-muted uppercase font-bold">{req.start} to {req.end}</p>
+                                            </div>
+                                        </div>
+                                        <div className="flex items-center gap-6">
+                                            <div className="text-right hidden sm:block">
+                                                <p className="text-[10px] text-muted font-bold uppercase">Decision Status</p>
+                                                <p className={`text-xs font-bold ${req.status === 'Approved' ? 'text-success' :
+                                                    req.status === 'Rejected' ? 'text-danger' :
+                                                        'text-accent'
+                                                    }`}>
+                                                    {req.status || 'Pending Review'}
+                                                </p>
+                                            </div>
+                                            <StatusBadge status={req.status} />
+                                            {(!req.status || req.status === 'Pending' || req.status === 'Pending Review' || req.status.toLowerCase() === 'pending') && (
+                                                <div className="flex items-center gap-2">
+                                                    <button
+                                                        onClick={() => {
+                                                            setEditingLeaveRequest(req);
+                                                            setLeaveFormData({
+                                                                type: req.type || 'Vacation',
+                                                                duration: req.hours === 4 ? 'Half Day' : 'Full Day',
+                                                                hours: req.hours || 8,
+                                                                start: req.start || '',
+                                                                end: req.end || '',
+                                                                reason: req.reason || ''
+                                                            });
+                                                            setIsLeaveModalOpen(true);
+                                                        }}
+                                                        className="p-2 bg-white/5 border border-border rounded-xl text-accent hover:bg-accent/10 transition-all"
+                                                        title="Edit Leave Request"
+                                                    >
+                                                        <Edit2 size={14} />
+                                                    </button>
+                                                    <button
+                                                        onClick={() => {
+                                                            swalConfirm(
+                                                                'Delete Request',
+                                                                'Are you sure you want to delete this leave request?'
+                                                            ).then(async (result) => {
+                                                                if (result.isConfirmed) {
+                                                                    try {
+                                                                        await deleteLeaveRequest(req.id);
+                                                                        swalSuccess('Deleted', 'Leave request has been successfully deleted.');
+                                                                    } catch (err) {
+                                                                        swalError('Error', err.message || 'Could not delete request.');
+                                                                    }
+                                                                }
+                                                            });
+                                                        }}
+                                                        className="p-2 bg-white/5 border border-danger/40 text-danger hover:bg-danger/10 rounded-xl transition-all"
+                                                        title="Delete Leave Request"
+                                                    >
+                                                        <Trash2 size={14} />
+                                                    </button>
+                                                </div>
+                                            )}
+                                        </div>
+                                    </div>
+                                ))}
+                                {leaveRequests.filter(isMatchingUserLeave).length === 0 && (
+                                    <p className="text-center py-8 text-secondary italic">No absence records found in the portal.</p>
+                                )}
+                            </div>
+                        </div>
+                    </motion.div>
+                )}
+            </AnimatePresence>
+
+            <Modal
+                isOpen={isLeaveModalOpen}
+                onClose={() => setIsLeaveModalOpen(false)}
+                title={editingLeaveRequest ? "Edit Absence Request" : "Bespoke Absence Request"}
+            >
+                <div className="space-y-4">
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div className="space-y-1">
+                            <label className="text-[10px] font-bold text-muted uppercase">Absence Category</label>
+                            <select
+                                className="w-full bg-background border border-border rounded-lg px-4 py-2 text-sm focus:border-accent outline-none"
+                                value={leaveFormData.type}
+                                onChange={(e) => setLeaveFormData({ ...leaveFormData, type: e.target.value })}
+                            >
+                                <option>Sick Leave</option>
+                                <option>Personal Leave</option>
+                                <option>Vacation</option>
+                                <option>Bereavement</option>
+                            </select>
+                        </div>
+                        <div className="space-y-1">
+                            <label className="text-[10px] font-bold text-muted uppercase">Duration Protocol</label>
+                            <select
+                                className="w-full bg-background border border-border rounded-lg px-4 py-2 text-sm focus:border-accent outline-none"
+                                value={leaveFormData.duration || 'Full Day'}
+                                onChange={(e) => setLeaveFormData({ ...leaveFormData, duration: e.target.value, hours: e.target.value === 'Half Day' ? 4 : 8 })}
+                            >
+                                <option>Full Day</option>
+                                <option>Half Day</option>
+                            </select>
+                        </div>
+                        <div className="space-y-1">
+                            <CustomDatePicker
+                                label="Commencement Date"
+                                selectedDate={leaveFormData.start}
+                                onChange={(date) => setLeaveFormData({ ...leaveFormData, start: date })}
+                            />
+                        </div>
+                        <div className="space-y-1">
+                            <CustomDatePicker
+                                label="Conclusion Date"
+                                selectedDate={leaveFormData.end}
+                                onChange={(date) => setLeaveFormData({ ...leaveFormData, end: date })}
+                            />
+                        </div>
+                        <div className="space-y-1 md:col-span-2">
+                            <label className="text-[10px] font-bold text-muted uppercase">Reason</label>
+                            <textarea
+                                className="w-full bg-background border border-border rounded-lg px-4 py-2 text-sm focus:border-accent outline-none resize-none"
+                                rows={2}
+                                value={leaveFormData.reason || ''}
+                                onChange={(e) => setLeaveFormData({ ...leaveFormData, reason: e.target.value })}
+                                placeholder="State reason for absence..."
+                            />
+                        </div>
+                    </div>
+                    <div className="flex gap-3 justify-end pt-4">
+                        <button onClick={() => setIsLeaveModalOpen(false)} className="btn-secondary">Cancel</button>
+                        <button
+                            onClick={async () => {
+                                if (!leaveFormData.start || !leaveFormData.end) {
+                                    swalWarning('Missing Dates', 'Please select both commencement and conclusion dates before submitting.');
+                                    return;
+                                }
+                                if (editingLeaveRequest) {
+                                    const res = await updateLeaveRequest({
+                                        id: editingLeaveRequest.id,
+                                        ...leaveFormData
+                                    });
+                                    if (res && res.success === false) {
+                                        swalError('Update Failed', res.message || 'Could not update leave request.');
+                                        return;
+                                    }
+                                    swalSuccess('Updated', 'Absence request has been successfully updated.');
+                                } else {
+                                    const res = await addLeaveRequest({
+                                        ...leaveFormData,
+                                        name: currentUser?.name,
+                                        userId: currentUser?.id
+                                    });
+                                    if (res && res.success === false) {
+                                        swalError('Submission Failed', res.message || 'Could not submit leave request.');
+                                        return;
+                                    }
+                                    swalSuccess('Submitted', 'Absence request has been successfully submitted.');
+                                }
+                                setIsLeaveModalOpen(false);
+                            }}
+                            className="btn-primary"
+                        >
+                            {editingLeaveRequest ? "Save Changes" : "Submit Requisition"}
+                        </button>
+                    </div>
+                </div>
+            </Modal>
+
+            {/* Security Protocol Modals */}
+            <Modal
+                isOpen={isSecurityModalOpen}
+                onClose={() => setIsSecurityModalOpen(false)}
+                title={securityModalType === 'panic' ? '🚨 EMERGENCY PANIC PROTOCOL' : '🛡️ SECURITY BREACH REPORT'}
+            >
+                {securityModalType === 'panic' ? (
+                    <div className="space-y-6 text-center py-4">
+                        <div className="w-24 h-24 bg-danger/10 border-4 border-danger rounded-full flex items-center justify-center mx-auto animate-pulse">
+                            <AlertCircle size={48} className="text-danger" />
+                        </div>
+                        <div className="space-y-2">
+                            <h3 className="text-2xl font-black text-white italic uppercase tracking-tighter">Signal Sent to HQ</h3>
+                            <p className="text-secondary text-sm font-medium leading-relaxed">
+                                Your current GPS coordinates have been broadcast to all regional units and law enforcement. <br />
+                                <span className="text-danger font-bold">Protocol: Maintain current position and await extraction.</span>
+                            </p>
+                        </div>
+                        <div className="p-4 bg-white/5 border border-white/5 rounded-2xl flex items-center justify-between text-left">
+                            <div>
+                                <p className="text-[10px] font-bold text-muted uppercase tracking-widest leading-tight">Response Time</p>
+                                <p className="text-lg font-black text-white italic tracking-tighter"><Clock size={14} className="inline mr-1" /> ~4.2 Minutes</p>
+                            </div>
+                            <div className="text-right">
+                                <p className="text-[10px] font-bold text-muted uppercase tracking-widest leading-tight">Extraction Unit</p>
+                                <p className="text-lg font-black text-accent italic tracking-tighter">Alpha-6</p>
+                            </div>
+                        </div>
+                        <button
+                            onClick={() => setIsSecurityModalOpen(false)}
+                            className="w-full py-4 bg-white/5 border border-border rounded-2xl text-[10px] font-black uppercase tracking-widest hover:bg-white/10 transition-all"
+                        >
+                            Acknowledge & Close
+                        </button>
+                    </div>
+                ) : (
+                    <div className="space-y-5">
+                        <div className="p-4 bg-warning/10 border border-warning/20 rounded-2xl flex items-center gap-4">
+                            <Shield size={24} className="text-warning shrink-0" />
+                            <p className="text-xs text-warning font-medium leading-tight">Reporting a breach initiates immediate internal audit. Please ensure accuracy in your statement.</p>
+                        </div>
+
+                        <div className="space-y-4">
+                            <div className="space-y-1.5">
+                                <label className="text-[10px] font-bold text-muted uppercase">Incident Type</label>
+                                <select
+                                    className="w-full bg-background border border-white/10 rounded-xl px-4 py-3 text-sm focus:border-accent outline-none"
+                                    value={breachFormData.type}
+                                    onChange={(e) => setBreachFormData({ ...breachFormData, type: e.target.value })}
+                                >
+                                    <option>Unauthorized Person</option>
+                                    <option>Asset Discrepancy</option>
+                                    <option>Digital Intrusion</option>
+                                    <option>Physical Breach</option>
+                                    <option>Bespoke Incident</option>
+                                </select>
+                            </div>
+
+                            <div className="space-y-1.5">
+                                <label className="text-[10px] font-bold text-muted uppercase">Location Coordinates</label>
+                                <div className="relative">
+                                    <MapPin className="absolute left-4 top-1/2 -translate-y-1/2 text-accent" size={16} />
+                                    <input
+                                        type="text"
+                                        className="w-full bg-background border border-white/10 rounded-xl py-3 pl-12 pr-4 text-sm focus:border-accent outline-none"
+                                        value={breachFormData.location}
+                                        onChange={(e) => setBreachFormData({ ...breachFormData, location: e.target.value })}
+                                    />
+                                </div>
+                            </div>
+
+                            <div className="space-y-1.5">
+                                <label className="text-[10px] font-bold text-muted uppercase">Incident Intelligence</label>
+                                <textarea
+                                    rows={4}
+                                    className="w-full bg-background border border-white/10 rounded-xl px-4 py-3 text-sm focus:border-accent outline-none resize-none"
+                                    placeholder="Describe the breach pattern, involved parties, and current status..."
+                                    value={breachFormData.detail}
+                                    onChange={(e) => setBreachFormData({ ...breachFormData, detail: e.target.value })}
+                                />
+                            </div>
+                        </div>
+
+                        <div className="flex gap-3 pt-2">
+                            <button
+                                onClick={() => {
+                                    setBreachFormData({ type: 'Unauthorized Person', location: '', detail: '' });
+                                    setIsSecurityModalOpen(false);
+                                }}
+                                className="flex-1 py-4 bg-white/5 border border-white/10 text-secondary rounded-2xl text-[10px] font-black uppercase tracking-widest hover:bg-white/10 transition-all"
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                onClick={async () => {
+                                    await reportSecurityEvent({ eventType: 'BREACH', location: breachFormData.location, details: `Type: ${breachFormData.type} | Info: ${breachFormData.detail}` });
+                                    setBreachFormData({ type: 'Unauthorized Person', location: '', detail: '' });
+                                    setIsSecurityModalOpen(false);
+                                    swalSuccess('Report Sent', 'Transmitted to Institutional Security. Audit tracking initialized.');
+                                }}
+                                className="flex-1 py-4 bg-accent text-black rounded-2xl text-[10px] font-black uppercase tracking-widest hover:scale-[1.02] active:scale-95 transition-all shadow-xl shadow-accent/20"
+                            >
+                                Submit Report
+                            </button>
+                        </div>
+                    </div>
+                )}
+            </Modal>
+
+            {/* Mission Details Modal */}
+            <Modal
+                isOpen={isMissionModalOpen}
+                onClose={() => setIsMissionModalOpen(false)}
+                title={
+                    selectedMission && (selectedMission.mission_type === 'Chauffeur' || selectedMission.isDirectChauffeurOrder || selectedMission.orderType === 'CHAUFFEUR')
+                        ? "MANIFEST DETAILS"
+                        : "MISSION INTELLIGENCE DEBRIEF"
+                }
+                subtitle={
+                    selectedMission && (selectedMission.mission_type === 'Chauffeur' || selectedMission.isDirectChauffeurOrder || selectedMission.orderType === 'CHAUFFEUR')
+                        ? "INSTITUTIONAL VERIFICATION"
+                        : undefined
+                }
+            >
+                {selectedMission && (() => {
+                    const isChauffeur = selectedMission.mission_type === 'Chauffeur' || selectedMission.isDirectChauffeurOrder || selectedMission.orderType === 'CHAUFFEUR';
+                    if (isChauffeur) {
+                        const rawAssignedVehicle = String(
+                            selectedMission.plateNumber ||
+                            selectedMission.vehicleId ||
+                            selectedMission.vehicle ||
+                            selectedMission.vehicleRef ||
+                            selectedMission.metadata?.plateNumber ||
+                            selectedMission.metadata?.vehicleId ||
+                            selectedMission.metadata?.vehicle ||
+                            selectedMission.metadata?.vehicleRef ||
+                            ''
+                        ).trim();
+
+                        const matchedVehicleInfo = (fleet || []).find(v => {
+                            if (!rawAssignedVehicle) return false;
+                            const vId = String(v.id || '').trim();
+                            const vDbId = String(v.db_id || '').trim();
+                            const vModel = String(v.model || '').trim();
+                            const vCombo1 = `${vModel} (${vId})`.toLowerCase();
+                            const vCombo2 = `${vModel} - ${vId}`.toLowerCase();
+                            const rawLower = rawAssignedVehicle.toLowerCase();
+                            return (
+                                rawLower === vCombo1 ||
+                                rawLower === vCombo2 ||
+                                rawLower === vId.toLowerCase() ||
+                                rawLower === vDbId.toLowerCase() ||
+                                rawLower === vModel.toLowerCase() ||
+                                rawLower.includes(vId.toLowerCase()) ||
+                                (vModel && rawLower.includes(vModel.toLowerCase()))
+                            );
+                        });
+
+                        const vehicleDisplayName = matchedVehicleInfo?.model
+                            ? matchedVehicleInfo.model.trim()
+                            : (rawAssignedVehicle || null);
+
+                        const vehiclePlateDisplay = matchedVehicleInfo?.id
+                            ? `#${matchedVehicleInfo.id}`
+                            : (rawAssignedVehicle || null);
+
+                        const s = String(selectedMission.status || selectedMission.chauffeur_status || '').toLowerCase().replace(/\s+/g, '_');
+                        const isEnRoute = ['en_route', 'in_transit'].includes(s);
+                        const isArrived = s === 'arrived';
+                        const canStart = ['assigned', 'accepted', 'pending', 'pending_review', 'approved'].includes(s);
+
+                        const displayOrderId = String(selectedMission.orderNumber || selectedMission.orderId || selectedMission.id || '').replace(/^ORD-2026-0*/, '').replace(/^ORD-0*/, '') || selectedMission.id;
+
+                        return (
+                            <div className="space-y-6">
+                                {/* Header Info Banner */}
+                                <div className="p-6 bg-accent/5 rounded-2xl border border-accent/20 flex items-center justify-between">
+                                    <div className="flex items-center gap-4">
+                                        <div className="w-12 h-12 bg-accent/20 rounded-xl flex items-center justify-center text-accent">
+                                            <Car size={24} />
+                                        </div>
+                                        <div>
+                                            <h4 className="font-bold text-lg text-white">{displayOrderId}</h4>
+                                            <p className="text-xs text-secondary uppercase font-black tracking-widest">{selectedMission.serviceType || 'ONE WAY'}</p>
+                                        </div>
+                                    </div>
+                                    <StatusBadge status={selectedMission.status || selectedMission.chauffeur_status} />
+                                </div>
+
+                                {/* Driver & Vehicle Box */}
+                                <div className="p-4 bg-white/[0.03] rounded-2xl border border-white/10 space-y-4">
+                                    <p className="text-[10px] font-black text-muted uppercase tracking-widest">Driver & Vehicle</p>
+                                    <div className="space-y-4">
+                                        {/* Driver */}
+                                        <div className="flex items-center gap-4">
+                                            <div className="w-14 h-14 rounded-xl bg-accent/10 border border-accent/20 flex items-center justify-center text-accent shrink-0">
+                                                <Car size={22} />
+                                            </div>
+                                            <div className="flex-1 min-w-0">
+                                                <div className="flex items-center gap-2">
+                                                    <p className="text-sm font-bold text-white">{selectedMission.driverName || selectedMission.driver || currentUser?.name || 'staff'}</p>
+                                                    <span className="text-[8px] font-black uppercase tracking-wider bg-emerald-500/20 text-emerald-400 px-2 py-0.5 rounded-full border border-emerald-500/30">Chauffeur</span>
+                                                </div>
+                                                <DriverEtaDisplay pickupLocation={selectedMission.pickupLocation || selectedMission.pickup_location} status={selectedMission.status} driverName={selectedMission.driverName || selectedMission.driver || currentUser?.name} />
+                                            </div>
+                                        </div>
+
+                                        {/* Vehicle */}
+                                        <div className="pt-3 border-t border-white/5">
+                                            <p className="text-[9px] font-black text-muted uppercase tracking-widest mb-2.5">Assigned Vehicle Specification</p>
+                                            {vehicleDisplayName ? (
+                                                <div className="flex items-start gap-4 p-3.5 bg-accent/[0.04] border border-accent/20 rounded-xl">
+                                                    <div className="w-12 h-12 rounded-xl bg-accent/10 border border-accent/30 flex items-center justify-center text-accent shrink-0">
+                                                        <Car size={20} />
+                                                    </div>
+                                                    <div className="flex-1 min-w-0 space-y-1">
+                                                        <div className="flex flex-wrap items-center justify-between gap-2">
+                                                            <p className="text-sm font-black text-white uppercase tracking-tight">{vehicleDisplayName}</p>
+                                                            <span className="text-[9px] font-black uppercase tracking-wider px-2 py-0.5 bg-emerald-500/20 text-emerald-400 rounded-md border border-emerald-500/30">
+                                                                {matchedVehicleInfo?.status || 'Active'}
+                                                            </span>
+                                                        </div>
+                                                        <div className="flex flex-wrap items-center gap-2 text-xs">
+                                                            {vehiclePlateDisplay && (
+                                                                <span className="font-mono text-accent font-bold text-xs">Plate / Unit: {vehiclePlateDisplay}</span>
+                                                            )}
+                                                            {matchedVehicleInfo?.type && (
+                                                                <span className="text-[10px] text-secondary font-medium px-2 py-0.5 bg-white/5 rounded border border-white/10 uppercase">
+                                                                    {matchedVehicleInfo.type}
+                                                                </span>
+                                                            )}
+                                                            {matchedVehicleInfo?.capacity && (
+                                                                <span className="text-[10px] text-muted font-medium px-2 py-0.5 bg-white/5 rounded border border-white/10 uppercase">
+                                                                    {matchedVehicleInfo.capacity} Seats
+                                                                </span>
+                                                            )}
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            ) : (
+                                                <div className="p-3 bg-white/5 rounded-xl border border-white/5 flex items-center gap-2 text-muted">
+                                                    <Car size={14} className="text-muted/60" />
+                                                    <p className="text-xs font-medium italic">No vehicle assigned to this chauffeur mission yet.</p>
+                                                </div>
+                                            )}
+                                        </div>
+                                    </div>
+                                </div>
+
+                                {/* Grid Details */}
+                                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                    <div className="p-4 bg-white/5 rounded-xl border border-border">
+                                        <p className="text-[10px] text-muted uppercase font-black tracking-widest mb-1">Entity / Client</p>
+                                        <p className="text-sm font-bold text-white">{selectedMission.clientName || 'abc'}</p>
+                                    </div>
+                                    <div className="p-4 bg-white/5 rounded-xl border border-border">
+                                        <p className="text-[10px] text-muted uppercase font-black tracking-widest mb-1">Execution Date</p>
+                                        <p className="text-sm font-bold text-white">
+                                            {selectedMission.dueDate || selectedMission.date || 'Scheduled'} {selectedMission.pickupTime ? `@ ${selectedMission.pickupTime}` : ''}
+                                        </p>
+                                    </div>
+                                    <div className="p-4 bg-white/5 rounded-xl border border-border col-span-1 sm:col-span-2">
+                                        <p className="text-[10px] text-muted uppercase font-black tracking-widest mb-1">Pickup Vector</p>
+                                        <p className="text-sm font-bold text-white italic">{selectedMission.pickupLocation || selectedMission.pickup_location || 'N/A'}</p>
+                                    </div>
+                                    <div className="p-4 bg-white/5 rounded-xl border border-border col-span-1 sm:col-span-2">
+                                        <p className="text-[10px] text-muted uppercase font-black tracking-widest mb-1">Destination Vector</p>
+                                        <p className="text-sm font-bold text-white italic">{selectedMission.dropLocation || selectedMission.drop_location || selectedMission.location || 'N/A'}</p>
+                                    </div>
+                                    <div className="p-4 bg-white/5 rounded-xl border border-border">
+                                        <p className="text-[10px] text-muted uppercase font-black tracking-widest mb-1">No. of Passengers</p>
+                                        <p className="text-sm font-bold text-white">
+                                            {selectedMission.numberOfPassengers || selectedMission.passengers || 1} PAX
+                                            {selectedMission.passengerName ? ` (${selectedMission.passengerName})` : ''}
+                                        </p>
+                                    </div>
+                                    <div className="p-4 bg-white/5 rounded-xl border border-border">
+                                        <p className="text-[10px] text-muted uppercase font-black tracking-widest mb-1">Luggage</p>
+                                        <p className="text-sm font-bold text-white">
+                                            {selectedMission.luggage === 'Yes'
+                                                ? `Yes — ${selectedMission.bags ?? 0} bag(s)`
+                                                : (selectedMission.luggage || 'No')}
+                                        </p>
+                                    </div>
+                                    <div className="p-4 bg-white/5 rounded-xl border border-border col-span-1 sm:col-span-2 overflow-hidden">
+                                        <div className="flex items-center justify-between mb-1.5">
+                                            <p className="text-[10px] text-muted uppercase font-black tracking-widest">Extra Stops / Intermediate Waypoints</p>
+                                            {selectedMission.stops === 'Yes' && (
+                                                <span className="text-[9px] font-black uppercase tracking-wider bg-accent/10 text-accent px-2 py-0.5 rounded border border-accent/20">
+                                                    {selectedMission.stopLocations ? 'Stops Specified' : 'Requested'}
+                                                </span>
+                                            )}
+                                        </div>
+                                        {selectedMission.stops === 'Yes' ? (
+                                            selectedMission.stopLocations ? (
+                                                <div className="space-y-1.5 pt-1">
+                                                    {String(selectedMission.stopLocations)
+                                                        .split(/\r?\n/)
+                                                        .map(s => s.trim())
+                                                        .filter(Boolean)
+                                                        .map((loc, idx, arr) => (
+                                                            <div key={idx} className="flex items-start gap-2 text-sm font-bold text-white">
+                                                                {arr.length > 1 && (
+                                                                    <span className="text-[10px] font-mono text-accent shrink-0 mt-0.5">#{idx + 1}</span>
+                                                                )}
+                                                                <p className="break-words break-all [overflow-wrap:anywhere] leading-relaxed flex-1 min-w-0">
+                                                                    {loc}
+                                                                </p>
+                                                            </div>
+                                                        ))}
+                                                </div>
+                                            ) : (
+                                                <p className="text-sm font-bold text-white italic">Yes (no specific waypoint addresses specified)</p>
+                                            )
+                                        ) : (
+                                            <p className="text-sm font-bold text-white">No extra stops requested</p>
+                                        )}
+                                    </div>
+                                    <div className="p-4 bg-warning/10 rounded-xl border border-warning/30 col-span-1 sm:col-span-2">
+                                        <p className="text-[10px] text-warning uppercase font-black tracking-widest mb-1">
+                                            Pricing
+                                        </p>
+                                        <p className="text-sm font-bold text-white">
+                                            ${(parseFloat(selectedMission.chauffeurFee || selectedMission.delivery_fee) || 120).toFixed(2)} USD
+                                            <span className="text-warning"> (separate billing)</span>
+                                        </p>
+                                    </div>
+                                    {Boolean(selectedMission.amenities && (Array.isArray(selectedMission.amenities) ? selectedMission.amenities.length > 0 : selectedMission.amenities)) && (
+                                        <div className="p-4 bg-white/5 rounded-xl border border-border col-span-1 sm:col-span-2">
+                                            <p className="text-[10px] text-muted uppercase font-black tracking-widest mb-1">Amenities</p>
+                                            <p className="text-sm font-bold text-white">
+                                                {Array.isArray(selectedMission.amenities)
+                                                    ? selectedMission.amenities.join(', ')
+                                                    : String(selectedMission.amenities)}
+                                            </p>
+                                        </div>
+                                    )}
+                                </div>
+
+                                {/* Actions */}
+                                <div className="flex gap-3">
+                                    <button
+                                        onClick={() => setIsMissionModalOpen(false)}
+                                        className="flex-1 py-4 bg-white/5 border border-white/10 text-secondary rounded-2xl text-[10px] font-black uppercase tracking-widest hover:bg-white/10 transition-all"
+                                    >
+                                        Close Debrief
+                                    </button>
+                                    {canStart && (
+                                        <button
+                                            onClick={async () => {
+                                                await handleStartTrip(selectedMission);
+                                                setIsMissionModalOpen(false);
+                                            }}
+                                            className="flex-1 py-4 bg-accent text-black rounded-2xl text-[10px] font-black uppercase tracking-widest hover:scale-[1.02] transition-all shadow-xl shadow-accent/20"
+                                        >
+                                            Start Trip
+                                        </button>
+                                    )}
+                                    {isEnRoute && (
+                                        <button
+                                            onClick={async () => {
+                                                await handleArriveTrip(selectedMission);
+                                                setIsMissionModalOpen(false);
+                                            }}
+                                            className="flex-1 py-4 bg-amber-500 hover:bg-amber-600 text-black rounded-2xl text-[10px] font-black uppercase tracking-widest hover:scale-[1.02] transition-all shadow-xl shadow-amber-500/20"
+                                        >
+                                            Arrived
+                                        </button>
+                                    )}
+                                    {isArrived && (
+                                        <button
+                                            onClick={async () => {
+                                                await handleCompleteMission(selectedMission);
+                                                setIsMissionModalOpen(false);
+                                            }}
+                                            className="flex-1 py-4 bg-success text-white rounded-2xl text-[10px] font-black uppercase tracking-widest hover:scale-[1.02] transition-all shadow-xl shadow-success/20"
+                                        >
+                                            Mark Complete
+                                        </button>
+                                    )}
+                                </div>
+                            </div>
+                        );
+                    }
+
+                    return (
+                        <div className="space-y-6">
+                            <div className="grid grid-cols-2 gap-4">
+                                <div className="p-4 bg-white/[0.03] border border-white/5 rounded-2xl">
+                                    <p className="text-[10px] font-black text-muted uppercase tracking-widest mb-1">Mission Type</p>
+                                    <p className="text-sm font-black text-white italic">{selectedMission.mission_type || 'Standard Delivery'}</p>
+                                </div>
+                                <div className="p-4 bg-white/[0.03] border border-white/5 rounded-2xl">
+                                    <p className="text-[10px] font-black text-muted uppercase tracking-widest mb-1">Operational ID</p>
+                                    <p className="text-sm font-black text-accent italic">{selectedMission.orderId || selectedMission.id}</p>
+                                </div>
+                            </div>
+
+                            {selectedMission.vehicle && (
+                                <div className="p-4 bg-accent/5 border border-accent/20 rounded-2xl flex items-center justify-between">
+                                    <div>
+                                        <p className="text-[10px] font-black text-muted uppercase tracking-widest">Assigned Vehicle Specification</p>
+                                        <p className="text-sm font-bold text-white mt-1 flex items-center gap-2">
+                                            <Car size={16} className="text-accent" /> {selectedMission.vehicle}
+                                        </p>
+                                    </div>
+                                    <span className="text-[9px] font-black uppercase tracking-wider bg-accent/20 text-accent px-2.5 py-1 rounded-full border border-accent/30">
+                                        Fleet Asset
+                                    </span>
+                                </div>
+                            )}
+
+                            {(selectedMission.dueDate || selectedMission.pickupTime) && (
+                                <div className="grid grid-cols-2 gap-4">
+                                    <div className="p-4 bg-white/[0.03] border border-white/5 rounded-2xl">
+                                        <p className="text-[10px] font-black text-muted uppercase tracking-widest mb-1">Execution Schedule</p>
+                                        <p className="text-sm font-bold text-white">
+                                            {selectedMission.dueDate || 'Scheduled'} {selectedMission.pickupTime ? `@ ${selectedMission.pickupTime}` : ''}
+                                        </p>
+                                    </div>
+                                    <div className="p-4 bg-white/[0.03] border border-white/5 rounded-2xl">
+                                        <p className="text-[10px] font-black text-muted uppercase tracking-widest mb-1">Passenger Manifest</p>
+                                        <p className="text-sm font-bold text-white">
+                                            {selectedMission.numberOfPassengers || selectedMission.passengers || 1} PAX {selectedMission.passengerName ? `(${selectedMission.passengerName})` : ''}
+                                        </p>
+                                    </div>
+                                </div>
+                            )}
+
+                            <div className="space-y-4">
+                                <div className="flex items-start gap-3 p-4 bg-success/5 border border-success/20 rounded-2xl">
+                                    <div className="w-8 h-8 rounded-full bg-success/20 flex items-center justify-center shrink-0">
+                                        <div className="w-2 h-2 rounded-full bg-success animate-pulse" />
+                                    </div>
+                                    <div>
+                                        <p className="text-[9px] font-black text-muted uppercase tracking-widest">Pickup Requisition</p>
+                                        <p className="text-sm font-bold text-white italic">{selectedMission.pickup_location || selectedMission.pickupLocation || 'Central Hub'}</p>
+                                    </div>
+                                </div>
+
+                                <div className="flex items-start gap-3 p-4 bg-accent/5 border border-accent/20 rounded-2xl">
+                                    <MapPin size={18} className="text-accent shrink-0 mt-1" />
+                                    <div>
+                                        <p className="text-[9px] font-black text-muted uppercase tracking-widest">Target Destination</p>
+                                        <p className="text-sm font-bold text-white italic">{selectedMission.drop_location || selectedMission.dropLocation || selectedMission.location || 'Client Perimeter'}</p>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div className="p-4 bg-white/[0.02] border border-white/5 rounded-2xl space-y-3">
+                                <p className="text-[10px] font-black text-muted uppercase tracking-widest flex items-center gap-2">
+                                    <ClipboardList size={14} className="text-accent" /> Asset Manifest
+                                </p>
+                                <div className="space-y-2">
+                                    {(() => {
+                                        let itemsToRender = selectedMission.items;
+                                        if (!itemsToRender && selectedMission.package_details) {
+                                            if (typeof selectedMission.package_details === 'string' && selectedMission.package_details.startsWith('[')) {
+                                                try {
+                                                    const parsed = JSON.parse(selectedMission.package_details);
+                                                    if (Array.isArray(parsed)) itemsToRender = parsed;
+                                                } catch(e) {}
+                                            } else if (Array.isArray(selectedMission.package_details)) {
+                                                itemsToRender = selectedMission.package_details;
+                                            }
+                                        }
+                                        if (Array.isArray(itemsToRender) && itemsToRender.length > 0) {
+                                            return itemsToRender.map((item, idx) => (
+                                                <div key={idx} className="flex justify-between items-center py-2 border-b border-white/5 last:border-0">
+                                                    <p className="text-xs font-bold text-white">{item.name || 'Item'}</p>
+                                                    <p className="text-[10px] font-black text-secondary">x{item.qty || 1}</p>
+                                                </div>
+                                            ));
+                                        }
+                                        return (
+                                            <p className="text-xs text-secondary leading-relaxed italic">{selectedMission.package_details || selectedMission.item || 'Standard Logistic Unit'}</p>
+                                        );
+                                    })()}
+                                </div>
+                            </div>
+
+                            {(() => {
+                                let rawNotes = selectedMission.delivery_instructions || selectedMission.order_instructions || selectedMission.order_notes || '';
+                                let cleanNotes = String(rawNotes).replace(/\[request_meta\].*/g, '').trim();
+                                if (!cleanNotes) return null;
+                                return (
+                                    <div className="p-4 bg-warning/5 border border-warning/20 rounded-2xl">
+                                        <p className="text-[10px] font-black text-warning uppercase tracking-widest mb-1 flex items-center gap-2">
+                                            <AlertCircle size={14} /> Customer delivery instructions
+                                        </p>
+                                        <p className="text-xs text-secondary leading-relaxed italic whitespace-pre-wrap">
+                                            "{cleanNotes}"
+                                        </p>
+                                    </div>
+                                );
+                            })()}
+
+                            <div className="p-4 bg-accent/5 border border-accent/20 rounded-2xl flex items-center justify-between">
+                                <div>
+                                    <p className="text-[10px] font-black text-muted uppercase tracking-widest">Staff Payout (Distance-Based)</p>
+                                    <p className="text-lg font-black text-accent">
+                                        {parseFloat(selectedMission.delivery_fee) > 0
+                                            ? `$${parseFloat(selectedMission.delivery_fee).toFixed(2)}`
+                                            : 'Pending Admin Setup'}
+                                    </p>
+                                    {selectedMission.route_distance && (
+                                        <p className="text-[9px] text-muted italic mt-0.5">{selectedMission.route_distance} km route</p>
+                                    )}
+                                </div>
+                            </div>
+
+                            <div className="flex gap-3">
+                                <button
+                                    onClick={() => setIsMissionModalOpen(false)}
+                                    className="flex-1 py-4 bg-white/5 border border-white/10 text-secondary rounded-2xl text-[10px] font-black uppercase tracking-widest hover:bg-white/10 transition-all"
+                                >
+                                    Close Debrief
+                                </button>
+                                {!selectedMission.driverId && (
+                                    <button
+                                        onClick={() => {
+                                            handleAcceptMission(selectedMission);
+                                            setIsMissionModalOpen(false);
+                                        }}
+                                        className="flex-1 py-4 bg-accent text-black rounded-2xl text-[10px] font-black uppercase tracking-widest hover:scale-[1.02] transition-all"
+                                    >
+                                        Accept Mission
+                                    </button>
+                                )}
+                            </div>
+                        </div>
+                    );
+                })()}
+            </Modal>
+
+            {/* Delivery Proof (POD) Modal */}
+            <Modal
+                isOpen={showDeliveryPodModal}
+                onClose={() => {
+                    if (!isSubmittingDeliveryPod) {
+                        setShowDeliveryPodModal(false);
+                        setPodTargetDelivery(null);
+                    }
+                }}
+                title="Proof of Delivery (POD) Required"
+            >
+                {podTargetDelivery && (
+                    <form onSubmit={handleSubmitDeliveryPOD} className="space-y-5">
+                        <div className="p-4 bg-white/5 border border-white/10 rounded-2xl flex items-center justify-between">
+                            <div>
+                                <p className="text-[10px] font-black text-accent uppercase tracking-widest">Delivering Requisition</p>
+                                <p className="text-sm font-bold text-white mt-0.5">{podTargetDelivery.deliveryNumber || podTargetDelivery.orderId || podTargetDelivery.id}</p>
+                            </div>
+                            <span className="px-2.5 py-1 bg-warning/20 text-warning text-[10px] font-black uppercase rounded-lg border border-warning/30">
+                                Proof Required
+                            </span>
+                        </div>
+
+                        <div className="space-y-1">
+                            <label className="text-[10px] font-bold text-muted uppercase tracking-widest flex items-center gap-1.5">
+                                <User size={12} className="text-accent" />
+                                Receiver Full Name <span className="text-danger">*</span>
+                            </label>
+                            <input
+                                type="text"
+                                required
+                                placeholder="Full Name of Signee / Client"
+                                value={deliveryPodData.receiverName}
+                                onChange={(e) => setDeliveryPodData({ ...deliveryPodData, receiverName: e.target.value })}
+                                className="w-full bg-background border border-border rounded-xl px-4 py-3 text-sm focus:border-accent outline-none font-bold text-white"
+                            />
+                        </div>
+
+                        <div className="space-y-1.5">
+                            <label className="text-[10px] font-bold text-muted uppercase tracking-widest flex items-center gap-1.5">
+                                <Camera size={12} className="text-accent" />
+                                Proof of Delivery Photo <span className="text-danger">*</span>
+                            </label>
+                            {deliveryPodData.photo ? (
+                                <div className="relative rounded-2xl overflow-hidden border border-white/20 aspect-video bg-black flex items-center justify-center group">
+                                    <img src={deliveryPodData.photo} alt="POD Proof" className="w-full h-full object-cover" />
+                                    <div className="absolute inset-0 bg-black/50 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
+                                        <button
+                                            type="button"
+                                            onClick={() => setDeliveryPodData(prev => ({ ...prev, photo: null }))}
+                                            className="px-3 py-1.5 bg-danger text-white rounded-lg text-xs font-bold flex items-center gap-1.5 shadow-lg"
+                                        >
+                                            <X size={14} /> Remove Photo
+                                        </button>
+                                    </div>
+                                </div>
+                            ) : (
+                                <label className="flex flex-col items-center justify-center p-6 border-2 border-dashed border-border hover:border-accent/50 rounded-2xl cursor-pointer bg-white/[0.02] hover:bg-white/[0.05] transition-all">
+                                    <Camera size={32} className="text-muted mb-2 group-hover:text-accent transition-colors" />
+                                    <span className="text-xs font-bold text-white">Capture or Upload Delivery Proof</span>
+                                    <span className="text-[10px] text-muted mt-1 uppercase tracking-wider">Packages, Receipt, or Handover</span>
+                                    <input
+                                        type="file"
+                                        accept="image/*"
+                                        capture="environment"
+                                        onChange={handleDeliveryPhotoUpload}
+                                        className="hidden"
+                                    />
+                                </label>
+                            )}
+                        </div>
+
+                        <div className="space-y-1">
+                            <label className="text-[10px] font-bold text-muted uppercase tracking-widest flex items-center gap-1.5">
+                                <FileText size={12} className="text-accent" />
+                                Delivery Notes / Remarks
+                            </label>
+                            <textarea
+                                rows={2}
+                                placeholder="Handover notes, reception confirmation..."
+                                value={deliveryPodData.notes}
+                                onChange={(e) => setDeliveryPodData({ ...deliveryPodData, notes: e.target.value })}
+                                className="w-full bg-background border border-border rounded-xl px-4 py-3 text-sm focus:border-accent outline-none font-medium text-white resize-none"
+                            />
+                        </div>
+
+                        <div className="flex gap-3 pt-2">
+                            <button
+                                type="button"
+                                onClick={() => {
+                                    setShowDeliveryPodModal(false);
+                                    setPodTargetDelivery(null);
+                                }}
+                                className="btn-secondary flex-1 py-3 text-xs uppercase font-bold"
+                                disabled={isSubmittingDeliveryPod}
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                type="submit"
+                                disabled={isSubmittingDeliveryPod || !deliveryPodData.photo || !deliveryPodData.receiverName.trim()}
+                                className={`flex-1 py-3 rounded-xl font-black uppercase text-xs tracking-widest transition-all flex items-center justify-center gap-2 ${
+                                    isSubmittingDeliveryPod || !deliveryPodData.photo || !deliveryPodData.receiverName.trim()
+                                        ? 'bg-success/40 text-white/50 cursor-not-allowed'
+                                        : 'bg-success text-white hover:bg-success/90 shadow-lg shadow-success/20'
+                                }`}
+                            >
+                                {isSubmittingDeliveryPod ? (
+                                    <>Verifying Proof...</>
+                                ) : (
+                                    <>
+                                        <CheckCircle2 size={16} /> Confirm Delivery
+                                    </>
+                                )}
+                            </button>
+                        </div>
+                    </form>
+                )}
+            </Modal>
+        </div>
+    );
+};
+
+const TaskCard = ({ asg, onAction }) => {
+    const [showProof, setShowProof] = React.useState(false);
+    const [proofPhoto, setProofPhoto] = React.useState(null);
+    const [proofNotes, setProofNotes] = React.useState('');
+    const [gpsStamp] = React.useState(() => {
+        const now = new Date();
+        return `${now.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })} · ${now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}`;
+    });
+
+    const handlePhotoChange = (e) => {
+        const file = e.target.files?.[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onloadend = () => setProofPhoto(reader.result);
+        reader.readAsDataURL(file);
+    };
+
+    const handleSubmitProof = () => {
+        if (!proofPhoto) return;
+        onAction(asg, 'Completed', { photo: proofPhoto, notes: proofNotes, gps: gpsStamp });
+        setShowProof(false);
+        setProofPhoto(null);
+        setProofNotes('');
+    };
+
+    return (
+        <>
+            <div className="p-5 bg-white/[0.02] border border-border rounded-2xl hover:border-accent/40 transition-all group relative overflow-hidden">
+                <div className="absolute top-0 right-0 w-24 h-24 bg-accent/5 blur-3xl rounded-full -mr-12 -mt-12" />
+                <div className="flex flex-col gap-4 relative z-10">
+                    <div className="flex justify-between items-start">
+                        <div className="space-y-1">
+                            <div className="flex items-center gap-2">
+                                <span className="text-[10px] font-black text-accent/60 uppercase tracking-widest">{asg.id}</span>
+                                {asg.type && (
+                                    <span className={`px-2 py-0.5 rounded text-[8px] font-black uppercase tracking-tighter ${asg.type === 'Pickup' ? 'bg-info/20 text-info' : 'bg-success/20 text-success'}`}>
+                                        {asg.type}
+                                    </span>
+                                )}
+                                <StatusBadge status={asg.status} />
+                            </div>
+                            <h4 className="font-bold text-white text-lg">{asg.task}</h4>
+                        </div>
+                        {asg.priority === 'Critical' && (
+                            <div className="px-2 py-1 bg-danger/10 text-danger rounded text-[8px] font-black uppercase tracking-tighter animate-pulse">Critical</div>
+                        )}
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-4 text-xs text-secondary">
+                        <span className="flex items-center gap-1.5 bg-white/5 px-3 py-1.5 rounded-lg border border-white/5">
+                            <MapPin size={14} className="text-accent" /> {asg.location}
+                        </span>
+                        <span className="flex items-center gap-1.5 bg-white/5 px-3 py-1.5 rounded-lg border border-white/5">
+                            <TrendingUp size={14} className="text-info" /> {asg.distance || 'Loading...'}
+                        </span>
+                    </div>
+
+                    <div className="flex gap-2 mt-2">
+                        {(() => {
+                            const s = String(asg.status).toLowerCase().replace(/_/g, ' ');
+                            if (s === 'pending' || s === 'dispatched' || s === 'pending pickup' || s === 'assigned') {
+                                const isAssignedToMe = !!(asg.assigneeId || asg.driverId || asg.assignee || asg.driver);
+                                return (
+                                    <>
+                                        <button
+                                            onClick={() => onAction(asg, 'in_progress')}
+                                            className="flex-1 py-3 bg-accent text-black rounded-xl text-[10px] font-black uppercase tracking-widest hover:scale-[1.02] transition-all"
+                                        >
+                                            Accept & Start
+                                        </button>
+                                        {isAssignedToMe && (
+                                            <button
+                                                onClick={() => onAction(asg, 'pending', { assigneeId: null, assignee: null, driverId: null, driver: null })}
+                                                className="py-3 px-4 rounded-xl text-[10px] font-black uppercase tracking-widest border border-danger/40 text-danger hover:bg-danger/10 transition-all"
+                                            >
+                                                Decline
+                                            </button>
+                                        )}
+                                    </>
+                                );
+                            }
+                            if (s === 'in progress') {
+                                return (
+                                    <button
+                                        onClick={() => onAction(asg, 'en_route')}
+                                        className="flex-1 py-3 bg-info text-white rounded-xl text-[10px] font-black uppercase tracking-widest hover:scale-[1.02] transition-all"
+                                    >
+                                        Set En Route
+                                    </button>
+                                );
+                            }
+                            if (s === 'en route') {
+                                return (
+                                    <button
+                                        onClick={() => setShowProof(true)}
+                                        className="flex-1 py-3 bg-success text-white rounded-xl text-[10px] font-black uppercase tracking-widest hover:scale-[1.02] transition-all flex items-center justify-center gap-2"
+                                    >
+                                        <Camera size={14} /> Complete Delivery
+                                    </button>
+                                );
+                            }
+                            if (s === 'completed') {
+                                return (
+                                    <div className="flex-1 py-3 bg-white/5 border border-success/20 text-success rounded-xl text-[10px] font-black uppercase tracking-widest flex items-center justify-center gap-2">
+                                        <CheckCircle2 size={14} /> Proof Submitted
+                                    </div>
+                                );
+                            }
+                            return null;
+                        })()}
+                        <button
+                            onClick={() => {
+                                // We need access to setIsMissionModalOpen and setSelectedMission here.
+                                // Since TaskCard is defined outside or doesn't have these props, 
+                                // I will pass them or use a callback.
+                                onAction(asg, 'view_details');
+                            }}
+                            className="p-3 bg-white/5 border border-border rounded-xl text-accent hover:bg-accent/10 transition-all"
+                            title="View Mission Manifest"
+                        >
+                            <FileText size={18} />
+                        </button>
+                        <button
+                            onClick={() => window.open(`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(asg.location)}`, '_blank')}
+                            className="p-3 bg-white/5 border border-border rounded-xl text-white hover:bg-white/10 transition-all"
+                        >
+                            <Navigation size={18} />
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            {/* Delivery Proof Modal */}
+            <AnimatePresence>
+                {showProof && (
+                    <motion.div
+                        className="fixed inset-0 z-[200] flex items-center justify-center p-4"
+                        initial={{ opacity: 0 }}
+                        animate={{ opacity: 1 }}
+                        exit={{ opacity: 0 }}
+                    >
+                        {/* Backdrop */}
+                        <motion.div
+                            className="absolute inset-0 bg-black/80 backdrop-blur-md"
+                            onClick={() => setShowProof(false)}
+                        />
+
+                        {/* Panel */}
+                        <motion.div
+                            className="relative w-full max-w-md bg-sidebar border border-border rounded-3xl shadow-2xl overflow-hidden"
+                            initial={{ scale: 0.92, y: 30 }}
+                            animate={{ scale: 1, y: 0 }}
+                            exit={{ scale: 0.92, y: 30 }}
+                            transition={{ type: 'spring', stiffness: 300, damping: 28 }}
+                        >
+                            {/* Header */}
+                            <div className="px-6 pt-6 pb-4 border-b border-white/5 flex items-center justify-between">
+                                <div className="flex items-center gap-3">
+                                    <div className="w-9 h-9 rounded-xl bg-success/15 border border-success/30 flex items-center justify-center">
+                                        <Camera size={16} className="text-success" />
+                                    </div>
+                                    <div>
+                                        <p className="font-black text-white text-sm">Delivery Proof</p>
+                                        <p className="text-[10px] text-muted uppercase tracking-widest font-bold">{asg.id} · {asg.task}</p>
+                                    </div>
+                                </div>
+                                <button
+                                    onClick={() => setShowProof(false)}
+                                    className="w-8 h-8 rounded-full bg-white/5 flex items-center justify-center hover:bg-white/10 transition-all"
+                                >
+                                    <X size={14} className="text-secondary" />
+                                </button>
+                            </div>
+
+                            <div className="p-6 space-y-5">
+                                {/* GPS Stamp */}
+                                <div className="flex items-center gap-3 bg-accent/5 border border-accent/15 rounded-2xl px-4 py-3">
+                                    <ScanLine size={16} className="text-accent flex-shrink-0" />
+                                    <div>
+                                        <p className="text-[9px] font-black text-accent/70 uppercase tracking-widest">GPS Timestamp</p>
+                                        <p className="text-xs font-bold text-white">{gpsStamp} · {asg.location}</p>
+                                    </div>
+                                </div>
+
+                                {/* Photo Upload */}
+                                <div className="space-y-2">
+                                    <p className="text-[10px] font-black text-muted uppercase tracking-widest">Proof Photo <span className="text-danger">*</span></p>
+                                    <label
+                                        htmlFor={`proof-upload-${asg.id}`}
+                                        className="group relative flex flex-col items-center justify-center w-full h-44 rounded-2xl border-2 border-dashed border-border hover:border-accent/50 transition-all cursor-pointer overflow-hidden bg-white/[0.02] hover:bg-white/[0.04]"
+                                    >
+                                        {proofPhoto ? (
+                                            <>
+                                                <img src={proofPhoto} alt="Delivery proof" className="absolute inset-0 w-full h-full object-cover" />
+                                                <div className="absolute inset-0 bg-black/40 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
+                                                    <p className="text-[10px] font-black text-white uppercase tracking-widest">Change Photo</p>
+                                                </div>
+                                            </>
+                                        ) : (
+                                            <div className="flex flex-col items-center gap-3 text-secondary">
+                                                <div className="w-14 h-14 rounded-2xl bg-white/5 border border-white/10 flex items-center justify-center group-hover:border-accent/30 group-hover:text-accent transition-all">
+                                                    <ImagePlus size={24} />
+                                                </div>
+                                                <div className="text-center">
+                                                    <p className="text-xs font-bold">Tap to upload photo</p>
+                                                    <p className="text-[10px] text-muted">JPG, PNG — Max 10MB</p>
+                                                </div>
+                                            </div>
+                                        )}
+                                        <input
+                                            id={`proof-upload-${asg.id}`}
+                                            type="file"
+                                            accept="image/*"
+                                            capture="environment"
+                                            className="hidden"
+                                            onChange={handlePhotoChange}
+                                        />
+                                    </label>
+                                </div>
+
+                                {/* Notes */}
+                                <div className="space-y-2">
+                                    <p className="text-[10px] font-black text-muted uppercase tracking-widest">Delivery Notes <span className="text-muted font-normal normal-case">(optional)</span></p>
+                                    <textarea
+                                        rows={3}
+                                        placeholder="Left with concierge, signed by guest, package condition…"
+                                        className="w-full bg-background border border-border rounded-xl px-4 py-3 text-sm text-white placeholder:text-muted/40 focus:border-accent outline-none resize-none transition-all"
+                                        value={proofNotes}
+                                        onChange={(e) => setProofNotes(e.target.value)}
+                                    />
+                                </div>
+
+                                {/* Actions */}
+                                <div className="flex gap-3 pt-1">
+                                    <button
+                                        onClick={() => setShowProof(false)}
+                                        className="flex-1 py-3 bg-white/5 border border-border text-secondary rounded-xl text-[10px] font-black uppercase tracking-widest hover:bg-white/10 transition-all"
+                                    >
+                                        Cancel
+                                    </button>
+                                    <button
+                                        onClick={handleSubmitProof}
+                                        disabled={!proofPhoto}
+                                        className={`flex-1 py-3 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all flex items-center justify-center gap-2 ${proofPhoto
+                                            ? 'bg-success text-white hover:scale-[1.02] shadow-lg shadow-success/20'
+                                            : 'bg-white/5 text-muted cursor-not-allowed'
+                                            }`}
+                                    >
+                                        <CheckCircle2 size={14} /> Confirm Delivery
+                                    </button>
+                                </div>
+                            </div>
+                        </motion.div>
+                    </motion.div>
+                )}
+            </AnimatePresence>
+        </>
+    );
+};
+
+export default EmployeePortal;

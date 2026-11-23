@@ -1,0 +1,704 @@
+// Personal Client Dashboard – distinct from SaaS client dashboard
+import React, { useState, useEffect, useMemo } from 'react';
+import { swalSuccess, swalError, swalConfirm } from '../../utils/swal';
+import KpiCard from '../../components/KpiCard';
+import StatusBadge from '../../components/StatusBadge';
+import OrderModal from '../../components/OrderModal';
+import Modal from '../../components/Modal';
+import { useNavigate } from 'react-router-dom';
+import { useData } from '../../context/GlobalDataContext';
+import { useUpdateOrder, useCreateOrder } from '../../hooks/api/useOrders';
+import { compareOrdersNewestFirst } from '../../utils/apiHelpers';
+import {
+  ArrowUpRight,
+  Car,
+  ChevronRight,
+  CreditCard,
+  Eye,
+  FileText,
+  Gift,
+  HelpCircle,
+  History,
+  Package,
+  ShoppingBag,
+  ShoppingCart,
+  Truck
+} from 'lucide-react';
+
+// Re‑used UI components (StatCard, SectionCard, EmptyState) are defined inline for clarity
+const StatCard = ({ label, value, icon: Icon, color = 'text-accent', bg = 'bg-accent/10', onClick }) => (
+  <div
+    className={`glass-card p-5 ${onClick ? 'cursor-pointer' : ''} group transition-all hover:border-accent/30`}
+    onClick={onClick}
+  >
+    <div className="flex items-start justify-between">
+      <div>
+        <p className={`text-[10px] font-black uppercase tracking-widest mb-1 ${color}`}>{label}</p>
+        <p className="text-3xl font-black italic font-heading tracking-tighter text-white">{String(value ?? 0).padStart(2, '0')}</p>
+      </div>
+      <div className={`w-10 h-10 ${bg} rounded-xl flex items-center justify-center`}>
+        <Icon size={18} className={color} />
+      </div>
+    </div>
+    {onClick && (
+      <p className="text-[9px] text-muted uppercase tracking-widest mt-2 group-hover:text-accent transition-colors flex items-center gap-1">
+        View all <ChevronRight size={10} />
+      </p>
+    )}
+  </div>
+);
+
+const SectionCard = ({ title, icon: Icon, children, viewAllPath, navigate }) => (
+  <div className="glass-card p-6">
+    <div className="flex items-center justify-between mb-6">
+      <h3 className="text-lg font-black text-white italic uppercase tracking-tighter flex items-center gap-2">
+        {Icon && <Icon size={18} className="text-accent" />}{title}
+      </h3>
+      {viewAllPath && (
+        <button onClick={() => navigate(viewAllPath)} className="text-[9px] font-black uppercase tracking-widest text-muted hover:text-accent transition-colors flex items-center gap-1">
+          View All <ChevronRight size={10} />
+        </button>
+      )}
+    </div>
+    {children}
+  </div>
+);
+
+
+const EmptyState = ({ text }) => (
+  <div className="py-8 text-center border border-dashed border-white/5 rounded-2xl bg-white/[0.01]">
+    <p className="text-[10px] font-black uppercase tracking-[0.3em] text-muted italic">{text}</p>
+  </div>
+);
+
+const PersonalClientDashboard = () => {
+  const {
+    orders,
+    projects = [],
+    missions = [],
+    invoices,
+    settleInvoice,
+    currentUser,
+    clients,
+    inventory = [],
+    deliveries = [],
+    chauffeurRequests = [],
+    fetchChauffeurRequests,
+    fetchOrders,
+    fetchProjects,
+    fetchMissions,
+    fetchFinance,
+    fetchInventory,
+    fetchClients,
+    fetchDeliveries,
+    fetchDashboardStats,
+    events = [],
+    fetchTickets,
+    updateClient,
+    purchaseOrders = [],
+    purchaseRequests = [],
+    quotes = [],
+    warehouses = [],
+    fleet = [],
+    guestRequests = [],
+    luxuryItems = [],
+    fetchLuxuryItems,
+    syncGlobalState
+  } = useData();
+  const navigate = useNavigate();
+  const updateOrderMutation = useUpdateOrder();
+  const createOrderMutation = useCreateOrder();
+
+  const handleSave = async (formData, orderId) => {
+    const targetId = orderId || selectedOrder?.id || formData?.id;
+    try {
+      if (targetId) {
+        await updateOrderMutation.mutateAsync({ id: targetId, orderData: formData });
+        swalSuccess('Success', 'Order updated successfully.');
+      } else {
+        await createOrderMutation.mutateAsync(formData);
+        swalSuccess('Success', 'Order created successfully.');
+      }
+      setIsModalOpen(false);
+      if (fetchOrders) fetchOrders();
+      if (fetchDeliveries) fetchDeliveries();
+    } catch (err) {
+      const errMsg = err?.response?.data?.message || err?.message || 'Failed to save order.';
+      swalError('Error', errMsg);
+    }
+  };
+
+  useEffect(() => {
+    fetchOrders();
+    fetchFinance();
+    fetchInventory();
+    fetchClients();
+    fetchDeliveries();
+    if (fetchProjects) fetchProjects();
+    if (fetchMissions) fetchMissions();
+    fetchDashboardStats();
+    if (fetchTickets) fetchTickets();
+    if (fetchChauffeurRequests) fetchChauffeurRequests();
+    if (fetchLuxuryItems) fetchLuxuryItems();
+
+    const handleStateChanged = () => {
+      if (syncGlobalState) syncGlobalState();
+      if (fetchLuxuryItems) fetchLuxuryItems();
+    };
+    window.addEventListener('app:state-changed', handleStateChanged);
+
+    const interval = setInterval(() => {
+      if (syncGlobalState) syncGlobalState();
+      if (fetchLuxuryItems) fetchLuxuryItems();
+    }, 5000);
+    return () => {
+      window.removeEventListener('app:state-changed', handleStateChanged);
+      clearInterval(interval);
+    };
+  }, [syncGlobalState, fetchOrders, fetchFinance, fetchInventory, fetchClients, fetchDeliveries, fetchProjects, fetchMissions, fetchDashboardStats, fetchTickets, fetchChauffeurRequests, fetchLuxuryItems]);
+
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [modalType, setModalType] = useState('add');
+  const [selectedOrder, setSelectedOrder] = useState(null);
+  const [isInvoiceModalOpen, setIsInvoiceModalOpen] = useState(false);
+  const [viewingInvoice, setViewingInvoice] = useState(null);
+  const [isProfileModalOpen, setIsProfileModalOpen] = useState(false);
+  const [profileForm, setProfileForm] = useState({ id: '', business_name: '', contact_person: '', email: '', location: '', phone: '' });
+  const [orderTab, setOrderTab] = useState('open');
+  const [invoiceTab, setInvoiceTab] = useState('unpaid');
+
+  const clientData = useMemo(() => {
+    if (!clients || !currentUser) return {};
+    const found = clients.find(c => c.id === currentUser.company_id || c.email === currentUser.email);
+    return found || {
+      id: currentUser.company_id || currentUser.id,
+      name: currentUser.name || 'Personal Client',
+      email: currentUser.email,
+      address: 'Main Residence',
+      client_type: 'individual'
+    };
+  }, [clients, currentUser]);
+
+  const isMyOrder = (o) => {
+    if (!o) return false;
+    const typeStr = String(o.orderType || o.type || '').toUpperCase();
+    if (typeStr === 'PROJECT' || typeStr === 'CHAUFFEUR' || typeStr.includes('CHAUFFEUR')) return false;
+    const itemsNames = (o.items || []).map(i => String(i.name || '').toUpperCase());
+    if (itemsNames.some(n => n.includes('CHAUFFEUR'))) return false;
+
+    const orderClientId = String(o.clientId || o.client_id || o.metadata?.clientId || o.metadata?.client_id || '').trim();
+    const orderCustId = String(o.customer_id || o.customerId || o.created_by || o.createdById || o.userId || o.user_id || o.metadata?.customer_id || o.metadata?.user_id || '').trim();
+    const orderEmail = String(o.email || o.client_email || o.customer_email || o.metadata?.email || o.metadata?.customer_email || o.metadata?.client_email || '').toLowerCase().trim();
+
+    const myUserId = String(currentUser?.id || '').trim();
+    const myClientId = String(clientData?.id || currentUser?.clientId || '').trim();
+    const myEmail = String(currentUser?.email || clientData?.email || '').toLowerCase().trim();
+    const myName = String(clientData?.name || clientData?.companyName || currentUser?.name || '').toLowerCase().trim();
+
+    if (myUserId && orderCustId && orderCustId === myUserId) return true;
+    if (myClientId && myClientId !== '1' && orderClientId && orderClientId === myClientId) return true;
+    if (myEmail && orderEmail && (orderEmail === myEmail || orderEmail.includes(myEmail) || myEmail.includes(orderEmail))) return true;
+
+    if (myName) {
+      const orderClientName = String(o.client || o.clientName || o.client_name || o.customer_name || o.metadata?.clientName || o.metadata?.client_name || '').toLowerCase().trim();
+      if (orderClientName && (orderClientName === myName || orderClientName.includes(myName) || myName.includes(orderClientName))) return true;
+    }
+
+    return false;
+  };
+
+  const resolveLiveOrderStatus = (o) => {
+    if (!o) return 'pending';
+    const oIdStr = String(o.id || '');
+    const oRawIdStr = String(o.rawId || o.id || '').replace(/\D/g, '');
+    const firstItemName = String(o.items?.[0]?.name || o.product || '').toLowerCase().trim();
+
+    // 1. Find linked projects (by exact orderRef or orderId)
+    const linkedProjects = (projects || []).filter(p => {
+      const pRef = String(p.orderRef || p.order_ref || p.orderId || p.order_id || p.metadata?.orderRef || p.metadata?.order_ref || p.metadata?.orderId || '');
+      const pId = String(p.id || '');
+      return (
+        (pRef && (pRef === oIdStr || pRef === oRawIdStr || pRef === `ORD-${oIdStr}` || pRef === `ORD-${oRawIdStr}`)) ||
+        (pId && (pId === oIdStr || pId === oRawIdStr))
+      );
+    });
+    const linkedProjectIds = linkedProjects.map(p => String(p.id));
+
+    // 2. Find linked mission (by orderId, projectId, or project match)
+    const linkedMission = (missions || []).find(m => {
+      const mOrderId = String(m.orderId || m.order_id || m.order_id_raw || m.metadata?.orderId || m.metadata?.orderRef || '');
+      const mProjectId = String(m.projectId || m.project_id || m.metadata?.projectId || m.metadata?.projectRef || '');
+      return (
+        mOrderId === oIdStr ||
+        mOrderId === oRawIdStr ||
+        mOrderId === `ORD-${oIdStr}` ||
+        mOrderId === `ORD-${oRawIdStr}` ||
+        linkedProjectIds.includes(mOrderId) ||
+        linkedProjectIds.includes(mProjectId)
+      );
+    });
+
+    // 3. Find linked delivery (by orderId, missionId, or project match)
+    const linkedDelivery = (deliveries || []).find(d => {
+      const dOrderId = String(d.orderId || d.order_id_raw || d.order_id || '');
+      const dMissionId = String(d.mission_id || d.missionId || '');
+      return (
+        dOrderId === oIdStr ||
+        dOrderId === oRawIdStr ||
+        dOrderId === `ORD-${oIdStr}` ||
+        dOrderId === `ORD-${oRawIdStr}` ||
+        linkedProjectIds.includes(dOrderId) ||
+        (linkedMission && (dMissionId === String(linkedMission.id) || dOrderId === String(linkedMission.orderId)))
+      );
+    });
+
+    const dbSt = String(o.status || '').toLowerCase();
+    if (['completed', 'delivered', 'done'].includes(dbSt)) return 'completed';
+
+    if (linkedDelivery) {
+      const delSt = String(linkedDelivery.status || '').toLowerCase();
+      if (['delivered', 'completed'].includes(delSt)) return 'completed';
+      if (['in_transit', 'en_route', 'on_way'].includes(delSt)) return 'in_transit';
+      if (['assigned', 'accepted'].includes(delSt) || linkedDelivery.driver) return 'assigned';
+      return 'logistics';
+    }
+    if (linkedMission) {
+      const misSt = String(linkedMission.status || '').toLowerCase();
+      if (['delivered', 'completed', 'done'].includes(misSt)) return 'completed';
+      if (['in_transit', 'en_route', 'dispatched'].includes(misSt)) return 'in_transit';
+      if (['assigned', 'accepted', 'in_progress'].includes(misSt)) return 'assigned';
+      return 'logistics';
+    }
+    if (linkedProjects.length > 0) {
+      const hasCompletedPrj = linkedProjects.some(p => ['completed', 'delivered'].includes(String(p.status || '').toLowerCase()));
+      if (hasCompletedPrj) return 'completed';
+      return 'logistics';
+    }
+    return dbSt || 'pending';
+  };
+
+  const clientOrders = (orders || []).filter(isMyOrder).sort(compareOrdersNewestFirst);
+  const clientInvoices = (invoices || []).filter(inv =>
+    inv.clientId === clientData.id || inv.company_id === clientData.id || inv.client === clientData.name ||
+    (inv.userId && String(inv.userId) === String(currentUser?.id))
+  );
+  const clientChauffeurRequests = (chauffeurRequests || []).filter(req => {
+    if (!req) return false;
+
+    // Strict cross-tenant boundary: reject if tenantId mismatch is present
+    const currentTenantId = currentUser?.tenantId != null ? String(currentUser.tenantId) : null;
+    const reqTenantId = req.tenantId != null ? String(req.tenantId) : null;
+    if (currentTenantId && reqTenantId && currentTenantId !== reqTenantId) {
+      return false;
+    }
+
+    const myUserId = currentUser?.id != null ? String(currentUser.id) : null;
+    const myClientId = (clientData?.id && clientData.id !== 'GUEST') ? String(clientData.id) : (currentUser?.company_id ? String(currentUser.company_id) : null);
+    const myEmail = currentUser?.email ? String(currentUser.email).toLowerCase().trim() : null;
+
+    // 1. Exact match on verified customer user ID
+    const reqCustId = (req.customer_id != null && req.customer_id !== '') ? String(req.customer_id) :
+      (req.user_id != null && req.user_id !== '') ? String(req.user_id) :
+        (req.userId != null && req.userId !== '') ? String(req.userId) :
+          (req.created_by != null && req.created_by !== '') ? String(req.created_by) : null;
+
+    if (myUserId && reqCustId && reqCustId === myUserId) return true;
+
+    // 2. Exact match on verified client ID
+    const reqClientId = (req.clientId && req.clientId !== 'CLT-GUEST') ? String(req.clientId) :
+      (req.company_id != null && req.company_id !== '') ? String(req.company_id) : null;
+
+    if (myClientId && reqClientId && reqClientId === myClientId) return true;
+
+    // 3. Exact match on verified customer email (exact equality only, no partial match)
+    const reqEmail = req.customer_email ? String(req.customer_email).toLowerCase().trim() :
+      (req.email ? String(req.email).toLowerCase().trim() : null);
+
+    if (myEmail && reqEmail && reqEmail === myEmail) return true;
+
+    return false;
+  });
+
+  const DONE_STATUSES = ['delivered', 'cancelled', 'completed', 'done'];
+  const isDoneOrder = (s) => DONE_STATUSES.includes(String(s || '').toLowerCase().replace(/\s+/g, '_'));
+
+  const activeOrders = clientOrders.filter(o => !isDoneOrder(o.status));
+  const activeDeliveries = deliveries.filter(d => !isDoneOrder(d.status) && clientOrders.some(o => String(o.id) === String(d.orderId) || String(o.id) === String(d.order_id_raw)));
+  const unpaidInvoices = clientInvoices.filter(inv => String(inv.status || '').toLowerCase() !== 'paid');
+
+  // Chauffeur bookings: only show active (not completed/cancelled) in the Active Bookings widget.
+  // Completed rides are accessible from the full Chauffeur page under "Order History".
+  const CHAUFFEUR_DONE = ['completed', 'delivered', 'cancelled', 'done'];
+  const activeChauffeurBookings = clientChauffeurRequests.filter(
+    req => !CHAUFFEUR_DONE.includes(String(req.status || '').toLowerCase().replace(/\s+/g, '_'))
+  );
+
+  const clientLuxuryItems = useMemo(() => {
+    const ids = new Set();
+    if (currentUser?.id != null) ids.add(String(currentUser.id));
+    if (currentUser?.clientId != null) ids.add(String(currentUser.clientId));
+    if (currentUser?.client_id != null) ids.add(String(currentUser.client_id));
+    if (currentUser?.companyId != null) ids.add(String(currentUser.companyId));
+    if (currentUser?.company_id != null) ids.add(String(currentUser.company_id));
+    if (clientData?.id != null) ids.add(String(clientData.id));
+
+    const userEmail = String(currentUser?.email || clientData?.email || '').toLowerCase().trim();
+    if (userEmail && Array.isArray(clients)) {
+      clients.forEach(c => {
+        if (c && String(c.email || '').toLowerCase().trim() === userEmail) {
+          if (c.id != null) ids.add(String(c.id));
+        }
+      });
+    }
+
+    return (luxuryItems || []).filter(item => {
+      const itemCid = item.clientId ?? item.client_id;
+      if (itemCid != null && ids.has(String(itemCid))) {
+        return true;
+      }
+      if (clientData?.name) {
+        const itemCname = item.clientName || item.client_name || item.owner;
+        if (itemCname && itemCname.toLowerCase() === clientData.name.toLowerCase()) {
+          return true;
+        }
+      }
+      return false;
+    });
+  }, [luxuryItems, clientData, currentUser, clients]);
+
+  const handleAction = (type, order) => {
+    setSelectedOrder(order);
+    setModalType(type);
+    setIsModalOpen(true);
+  };
+
+  const handlePayment = async (inv) => {
+    const amount = inv.totalAmount - (inv.paidAmount || 0);
+    if ((await swalConfirm('Settle Balance', `Settle ${amount.toLocaleString()} for ${inv.id}?`)).isConfirmed) {
+      settleInvoice(inv.id, { amount, method: 'Dashboard Fast-Pay' });
+    }
+  };
+
+  const handleProfileUpdate = async () => {
+    if (updateClient) {
+      await updateClient(profileForm);
+      setIsProfileModalOpen(false);
+      swalSuccess('Success', 'Profile updated successfully.');
+      fetchClients();
+    }
+  };
+
+  return (
+    <div className="min-h-screen space-y-8 animate-fade-in pb-10">
+      <div className="max-w-[1600px] mx-auto space-y-8">
+        {/* Header */}
+        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+          <div>
+            <h1 className="text-2xl md:text-3xl font-black tracking-tighter text-white italic uppercase">Personal Client Dashboard</h1>
+            <p className="text-secondary text-[10px] md:text-xs mt-1 font-black uppercase tracking-[0.2em] opacity-70">{clientData?.tagline || 'Personal client dashboard.'}</p>
+          </div>
+
+        </div>
+
+        {/* KPI Row – Core Operations */}
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+          <StatCard label="Active Orders" value={activeOrders.length} icon={ShoppingCart} color="text-accent" bg="bg-accent/10" onClick={() => navigate('/dashboard/client-orders')} />
+          <StatCard label="In‑Transit Deliveries" value={activeDeliveries.length} icon={Truck} color="text-info" bg="bg-info/10" onClick={() => navigate('/dashboard/track-delivery')} />
+          <StatCard label="Unpaid Invoices" value={unpaidInvoices.length} icon={CreditCard} color="text-danger" bg="bg-danger/10" onClick={() => navigate('/dashboard/invoices')} />
+          <StatCard label="Vault Assets" value={clientLuxuryItems.length} icon={Gift} color="text-success" bg="bg-success/10" onClick={() => navigate('/dashboard/luxury-items')} />
+        </div>
+
+        {/* Main content */}
+        <div className="grid grid-cols-1 xl:grid-cols-12 gap-6 sm:gap-8">
+          {/* Left Column */}
+          <div className="xl:col-span-8 space-y-6 sm:space-y-8">
+            {/* Unified Order & Transaction History Proof Ledger */}
+            <SectionCard title="Unified Order & Transaction History" icon={History} viewAllPath="/dashboard/client-orders" navigate={navigate}>
+              <div className="flex bg-background border border-border p-1 rounded-xl w-fit mb-6 overflow-x-auto max-w-full">
+                {['all', 'open', 'fulfilled', 'chauffeur', 'invoices'].map(tab => (
+                  <button key={tab} onClick={() => setOrderTab(tab)}
+                    className={`px-4 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-widest transition-all whitespace-nowrap ${orderTab === tab ? 'bg-accent text-black' : 'text-muted hover:text-white'}`}
+                  >{tab}</button>
+                ))}
+              </div>
+
+              {/* Transaction Ledger Table / Cards */}
+              <div className="space-y-3">
+                {(() => {
+                  const rawCombined = [
+                    ...clientChauffeurRequests.map(r => ({
+                      txId: `CH-${r.id}`,
+                      type: `VIP Chauffeur (${r.serviceType || 'One Way'})`,
+                      date: r.dueDate || r.requestDate || 'N/A',
+                      rawDate: r.createdAt || r.created_at || r.order_date || r.date || r.requestDate || null,
+                      rawId: r.id,
+                      amount: parseFloat(r.chauffeurFee || r.chauffeur_fee || 120),
+                      status: r.status,
+                      proofRef: `PROOF-CH-${r.id}`,
+                      raw: r,
+                      category: 'chauffeur',
+                      isDone: CHAUFFEUR_DONE.includes(String(r.status || '').toLowerCase().replace(/\s+/g, '_'))
+                    })),
+                    ...clientOrders.map(o => {
+                      const liveStatus = resolveLiveOrderStatus(o);
+                      let meta = o.metadata;
+                      if (typeof meta === 'string') {
+                        try { meta = JSON.parse(meta); } catch { meta = {}; }
+                      }
+                      meta = meta || {};
+                      const metaItems = meta.customItems || meta.custom_items || meta.manifestItems || o.customItems || o.items || [];
+                      const firstItemName = (Array.isArray(metaItems) && metaItems[0]?.name) || o.items?.[0]?.name || o.product || null;
+                      const orderTypeLabel = firstItemName ? `${firstItemName} (Order)` : (o.orderType || o.type || 'Marketplace Requisition');
+
+                      return {
+                        txId: `ORD-${o.id}`,
+                        type: orderTypeLabel,
+                        itemName: firstItemName,
+                        date: o.date || o.createdAt?.split('T')[0] || 'N/A',
+                        rawDate: o.createdAt || o.created_at || o.order_date || o.date,
+                        rawId: o.id,
+                        amount: parseFloat(o.totalAmount || o.total || o.total_amount || 0),
+                        status: liveStatus,
+                        proofRef: `PROOF-ORD-${o.id}`,
+                        raw: o,
+                        category: 'order',
+                        isDone: isDoneOrder(liveStatus)
+                      };
+                    }),
+                    ...clientInvoices.filter(i => String(i.status || '').toLowerCase() === 'paid').map(i => ({
+                      txId: `INV-${i.id}`,
+                      type: `Settled Invoice Payment`,
+                      date: i.date || 'N/A',
+                      rawDate: i.createdAt || i.created_at || i.date,
+                      rawId: i.id,
+                      amount: parseFloat(i.totalAmount || 0),
+                      status: 'Paid',
+                      proofRef: `PAYMENT-WIRE-${i.id}`,
+                      raw: i,
+                      category: 'invoices',
+                      isDone: true
+                    }))
+                  ];
+
+                  const seenTxKeys = new Set();
+                  const combinedHistory = rawCombined.filter(tx => {
+                    const key = `${tx.category}-${tx.rawId}`;
+                    if (seenTxKeys.has(key)) return false;
+                    seenTxKeys.add(key);
+                    return true;
+                  }).sort((a, b) => {
+                    const timeA = new Date(a.rawDate || a.date || 0).getTime();
+                    const timeB = new Date(b.rawDate || b.date || 0).getTime();
+                    if (!isNaN(timeA) && !isNaN(timeB) && timeA !== timeB) return timeB - timeA;
+                    const isSameCat = a.category === b.category;
+                    if (isSameCat) {
+                      const numA = parseInt(String(a.rawId || a.txId || 0).replace(/\D/g, ''), 10) || 0;
+                      const numB = parseInt(String(b.rawId || b.txId || 0).replace(/\D/g, ''), 10) || 0;
+                      if (numA > 0 && numB > 0 && numA !== numB) return numB - numA;
+                    }
+                    const numA = parseInt(String(a.rawId || a.txId || 0).replace(/\D/g, ''), 10) || 0;
+                    const numB = parseInt(String(b.rawId || b.txId || 0).replace(/\D/g, ''), 10) || 0;
+                    return numB - numA;
+                  });
+
+                  const filteredTx = combinedHistory.filter(tx => {
+                    if (orderTab === 'open') return !tx.isDone;
+                    if (orderTab === 'fulfilled') return tx.isDone && tx.category === 'order';
+                    if (orderTab === 'chauffeur') return tx.category === 'chauffeur';
+                    if (orderTab === 'invoices') return tx.category === 'invoices';
+                    return true; // 'all'
+                  });
+
+                  return filteredTx.slice(0, 6).map((tx, idx) => (
+                    <div key={idx} className="group bg-white/[0.02] border border-white/5 rounded-2xl p-5 hover:border-accent/30 hover:bg-white/[0.04] transition-all duration-300">
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                        <div className="flex items-center gap-4 flex-1">
+                          <div className="w-12 h-12 bg-background border border-white/10 rounded-xl flex items-center justify-center text-accent/40 group-hover:text-accent transition-colors">
+                            {tx.category === 'chauffeur' ? <Car size={20} /> : tx.category === 'invoices' ? <CreditCard size={20} /> : <Package size={20} />}
+                          </div>
+                          <div>
+                            <p className="font-black text-white text-sm group-hover:text-accent transition-colors italic">{tx.type}</p>
+                            <div className="flex items-center gap-2 mt-1">
+                              <span className="text-[10px] font-black text-accent uppercase tracking-widest italic">{tx.txId}</span>
+                              <span className="text-muted/30">•</span>
+                              <span className="text-[10px] font-black text-muted uppercase tracking-widest italic">{tx.date}</span>
+                              <span className="text-muted/30">•</span>
+                              <span className="text-[9px] font-bold text-secondary/60 uppercase tracking-wider">{tx.proofRef}</span>
+                            </div>
+                          </div>
+                        </div>
+                        <div className="flex items-center justify-between sm:justify-end gap-6 w-full sm:w-auto">
+                          <div className="text-right">
+                            <p className="text-lg font-black text-white font-heading italic tracking-tighter">${tx.amount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
+                            <StatusBadge status={tx.status} />
+                          </div>
+                          <button onClick={() => {
+                            if (tx.category === 'order') handleAction('view', tx.raw);
+                            else if (tx.category === 'chauffeur') navigate('/dashboard/chauffeur');
+                            else navigate('/dashboard/invoices');
+                          }} className="w-12 h-12 bg-white/5 border border-white/10 rounded-2xl flex items-center justify-center hover:bg-accent hover:text-black hover:border-accent transition-all shadow-lg">
+                            <ArrowUpRight size={20} />
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  ));
+                })()}
+              </div>
+            </SectionCard>
+
+            {/* Chauffeur Bookings */}
+            <SectionCard title="Active Chauffeur Bookings" icon={Car} viewAllPath="/dashboard/chauffeur" navigate={navigate}>
+              <div className="space-y-3">
+                {activeChauffeurBookings.slice(0, 3).map((req, i) => (
+                  <div key={i} className="p-4 bg-white/5 border border-border rounded-xl">
+                    <div className="flex justify-between items-start">
+                      <div>
+                        <p className="text-sm font-black text-white italic">{req.serviceType || 'Chauffeur Protocol'}</p>
+                        <div className="flex items-center gap-1.5 mt-1 text-[10px] text-muted font-bold truncate max-w-[240px]">
+                          <span className="text-accent shrink-0">{req.pickupLocation || 'Pickup'}</span>
+                          <span className="shrink-0">→</span>
+                          <span className="truncate">{req.dropLocation || 'Destination'}</span>
+                        </div>
+                      </div>
+                      <StatusBadge status={req.status} />
+                    </div>
+                    <p className="text-[10px] text-accent font-black uppercase tracking-widest mt-2">{req.dueDate || req.requestDate || ''} @ {req.pickupTime || ''}</p>
+                  </div>
+                ))}
+                {activeChauffeurBookings.length === 0 && (
+                  <div className="py-6 text-center border border-dashed border-white/5 rounded-2xl">
+                    <p className="text-[10px] font-black uppercase tracking-[0.3em] text-muted italic">No active chauffeur bookings.</p>
+                    <p className="text-[9px] text-muted/60 mt-1 font-bold">Completed rides appear under Order History on the Chauffeur page.</p>
+                  </div>
+                )}
+                <button onClick={() => navigate('/dashboard/chauffeur')} className="w-full mt-6 py-2.5 bg-white/5 border border-border text-white rounded-xl text-[10px] font-bold uppercase tracking-widest hover:bg-white/10 transition-all">Manage Protocols</button>
+              </div>
+            </SectionCard>
+
+            {/* Concierge Requests */}
+            <SectionCard title="Concierge Requests" icon={HelpCircle} viewAllPath="/dashboard/events" navigate={navigate}>
+              <div className="space-y-3">
+                {events.filter(e => e.clientId === clientData.id || e.client === clientData.name).slice(0, 3).map((event, i) => (
+                  <div key={i} className="p-4 bg-white/5 border border-border rounded-xl">
+                    <p className="text-sm font-black text-white italic">{event.request || event.title || event.name}</p>
+                    <p className="text-[10px] text-accent font-black uppercase tracking-widest mt-1">{event.date} - {event.status || 'Pending'}</p>
+                  </div>
+                ))}
+                {events.filter(e => e.clientId === clientData.id || e.client === clientData.name).length === 0 && (<EmptyState text="No active concierge logs found." />)}
+                <button onClick={() => navigate('/dashboard/events')} className="w-full mt-6 py-2.5 bg-white/5 border border-border text-white rounded-xl text-[10px] font-bold uppercase tracking-widest hover:bg-white/10 transition-all">Initiate Request</button>
+              </div>
+            </SectionCard>
+
+            {/* Delivery Tracking */}
+            <SectionCard title="Delivery Tracking" icon={Truck} viewAllPath="/dashboard/track-delivery" navigate={navigate}>
+              <div className="grid grid-cols-3 gap-3 mb-4">
+                <div className="p-3 bg-info/5 border border-info/10 rounded-xl text-center"><p className="text-lg font-black text-info">{activeDeliveries.length}</p><p className="text-[9px] text-muted uppercase font-black tracking-widest">In Transit</p></div>
+                <div className="p-3 bg-success/5 border border-success/10 rounded-xl text-center"><p className="text-lg font-black text-success">{deliveries.filter(d => d.status === 'Delivered' && clientOrders.some(o => o.id === d.orderId)).length}</p><p className="text-[9px] text-muted uppercase font-black tracking-widest">Delivered</p></div>
+                <div className="p-3 bg-white/[0.02] border border-white/5 rounded-xl text-center"><p className="text-lg font-black text-white">{deliveries.filter(d => clientOrders.some(o => o.id === d.orderId)).length}</p><p className="text-[9px] text-muted uppercase font-black tracking-widest">Total</p></div>
+              </div>
+              <div className="space-y-3">
+                {activeDeliveries.slice(0, 4).map((d, idx) => (
+                  <div key={idx} className="flex items-center justify-between p-4 bg-white/[0.02] border border-white/5 rounded-2xl hover:border-info/20 transition-all">
+                    <div className="flex items-center gap-3">
+                      <div className="w-10 h-10 bg-info/10 rounded-xl flex items-center justify-center text-info"><Truck size={16} /></div>
+                      <div>
+                        <p className="text-sm font-black text-white italic">DEL-{d.id}</p>
+                        <p className="text-[10px] text-muted uppercase font-black tracking-widest">{d.destination || d.dropLocation || 'N/A'}</p>
+                      </div>
+                    </div>
+                    <StatusBadge status={d.status} />
+                  </div>
+                ))}
+                {activeDeliveries.length === 0 && <EmptyState text="No active deliveries" />}
+              </div>
+            </SectionCard>
+          </div>
+
+          {/* Right Column */}
+          <div className="xl:col-span-4 space-y-6 sm:space-y-8">
+            {/* Billing & Invoices */}
+            <SectionCard title="Billing & Invoices" icon={CreditCard} viewAllPath="/dashboard/invoices" navigate={navigate}>
+              <div className="flex bg-background border border-border p-1 rounded-xl w-fit mb-6">
+                {['unpaid', 'paid'].map(tab => (
+                  <button key={tab} onClick={() => setInvoiceTab(tab)} className={`px-4 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-widest transition-all ${invoiceTab === tab ? (tab === 'unpaid' ? 'bg-danger text-white' : 'bg-success text-white') : 'text-muted hover:text-white'}`}>{tab}</button>
+                ))}
+              </div>
+              <div className="space-y-3 overflow-x-auto pb-2 custom-scrollbar">
+                {clientInvoices.filter(inv => invoiceTab === 'paid' ? inv.status === 'Paid' : inv.status !== 'Paid').map((inv, idx) => (
+                  <div key={idx} className="group bg-white/[0.02] border border-white/5 rounded-2xl p-5 hover:border-accent/30 hover:bg-white/[0.04] transition-all duration-300 min-w-[440px]">
+                    <div className="flex items-center justify-between gap-6">
+                      <div className="flex items-center gap-4 flex-1 min-w-0">
+                        <div className="w-12 h-12 bg-background border border-white/10 rounded-xl flex items-center justify-center text-muted/40 group-hover:text-accent transition-colors flex-shrink-0"><FileText size={22} /></div>
+                        <div className="min-w-0">
+                          <p className="font-black text-white text-sm group-hover:text-accent transition-colors italic truncate">{inv.id}</p>
+                          <p className="text-[10px] font-black text-muted uppercase tracking-widest mt-1 italic truncate">{inv.date}</p>
+                        </div>
+                      </div>
+                      <div className="flex items-center justify-end gap-6 flex-shrink-0">
+                        <div className="text-right">
+                          <p className="text-lg font-black text-white font-heading italic tracking-tighter">${parseFloat(inv.totalAmount || 0).toLocaleString()}</p>
+                          <StatusBadge status={inv.status} />
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <button onClick={() => { setViewingInvoice(inv); setIsInvoiceModalOpen(true); }} className="w-10 h-10 bg-white/5 border border-white/10 rounded-xl flex items-center justify-center hover:bg-accent hover:text-accent transition-all flex-shrink-0"><Eye size={18} /></button>
+                          {inv.status !== 'Paid' && (
+                            <button onClick={() => handlePayment(inv)} className="px-5 h-10 bg-accent text-black rounded-xl text-[10px] font-black uppercase tracking-widest hover:shadow-lg transition-all flex-shrink-0">Settle</button>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+                {clientInvoices.filter(inv => invoiceTab === 'paid' ? inv.status === 'Paid' : inv.status !== 'Paid').length === 0 && (<EmptyState text="No invoices found" />)}
+              </div>
+            </SectionCard>
+
+            {/* Luxury Asset Vault */}
+            <SectionCard title="Luxury Asset Vault" icon={Gift} viewAllPath="/dashboard/luxury-items" navigate={navigate}>
+              <div className="space-y-3">
+                {clientLuxuryItems.slice(0, 3).map((item, idx) => (
+                  <div key={idx} className="p-4 bg-white/[0.02] border border-white/5 rounded-xl flex items-center justify-between hover:border-accent/20 transition-all">
+                    <div>
+                      <p className="text-sm font-black text-white italic">{item.item || item.name}</p>
+                      <p className="text-[10px] text-accent font-black uppercase tracking-widest mt-1">
+                        {item.vault || 'Vault Alpha'} • {item.status || 'Stored'}
+                      </p>
+                    </div>
+                    <span className="text-xs font-mono font-bold text-success">${Number(item.value || item.price || 0).toLocaleString()}</span>
+                  </div>
+                ))}
+                {clientLuxuryItems.length === 0 && (
+                  <div className="py-6 text-center border border-dashed border-white/5 rounded-2xl">
+                    <p className="text-[10px] font-black uppercase tracking-[0.3em] text-muted italic">No private luxury assets in vault.</p>
+                  </div>
+                )}
+                <button onClick={() => navigate('/dashboard/luxury-items')} className="w-full mt-4 py-3 bg-white/5 border border-white/10 text-white rounded-xl text-[9px] font-black uppercase tracking-[0.2em] hover:bg-accent hover:text-black hover:border-accent transition-all">
+                  Open Vault Registry
+                </button>
+              </div>
+            </SectionCard>
+
+            {/* Marketplace Store */}
+            <SectionCard title="Marketplace Store" icon={ShoppingBag} viewAllPath="/dashboard/store" navigate={navigate}>
+              <button onClick={() => navigate('/dashboard/store')} className="w-full py-3 bg-white/5 border border-white/10 text-white rounded-xl text-[9px] font-black uppercase tracking-[0.2em] hover:bg-info hover:text-white hover:border-info transition-all">Open Catalog</button>
+            </SectionCard>
+
+            {/* Customer Support */}
+            <SectionCard title="Customer Support" icon={HelpCircle} viewAllPath="/dashboard/support" navigate={navigate}>
+              <button onClick={() => navigate('/dashboard/support')} className="w-full py-3 bg-white/5 border border-white/10 text-white rounded-xl text-[9px] font-black uppercase tracking-[0.2em] hover:bg-accent hover:text-black hover:border-accent transition-all">Open Support</button>
+            </SectionCard>
+          </div>
+        </div>
+      </div>
+
+      {/* Modals */}
+      <OrderModal isOpen={isModalOpen} onClose={() => setIsModalOpen(false)} modalType={modalType} selectedOrder={selectedOrder} onSave={handleSave} onDelete={() => { setIsModalOpen(false); }} role={currentUser?.role || 'client'} />
+      <Modal isOpen={isInvoiceModalOpen} onClose={() => setIsInvoiceModalOpen(false)} title={`Invoice: ${viewingInvoice?.id}`}>
+        {/* Minimal invoice view – details already displayed in the main list */}
+      </Modal>
+    </div>
+  );
+};
+
+export default PersonalClientDashboard;

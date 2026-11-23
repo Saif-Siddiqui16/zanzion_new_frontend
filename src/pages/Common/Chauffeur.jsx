@@ -1,0 +1,2019 @@
+import React, { useState, useEffect, useMemo, useRef } from 'react';
+import Swal, { swalSuccess, swalError, swalWarning, swalInfo, swalConfirm, swalCredentials, swalCopied, swalLoading, swalClose } from '../../utils/swal';
+import {
+    Car, Calendar, Clock, MapPin, Navigation,
+    Plus, X, CheckCircle, Info, ArrowRight,
+    Luggage, Clock4, Search, Filter, Edit2, Trash2
+} from 'lucide-react';
+import { motion, AnimatePresence } from 'framer-motion';
+import { useData } from '../../context/GlobalDataContext';
+import Table from '../../components/Table';
+import StatusBadge from '../../components/StatusBadge';
+import Pagination from '../../components/Common/Pagination';
+import { calculateOSRMRouteDistance } from '../../utils/distanceHelper';
+import { useQueryClient } from '@tanstack/react-query';
+import { useChauffeurMissions, useCreateChauffeurMission, useUpdateChauffeurMission, useDeleteChauffeurMission } from '../../hooks/api/useChauffeur';
+import { formatClientDisplayName } from '../../utils/apiHelpers';
+import { normalizeRole } from '../../utils/authUtils';
+import api from '../../services/api/setupAxios';
+import { setUpdatedChauffeurItem, addDeletedChauffeurId, notifyStateChanged } from '../../utils/stateSyncHelper';
+
+const DriverEtaDisplay = ({ pickupLocation, status, driverName }) => {
+    const [eta, setEta] = useState(null);
+    const [loading, setLoading] = useState(false);
+
+    useEffect(() => {
+        if (!driverName || !pickupLocation) return;
+        const normStatus = String(status || '').toLowerCase().replace(/\s+/g, '_');
+        if (['completed', 'delivered', 'arrived'].includes(normStatus)) {
+            return;
+        }
+
+        let isMounted = true;
+        const fetchEta = async () => {
+            setLoading(true);
+            try {
+                const res = await calculateOSRMRouteDistance("Nassau Hub", pickupLocation);
+                if (res && isMounted) {
+                    setEta(res.durationMins);
+                }
+            } catch (err) {
+                console.error("Failed to calculate ETA:", err);
+            } finally {
+                if (isMounted) setLoading(false);
+            }
+        };
+
+        fetchEta();
+        return () => { isMounted = false; };
+    }, [pickupLocation, status, driverName]);
+
+    const normStatus = String(status || '').toLowerCase().replace(/\s+/g, '_');
+    if (['completed', 'delivered', 'arrived'].includes(normStatus)) {
+        return (
+            <div className="flex items-center gap-2 mt-2 px-3 py-1.5 rounded-lg bg-success/20 border border-success/30 text-success text-[10px] font-black uppercase tracking-wider w-fit">
+                <CheckCircle size={12} />
+                <span>Driver Arrived</span>
+            </div>
+        );
+    }
+
+    if (!driverName) return null;
+
+    if (loading) {
+        return (
+            <div className="text-[10px] text-muted font-bold mt-2 flex items-center gap-1.5 animate-pulse">
+                <Clock size={12} className="animate-spin text-accent" />
+                <span>Calculating driver ETA...</span>
+            </div>
+        );
+    }
+
+    if (eta !== null) {
+        return (
+            <div className="flex flex-col gap-1 mt-2">
+                <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-accent/20 border border-accent/30 text-accent text-[10px] font-black uppercase tracking-wider w-fit">
+                    <Clock size={12} />
+                    <span>ETA: ~{eta} mins ({Math.round(eta * 1.2)} km away)</span>
+                </div>
+            </div>
+        );
+    }
+
+    return (
+        <div className="flex items-center gap-2 mt-2 px-3 py-1.5 rounded-lg bg-white/5 border border-white/10 text-secondary text-[10px] font-black uppercase tracking-wider w-fit">
+            <Clock size={12} />
+            <span>ETA: ~15 mins (Nassau Area)</span>
+        </div>
+    );
+};
+
+const CHAUFFEUR_BASE_FEE_USD = Number(import.meta.env?.VITE_CHAUFFEUR_BASE_FEE_USD) || 120;
+const CHAUFFEUR_BILLING_MODE = String(import.meta.env?.VITE_CHAUFFEUR_BILLING_MODE || 'separate').toLowerCase() === 'included'
+    ? 'included'
+    : 'separate';
+
+const getPeriodFrom24h = (timeStr) => {
+    if (!timeStr) return '';
+    const parts = timeStr.split(':');
+    const hour = parseInt(parts[0], 10);
+    if (isNaN(hour)) return '';
+    return hour >= 12 ? 'PM' : 'AM';
+};
+
+const Chauffeur = () => {
+    const {
+        currentUser,
+        users,
+        customerUsers,
+        clients,
+        fetchStaff,
+        fetchClients,
+        fetchCustomerUsers,
+        hasMenuPermission,
+        systemSettings,
+        fetchSystemSettings,
+        fleet,
+        fetchFleet,
+        syncGlobalState,
+        addChauffeurRequest,
+        updateChauffeurRequest: updateChauffeurRequestCtx,
+        deleteChauffeurRequest,
+    } = useData();
+    const queryClient = useQueryClient();
+    const [editingRequest, setEditingRequest] = useState(null);
+    useEffect(() => {
+        fetchStaff();
+        fetchClients();
+        if (fetchCustomerUsers) fetchCustomerUsers();
+        fetchSystemSettings();
+        fetchFleet();
+
+        const handleStateChanged = () => {
+            queryClient.invalidateQueries({ queryKey: ['chauffeurMissions'] });
+            if (syncGlobalState) syncGlobalState();
+        };
+        window.addEventListener('app:state-changed', handleStateChanged);
+
+        return () => {
+            window.removeEventListener('app:state-changed', handleStateChanged);
+        };
+    }, [fetchStaff, fetchClients, fetchSystemSettings, fetchFleet, queryClient, syncGlobalState]);
+
+    const [currentPage, setCurrentPage] = useState(1);
+    const [searchTerm, setSearchTerm] = useState('');
+    const [debounceSearch, setDebounceSearch] = useState('');
+
+    useEffect(() => {
+        const timer = setTimeout(() => {
+            setDebounceSearch(searchTerm);
+            setCurrentPage(1);
+        }, 500);
+        return () => clearTimeout(timer);
+    }, [searchTerm]);
+
+    const { data: chauffeurData, isLoading } = useChauffeurMissions(currentPage, 10, debounceSearch);
+    const chauffeurRequests = chauffeurData?.data || [];
+    const meta = chauffeurData?.meta || { totalPages: 1, totalItems: 0 };
+
+    const createMutation = useCreateChauffeurMission();
+    const updateMutation = useUpdateChauffeurMission();
+    const deleteMutation = useDeleteChauffeurMission();
+
+    const updateChauffeurRequest = (updated) => {
+        updateMutation.mutate({
+            id: updated.id,
+            data: updated
+        });
+        setEditingRequest(updated);
+    };
+
+    useEffect(() => {
+        if (editingRequest && editingRequest.id) {
+            const updated = (chauffeurRequests || []).find(r => r.id === editingRequest.id);
+            if (updated) {
+                setEditingRequest(updated);
+            }
+        }
+    }, [chauffeurRequests, editingRequest?.id]);
+
+    const [showModal, setShowModal] = useState(false);
+    const [isSubmitting, setIsSubmitting] = useState(false);
+    const isSubmittingRef = useRef(false);
+    const [bookingTab, setBookingTab] = useState('active'); // 'active' | 'history'
+
+    const [modalType, setModalType] = useState('create'); // create, edit, view
+    const [serviceType, setServiceType] = useState('One Way');
+    const [chauffeurQuote, setChauffeurQuote] = useState(0);
+    const [hasLuggage, setHasLuggage] = useState(false);
+    const [hasStops, setHasStops] = useState(false);
+    const [amenities, setAmenities] = useState([]);
+
+    const [pickupTimeInput, setPickupTimeInput] = useState('12:00');
+    const [returnTimeInput, setReturnTimeInput] = useState('12:00');
+
+    const userRoleKey = normalizeRole(currentUser?.role);
+    const isCustomer = userRoleKey === 'customer';
+    const isSaasAdmin = userRoleKey === 'saas_client';
+    const isClientAdmin = userRoleKey === 'client';
+    const isStaffAdmin = !isCustomer && !isClientAdmin;
+    const isAdmin = isStaffAdmin;
+    const isFeeLocked = isCustomer || (isClientAdmin && (!editingRequest || editingRequest?.userId === currentUser?.id));
+
+    /** Admin-configured base price (Settings → system), fallback to env default */
+    const defaultChauffeurFee = useMemo(() => {
+        const raw = systemSettings?.chauffeur_base_price ?? systemSettings?.chauffeurBasePrice;
+        const n = parseFloat(raw);
+        if (Number.isFinite(n) && n >= 0) return Number(n.toFixed(2));
+        return CHAUFFEUR_BASE_FEE_USD;
+    }, [systemSettings]);
+
+    const displayFee = (row) => {
+        const sType = row?.serviceType || 'One Way';
+        const days = parseInt(row?.numberOfDays || row?.dailyDays || 1, 10) || 1;
+        const qty = sType === 'Round Trip' ? 2 : (sType === 'Daily Service' ? days : 1);
+        // Always $120/day base × qty — never read stored values
+        return Number((120 * qty).toFixed(2));
+    };
+
+    const [daysCountInput, setDaysCountInput] = useState(1);
+
+    /** Price shown / submitted for retail customers (cannot self-edit) */
+    const customerLockedFee = useMemo(() => {
+        if (editingRequest) {
+            const uPrice = Number(editingRequest.unitPrice ?? editingRequest.price);
+            if (Number.isFinite(uPrice) && uPrice > 0) return uPrice;
+            const total = Number(editingRequest.chauffeurFee ?? editingRequest.chauffeur_fee ?? editingRequest.total_amount ?? 0);
+            const days = parseInt(editingRequest.numberOfDays || editingRequest.dailyDays || 1, 10) || 1;
+            const qty = editingRequest.serviceType === 'Round Trip' ? 2 : (editingRequest.serviceType === 'Daily Service' ? days : 1);
+            if (total > 0 && qty > 0) return Number((total / qty).toFixed(2));
+        }
+        return defaultChauffeurFee;
+    }, [editingRequest, defaultChauffeurFee]);
+
+    const mergePassengerPayload = (req, patch = {}) => ({
+        passengers: req.numberOfPassengers ?? 1,
+        luggage: req.luggage || 'No',
+        amenities: req.amenities || [],
+        chauffeurFee: Number(req.chauffeurFee ?? req.chauffeur_fee ?? 0) || 0,
+        chauffeur_fee: Number(req.chauffeurFee ?? req.chauffeur_fee ?? 0) || 0,
+        chauffeur_fee_mode: req.chauffeur_fee_mode || 'separate',
+        serviceType: req.serviceType || 'One Way',
+        returnDate: req.returnDate || null,
+        returnTime: req.returnTime || null,
+        numberOfDays: req.numberOfDays || null,
+        stops: req.stops || 'No',
+        stopLocations: req.stopLocations || null,
+        bags: req.bags || 0,
+        clientName: req.clientName || null,
+        driverName: patch.driverName !== undefined ? patch.driverName : (req.driverName || req.metadata?.driverName || null),
+        plateNumber: patch.plateNumber !== undefined ? patch.plateNumber : (req.plateNumber || req.vehicleId || req.vehicle || req.vehicleRef || req.metadata?.plateNumber || req.metadata?.vehicleId || req.metadata?.vehicle || null),
+        vehicleId: patch.plateNumber !== undefined ? patch.plateNumber : (req.plateNumber || req.vehicleId || req.vehicle || req.vehicleRef || req.metadata?.plateNumber || req.metadata?.vehicleId || req.metadata?.vehicle || null),
+        vehicle: patch.plateNumber !== undefined ? patch.plateNumber : (req.plateNumber || req.vehicleId || req.vehicle || req.vehicleRef || req.metadata?.plateNumber || req.metadata?.vehicleId || req.metadata?.vehicle || null),
+        driver_user_id: patch.driver_user_id !== undefined ? patch.driver_user_id : (req.driver_user_id || req.driverId || req.metadata?.driver_user_id || req.metadata?.driverId || null),
+        driverPhotoUrl: patch.driverPhotoUrl !== undefined ? patch.driverPhotoUrl : (req.driverPhotoUrl || null),
+        adminApproved: patch.adminApproved !== undefined ? patch.adminApproved : (req.adminApproved || false),
+        chauffeur_status: patch.chauffeur_status || req.chauffeur_status || req.status || 'pending',
+    });
+
+    const chauffeurStatusKey = (s) => String(s || '').toLowerCase().replace(/\s+/g, '_');
+    const isAwaitingDriver = (req) => {
+        const k = chauffeurStatusKey(req?.status);
+        return ['pending', 'pending_review', 'approved', 'accepted'].includes(k) && !req?.driverName;
+    };
+    const needsAdminApprove = (req) =>
+        isAdmin && (!isClientAdmin || req?.userId !== currentUser?.id) && req && !req.driverName && !req.adminApproved && ['pending', 'pending_review'].includes(chauffeurStatusKey(req.status));
+
+    const filteredRequests = useMemo(() => {
+        console.log("RAW BACKEND DATA (chauffeurRequests):", chauffeurRequests);
+        const myUserId = String(currentUser?.id || '').trim();
+        const myClientId = String(currentUser?.clientId || currentUser?.client_id || currentUser?.company_id || '').trim();
+        const myEmail = String(currentUser?.email || '').toLowerCase().trim();
+        const myName = String(currentUser?.name || currentUser?.full_name || '').toLowerCase().trim();
+
+        const list = (!isCustomer && !isClientAdmin)
+            ? [...(chauffeurRequests || [])]
+            : (chauffeurRequests || []).filter(req => {
+                const reqUserId = String(req.userId || req.user_id || req.customer_id || req.created_by || req.createdById || req.metadata?.userId || req.metadata?.user_id || req.metadata?.customer_id || req.metadata?.created_by || '').trim();
+                const reqClientId = String(req.clientId || req.client_id || req.client?.id || req.metadata?.clientId || req.metadata?.client_id || req.metadata?.client?.id || '').trim();
+                const reqEmail = String(req.email || req.clientEmail || req.customerEmail || req.customer_email || req.client?.email || req.metadata?.email || req.metadata?.user_email || req.metadata?.customer_email || req.metadata?.client_email || req.metadata?.client?.email || '').toLowerCase().trim();
+                const reqClientName = String(req.clientName || req.client_name || req.client?.companyName || req.client?.name || req.client || req.guestName || req.passengerName || req.customer_name || req.metadata?.clientName || req.metadata?.client_name || req.metadata?.passengerName || req.metadata?.guestName || '').toLowerCase().trim();
+
+                if (myUserId && reqUserId && reqUserId === myUserId) return true;
+                if (myClientId && reqClientId && reqClientId === myClientId) return true;
+                if (myEmail && reqEmail && (reqEmail === myEmail || reqEmail.includes(myEmail) || myEmail.includes(reqEmail))) return true;
+                if (myName && reqClientName && (reqClientName.includes(myName) || myName.includes(reqClientName))) return true;
+
+                // Also check nested custom items
+                const c0 = req.metadata?.customItems?.[0] || req.metadata?.custom_items?.[0] || {};
+                const cEmail = String(c0.customer_email || c0.email || '').toLowerCase().trim();
+                const cUserId = String(c0.user_id || c0.userId || c0.customer_id || '').trim();
+                const cClientId = String(c0.clientId || '').trim();
+                const cName = String(c0.clientName || c0.passengerName || c0.guestName || '').toLowerCase().trim();
+
+                if (myUserId && cUserId && cUserId === myUserId) return true;
+                if (myClientId && cClientId && cClientId === myClientId) return true;
+                if (myEmail && cEmail && (cEmail === myEmail || cEmail.includes(myEmail) || myEmail.includes(cEmail))) return true;
+                if (myName && cName && (cName.includes(myName) || myName.includes(cName))) return true;
+
+                return false;
+            });
+
+        return list.sort((a, b) => {
+            const timeA = new Date(a.createdAt || a.created_at || a.order_date || a.date || 0).getTime();
+            const timeB = new Date(b.createdAt || b.created_at || b.order_date || b.date || 0).getTime();
+            if (!isNaN(timeA) && !isNaN(timeB) && timeA !== timeB) return timeB - timeA;
+            const numA = parseInt(String(a.db_id || a.id || 0).replace(/\D/g, ''), 10) || 0;
+            const numB = parseInt(String(b.db_id || b.id || 0).replace(/\D/g, ''), 10) || 0;
+            return numB - numA;
+        });
+    }, [chauffeurRequests, isCustomer, isClientAdmin, currentUser]);
+
+    /** Active: any status that is NOT completed/cancelled/rejected – stays visible until service is done. */
+    const DONE_STATUSES = ['completed', 'delivered', 'cancelled', 'canceled', 'rejected', 'done'];
+    const activeBookings = filteredRequests.filter(r => !DONE_STATUSES.includes(chauffeurStatusKey(r.status)));
+    const historyBookings = filteredRequests.filter(r => DONE_STATUSES.includes(chauffeurStatusKey(r.status)));
+    
+    console.log("FINAL ACTIVE BOOKINGS:", activeBookings);
+
+    const tabData = bookingTab === 'active' ? activeBookings : historyBookings;
+
+    const toggleAmenity = (item) => {
+        setAmenities(prev =>
+            prev.includes(item) ? prev.filter(a => a !== item) : [...prev, item]
+        );
+    };
+
+    const handleSubmit = (e) => {
+        e.preventDefault();
+        if (isSubmitting || isSubmittingRef.current) return;
+        isSubmittingRef.current = true;
+
+        const formData = new FormData(e.target);
+
+        // For staff admin: resolve selected client from dropdown
+        const selectedClientId = isStaffAdmin ? formData.get('assignClient') : null;
+        const selectedClient = isStaffAdmin && selectedClientId ? (clients || []).find(c => String(c.id) === selectedClientId) : null;
+        const daysCount = serviceType === 'Daily Service' ? (parseInt(formData.get('numberOfDays'), 10) || 1) : 1;
+        const qtyMultiplier = serviceType === 'Round Trip' ? 2 : (serviceType === 'Daily Service' ? daysCount : 1);
+
+        let baseFee = defaultChauffeurFee;
+        if (!isFeeLocked) {
+            const feeInput = parseFloat(formData.get('chauffeurFee') || 0);
+            if (Number.isFinite(feeInput) && feeInput > 0) {
+                if (feeInput > defaultChauffeurFee * 1.5 && qtyMultiplier > 1) {
+                    baseFee = Number((feeInput / qtyMultiplier).toFixed(2));
+                } else {
+                    baseFee = Number(feeInput.toFixed(2));
+                }
+            }
+        }
+        const normalizedFee = Number((baseFee * qtyMultiplier).toFixed(2));
+
+        const clientDisplayName = isStaffAdmin 
+            ? (selectedClient?.name || selectedClient?.business_name || currentUser?.name) 
+            : (currentUser?.name ? (currentUser.name.includes('(Personal Client)') ? currentUser.name : `${currentUser.name} (Personal Client)`) : 'Personal Client');
+
+        const rawPassengerName = formData.get('passengerName') || editingRequest?.passengerName || editingRequest?.guestName;
+
+        // Preserve original customer and client identity when updating an existing booking
+        const targetUserId = editingRequest
+            ? (editingRequest.userId || editingRequest.user_id || editingRequest.customer_id || editingRequest.created_by || editingRequest.createdById || editingRequest.metadata?.userId || editingRequest.metadata?.user_id || editingRequest.metadata?.created_by || currentUser?.id)
+            : currentUser?.id;
+
+        const targetEmail = editingRequest
+            ? (editingRequest.email || editingRequest.customer_email || editingRequest.clientEmail || editingRequest.client_email || editingRequest.metadata?.email || editingRequest.metadata?.customer_email || editingRequest.client?.email || currentUser?.email)
+            : currentUser?.email;
+
+        const targetClientId = editingRequest
+            ? (selectedClientId || editingRequest.clientId || editingRequest.client_id || editingRequest.client?.id || editingRequest.metadata?.clientId || editingRequest.metadata?.client?.id || currentUser?.company_id || 'CLT-GUEST')
+            : (isStaffAdmin ? (selectedClientId || currentUser?.company_id || 'CLT-GUEST') : (currentUser?.clientId || currentUser?.company_id || 'CLT-GUEST'));
+
+        const targetClientName = editingRequest
+            ? (editingRequest.clientName || editingRequest.client_name || editingRequest.client?.companyName || editingRequest.client?.name || editingRequest.guestName || editingRequest.passengerName || clientDisplayName)
+            : clientDisplayName;
+
+        const guestNameResolved = (rawPassengerName && String(rawPassengerName).trim()) 
+            ? String(rawPassengerName).trim() 
+            : (editingRequest?.passengerName || editingRequest?.guestName || targetClientName);
+
+        const request = {
+            tenantId: editingRequest?.tenantId || currentUser?.tenantId || currentUser?.tenant_id || 1,
+            userId: targetUserId,
+            user_id: targetUserId,
+            customer_id: targetUserId,
+            email: targetEmail,
+            customer_email: targetEmail,
+            clientId: targetClientId,
+            clientName: targetClientName,
+            passengerName: guestNameResolved,
+            guestName: guestNameResolved,
+            serviceType,
+            requestDate: editingRequest ? (editingRequest.requestDate || editingRequest.date || new Date().toISOString().split('T')[0]) : new Date().toISOString().split('T')[0],
+            dueDate: formData.get('dueDate'),
+            pickupTime: formData.get('pickupTime'),
+            pickupLocation: formData.get('pickupLocation'),
+            dropLocation: formData.get('dropLocation'),
+            returnDate: serviceType === 'Round Trip' ? formData.get('returnDate') : null,
+            returnTime: serviceType === 'Round Trip' ? formData.get('returnTime') : null,
+            numberOfDays: serviceType === 'Daily Service' ? daysCount : null,
+            dailyDays: daysCount,
+            quantity: qtyMultiplier,
+            qty: qtyMultiplier,
+            numberOfPassengers: parseInt(formData.get('numberOfPassengers'), 10) || 1,
+            passengers: parseInt(formData.get('numberOfPassengers'), 10) || 1,
+            luggage: hasLuggage ? 'Yes' : 'No',
+            bags: hasLuggage ? (parseInt(formData.get('bags'), 10) || 0) : 0,
+            stops: hasStops ? 'Yes' : 'No',
+            stopLocations: hasStops ? (formData.get('stopLocations') || '').trim() || null : null,
+            amenities: amenities,
+            wifi: amenities.includes('WiFi') ? 'Yes' : 'No',
+            refreshments: amenities.includes('Refreshments') ? 'Yes' : 'No',
+            carSeat: (amenities.includes('Baby Car Seat') || amenities.includes('Car Seat')) ? 'Yes' : 'No',
+            chauffeurFee: normalizedFee,
+            chauffeur_fee: normalizedFee,
+            totalAmount: normalizedFee,
+            total_amount: normalizedFee,
+            unitPrice: baseFee,
+            price: baseFee,
+            chauffeur_fee_mode: CHAUFFEUR_BILLING_MODE,
+            ...(() => {
+                const submittedPlate = formData.get('plateNumber');
+                const rawExistingPlate = editingRequest?.plateNumber || editingRequest?.vehicleId || editingRequest?.vehicle || editingRequest?.vehicleRef || editingRequest?.metadata?.plateNumber || editingRequest?.metadata?.vehicleId || null;
+                const resolvedPlateNumberVal = isStaffAdmin
+                    ? (submittedPlate !== null && submittedPlate !== undefined
+                        ? (String(submittedPlate).trim() || null)
+                        : rawExistingPlate)
+                    : rawExistingPlate;
+
+                const selDriver = formData.get('driverNameSelect');
+                let resolvedDriverNameVal = editingRequest?.driverName || editingRequest?.metadata?.driverName || null;
+                let resolvedDriverUserIdVal = editingRequest?.driver_user_id || editingRequest?.driverId || editingRequest?.metadata?.driver_user_id || editingRequest?.metadata?.driverId || null;
+                if (isStaffAdmin && selDriver) {
+                    const u = (users || []).find(user => String(user.id) === String(selDriver));
+                    resolvedDriverNameVal = u?.fullName || u?.name || editingRequest?.driverName || null;
+                    resolvedDriverUserIdVal = Number(selDriver);
+                }
+
+                const driverPhoto = (users || []).find(u => String(u.id) === String(resolvedDriverUserIdVal))?.profile_pic_url || editingRequest?.driverPhotoUrl || null;
+
+                const itemObj = {
+                    name: `VIP Chauffeur Service (${serviceType}${serviceType === 'Daily Service' ? ` - ${daysCount} Days` : ''})`,
+                    qty: qtyMultiplier,
+                    quantity: qtyMultiplier,
+                    unitPrice: baseFee,
+                    price: baseFee,
+                    totalPrice: normalizedFee,
+                    total: normalizedFee,
+                    userId: targetUserId,
+                    user_id: targetUserId,
+                    customer_id: targetUserId,
+                    email: targetEmail,
+                    customer_email: targetEmail,
+                    clientId: targetClientId,
+                    clientName: targetClientName,
+                    passengerName: guestNameResolved,
+                    guestName: guestNameResolved,
+                    driverName: resolvedDriverNameVal,
+                    driver_user_id: resolvedDriverUserIdVal,
+                    driverId: resolvedDriverUserIdVal,
+                    plateNumber: resolvedPlateNumberVal,
+                    vehicleId: resolvedPlateNumberVal,
+                    vehicle: resolvedPlateNumberVal
+                };
+
+                const customItemObj = {
+                    ...itemObj,
+                    serviceType,
+                    numberOfDays: daysCount,
+                    dailyDays: daysCount
+                };
+
+                const determinedStatus = isStaffAdmin
+                    ? (formData.get('overrideStatus') && formData.get('overrideStatus') !== 'pending'
+                        ? formData.get('overrideStatus')
+                        : ((resolvedDriverNameVal || resolvedPlateNumberVal)
+                            ? (['completed', 'delivered'].includes(String(editingRequest?.status).toLowerCase()) ? 'completed' : 'assigned')
+                            : (editingRequest?.status || 'pending')))
+                    : (editingRequest?.status || 'pending');
+
+                return {
+                    driverName: resolvedDriverNameVal,
+                    plateNumber: resolvedPlateNumberVal,
+                    vehicleId: resolvedPlateNumberVal,
+                    vehicle: resolvedPlateNumberVal,
+                    driver_user_id: resolvedDriverUserIdVal,
+                    driverId: resolvedDriverUserIdVal,
+                    passenger_info: isStaffAdmin ? {
+                        ...(editingRequest?._passengerInfo || editingRequest?.passenger_info || {}),
+                        driver_user_id: resolvedDriverUserIdVal,
+                        driverPhotoUrl: driverPhoto,
+                        adminApproved: true
+                    } : (editingRequest?.passenger_info || editingRequest?._passengerInfo || null),
+                    status: determinedStatus,
+                    adminApproved: isStaffAdmin ? (!!(resolvedDriverNameVal || resolvedPlateNumberVal) || !!editingRequest?.adminApproved) : !!editingRequest?.adminApproved,
+                    items: [itemObj],
+                    customItems: [customItemObj],
+                    orderType: 'CHAUFFEUR',
+                    missionType: 'CHAUFFEUR'
+                };
+            })()
+        };
+
+        swalLoading("Booking Chauffeur", "Booking your chauffeur, please wait...");
+        setIsSubmitting(true);
+
+        if (editingRequest) {
+            const targetId = editingRequest.db_id || editingRequest.id;
+            updateMutation.mutate({ id: targetId, data: { ...editingRequest, ...request } }, {
+                onSuccess: async () => {
+                    isSubmittingRef.current = false;
+                    const strId = String(targetId);
+                    setUpdatedChauffeurItem(strId, { status: request.status, chauffeur_status: request.status });
+                    if (updateChauffeurRequestCtx) {
+                        try { await updateChauffeurRequestCtx({ ...editingRequest, ...request, id: targetId, db_id: targetId }); } catch (_) {}
+                    }
+                    if (syncGlobalState) await syncGlobalState();
+                    notifyStateChanged(queryClient, ['chauffeurMissions', 'orders', 'deliveries', 'dashboardStats']);
+                    window.dispatchEvent(new CustomEvent('app:state-changed', { detail: { source: 'chauffeur-update', orderId: targetId } }));
+                    swalClose();
+                    setIsSubmitting(false);
+                    setShowModal(false);
+                    resetForm();
+                    swalSuccess("Protocol Updated", "Chauffeur booking details updated successfully.");
+                },
+                onError: (err) => {
+                    isSubmittingRef.current = false;
+                    swalClose();
+                    setIsSubmitting(false);
+                    const msg = err.response?.data?.message || err.message || "Failed to update chauffeur booking.";
+                    swalError("Update Failed", msg);
+                }
+            });
+        } else {
+            createMutation.mutate(request, {
+                onSuccess: async () => {
+                    isSubmittingRef.current = false;
+                    if (syncGlobalState) await syncGlobalState();
+                    swalClose();
+                    setIsSubmitting(false);
+                    setShowModal(false);
+                    resetForm();
+                    swalSuccess("Booking Confirmed", "Your chauffeur service has been booked successfully.");
+                },
+                onError: (err) => {
+                    isSubmittingRef.current = false;
+                    swalClose();
+                    setIsSubmitting(false);
+                    const msg = err.response?.data?.message || err.message || "Failed to book chauffeur service.";
+                    swalError("Booking Failed", msg);
+                }
+            });
+        }
+    };
+
+    const resetForm = () => {
+        setEditingRequest(null);
+        setServiceType('One Way');
+        setChauffeurQuote(0);
+        setHasLuggage(false);
+        setHasStops(false);
+        setAmenities([]);
+        setModalType('create');
+        setPickupTimeInput('12:00');
+        setReturnTimeInput('12:00');
+    };
+
+    const openModal = (type, req = null) => {
+        setModalType(type);
+        if (req) {
+            const resolvedVehicle = req.plateNumber || req.vehicleId || req.vehicle || req.vehicleRef || req.metadata?.plateNumber || req.metadata?.vehicleId || req.metadata?.vehicle || req.metadata?.vehicleRef || null;
+            const resolvedDriver = req.driverName || req.metadata?.driverName || null;
+            const resolvedDriverId = req.driver_user_id || req.driverId || req.metadata?.driver_user_id || req.metadata?.driverId || null;
+            const enriched = {
+                ...req,
+                plateNumber: resolvedVehicle || req.plateNumber || null,
+                vehicleId: resolvedVehicle || req.vehicleId || null,
+                vehicle: resolvedVehicle || req.vehicle || null,
+                driverName: resolvedDriver || req.driverName || null,
+                driver_user_id: resolvedDriverId || req.driver_user_id || null,
+                driverId: resolvedDriverId || req.driverId || null
+            };
+            setEditingRequest(enriched);
+            setServiceType(req.serviceType || 'One Way');
+            const feeVal = parseFloat(req.chauffeurFee ?? req.chauffeur_fee ?? req.total_amount ?? 0);
+            setChauffeurQuote(Number.isFinite(feeVal) ? feeVal : 0);
+            setHasLuggage(req.luggage === 'Yes');
+            setHasStops(req.stops === 'Yes');
+            let parsedAmenities = [];
+            if (Array.isArray(req.amenities)) {
+                parsedAmenities = req.amenities;
+            } else if (typeof req.amenities === 'string' && req.amenities.trim()) {
+                try {
+                    const parsed = JSON.parse(req.amenities);
+                    parsedAmenities = Array.isArray(parsed) ? parsed : [req.amenities];
+                } catch {
+                    parsedAmenities = req.amenities.split(',').map(s => s.trim()).filter(Boolean);
+                }
+            }
+            setAmenities(parsedAmenities);
+            setPickupTimeInput(req.pickupTime || '12:00');
+            setReturnTimeInput(req.returnTime || '12:00');
+        } else {
+            resetForm();
+        }
+        setShowModal(true);
+    };
+
+    const handleCancel = async (id) => {
+        if ((await swalConfirm('Cancel Booking', 'Are you sure you want to cancel this booking?')).isConfirmed) {
+            swalLoading("Cancelling Booking", "Processing cancellation, please wait...");
+            const strId = String(id);
+            setUpdatedChauffeurItem(strId, { status: 'cancelled', chauffeur_status: 'cancelled' });
+            queryClient.setQueriesData({ queryKey: ['chauffeurMissions'] }, (old) => {
+                if (!old || !old.data) return old;
+                return {
+                    ...old,
+                    data: old.data.map(r => (String(r.id) === strId || String(r.db_id) === strId) ? { ...r, status: 'cancelled', chauffeur_status: 'cancelled' } : r)
+                };
+            });
+            try {
+                await api.put(`/orders/${id}/status`, { status: 'cancelled' });
+            } catch (_) {
+                try { await api.patch(`/orders/${id}/status`, { status: 'cancelled' }); } catch (_) {}
+            }
+            const request = chauffeurRequests.find(r => String(r.id) === strId || String(r.db_id) === strId);
+            if (request) {
+                try { updateMutation.mutate({ id, data: { ...request, status: 'cancelled' } }); } catch (_) {}
+            }
+            if (syncGlobalState) await syncGlobalState();
+            swalClose();
+            swalSuccess("Booking Cancelled", "Chauffeur booking cancelled successfully.");
+            window.dispatchEvent(new CustomEvent('app:state-changed', { detail: { source: 'chauffeur-cancel', orderId: id } }));
+            queryClient.invalidateQueries({ queryKey: ['chauffeurMissions'] });
+            queryClient.invalidateQueries({ queryKey: ['orders'] });
+        }
+    };
+
+    const handleRejectBooking = async (row) => {
+        const rawTargetId = row.db_id || row.id;
+        const targetId = !isNaN(Number(rawTargetId)) && Number(rawTargetId) > 0 ? Number(rawTargetId) : rawTargetId;
+        const strId = String(targetId);
+
+        if ((await swalConfirm('Reject Chauffeur Booking', `Are you sure you want to reject chauffeur booking #${targetId}? This will cancel the booking.`)).isConfirmed) {
+            swalLoading("Rejecting Booking", "Cancelling chauffeur booking, please wait...");
+            try {
+                // 1. Local cache update
+                setUpdatedChauffeurItem(strId, { status: 'cancelled', chauffeur_status: 'cancelled' });
+                queryClient.setQueriesData({ queryKey: ['chauffeurMissions'] }, (old) => {
+                    if (!old || !old.data) return old;
+                    return {
+                        ...old,
+                        data: old.data.map(r => (String(r.id) === strId || String(r.db_id) === strId) ? { ...r, status: 'cancelled', chauffeur_status: 'cancelled' } : r)
+                    };
+                });
+
+                // 2. Persist to backend status endpoint
+                try {
+                    await api.put(`/orders/${targetId}/status`, { status: 'cancelled' });
+                } catch (_) {
+                    try { await api.patch(`/orders/${targetId}/status`, { status: 'cancelled' }); } catch (_) {}
+                }
+
+                // 3. Update global context
+                if (updateChauffeurRequestCtx) {
+                    try { await updateChauffeurRequestCtx({ ...row, status: 'cancelled', chauffeur_status: 'cancelled' }); } catch (_) {}
+                }
+                if (syncGlobalState) await syncGlobalState();
+
+                swalClose();
+                swalSuccess("Booking Rejected", `Chauffeur booking #${targetId} has been rejected and cancelled.`);
+                notifyStateChanged(queryClient, ['chauffeurMissions', 'orders', 'deliveries', 'dashboardStats']);
+                window.dispatchEvent(new CustomEvent('app:state-changed', { detail: { source: 'chauffeur-reject', orderId: targetId } }));
+            } catch (err) {
+                swalClose();
+                const msg = err.response?.data?.message || err.message || 'Failed to reject chauffeur booking.';
+                swalError("Error", msg);
+            }
+        }
+    };
+
+    const handleAcceptBooking = async (row) => {
+        const rawTargetId = row.db_id || row.id;
+        const targetId = !isNaN(Number(rawTargetId)) && Number(rawTargetId) > 0 ? Number(rawTargetId) : rawTargetId;
+        const strId = String(targetId);
+
+        if ((await swalConfirm('Accept Chauffeur Booking', `Accept and approve chauffeur booking #${targetId}? The status will update to Accepted across Admin and Client portals.`)).isConfirmed) {
+            swalLoading("Accepting Booking", "Approving chauffeur booking, please wait...");
+            try {
+                // 1. Immediately update local storage sync map
+                setUpdatedChauffeurItem(strId, { status: 'accepted', chauffeur_status: 'accepted' });
+
+                // 2. Immediately update TanStack Query cache
+                queryClient.setQueriesData({ queryKey: ['chauffeurMissions'] }, (old) => {
+                    if (!old || !old.data) return old;
+                    return {
+                        ...old,
+                        data: old.data.map(r =>
+                            (String(r.id) === strId || String(r.db_id) === strId)
+                                ? { ...r, status: 'accepted', chauffeur_status: 'accepted' }
+                                : r
+                        )
+                    };
+                });
+
+                // 3. Persist to backend status endpoint
+                try {
+                    await api.put(`/orders/${targetId}/status`, { status: 'accepted' });
+                } catch (_) {
+                    try { await api.patch(`/orders/${targetId}/status`, { status: 'accepted' }); } catch (_) {}
+                }
+
+                // 4. Update global context
+                if (updateChauffeurRequestCtx) {
+                    try { await updateChauffeurRequestCtx({ ...row, status: 'accepted', chauffeur_status: 'accepted', id: targetId, db_id: targetId }); } catch (_) {}
+                }
+                if (syncGlobalState) await syncGlobalState();
+
+                swalClose();
+                swalSuccess("Booking Accepted", `Chauffeur booking #${targetId} is now Accepted!`);
+
+                // 5. Broadcast state change event to sync with Client Portal and other views
+                notifyStateChanged(queryClient, ['chauffeurMissions', 'orders', 'deliveries', 'dashboardStats']);
+                window.dispatchEvent(new CustomEvent('app:state-changed', { detail: { source: 'chauffeur-accept', orderId: targetId, status: 'accepted' } }));
+            } catch (err) {
+                queryClient.invalidateQueries({ queryKey: ['chauffeurMissions'] });
+                swalClose();
+                const msg = err.response?.data?.message || err.message || 'Failed to accept chauffeur booking.';
+                swalError("Error", msg);
+            }
+        }
+    };
+
+    const handleEmergencyAbort = async (row) => {
+        const rawTargetId = row.db_id || row.id;
+        const targetId = !isNaN(Number(rawTargetId)) && Number(rawTargetId) > 0 ? Number(rawTargetId) : rawTargetId;
+        const strId = String(targetId);
+
+        const { value: reason, isConfirmed } = await Swal.fire({
+            title: 'Emergency Abort Ride',
+            text: `Enter the mandatory operational reason to abort and cancel active trip #${targetId}:`,
+            input: 'textarea',
+            inputPlaceholder: 'State incident, mechanical issue, passenger request, or emergency dispatch reason...',
+            inputAttributes: {
+                'aria-label': 'Type your cancellation reason here'
+            },
+            showCancelButton: true,
+            confirmButtonText: 'Abort Trip',
+            confirmButtonColor: '#ef4444',
+            cancelButtonText: 'Keep Active',
+            inputValidator: (val) => {
+                if (!val || !val.trim()) {
+                    return 'A valid reason is strictly required to cancel an active in-progress trip!';
+                }
+                if (val.trim().length < 5) {
+                    return 'Please provide a more detailed reason (minimum 5 characters).';
+                }
+                return null;
+            },
+            background: '#1a1a2e',
+            color: '#fff',
+            icon: 'warning'
+        });
+
+        if (isConfirmed && reason) {
+            swalLoading("Aborting Trip", "Processing emergency cancellation and audit logging...");
+            try {
+                // 1. Immediately update local sync map
+                setUpdatedChauffeurItem(strId, { status: 'cancelled', chauffeur_status: 'cancelled', cancelReason: reason });
+
+                // 2. TanStack Query cache update
+                queryClient.setQueriesData({ queryKey: ['chauffeurMissions'] }, (old) => {
+                    if (!old || !old.data) return old;
+                    return {
+                        ...old,
+                        data: old.data.map(r =>
+                            (String(r.id) === strId || String(r.db_id) === strId)
+                                ? { ...r, status: 'cancelled', chauffeur_status: 'cancelled', cancelReason: reason }
+                                : r
+                        )
+                    };
+                });
+
+                // 3. Persist to backend with mandatory remarks reason
+                try {
+                    await api.put(`/orders/${targetId}/status`, {
+                        status: 'cancelled',
+                        remarks: `[EXCEPTIONAL_CANCELLATION] ${reason.trim()}`
+                    });
+                } catch (_) {
+                    await api.patch(`/orders/${targetId}/status`, {
+                        status: 'cancelled',
+                        remarks: `[EXCEPTIONAL_CANCELLATION] ${reason.trim()}`
+                    });
+                }
+
+                // 4. Update global context
+                if (updateChauffeurRequestCtx) {
+                    try { await updateChauffeurRequestCtx({ ...row, status: 'cancelled', chauffeur_status: 'cancelled', cancelReason: reason }); } catch (_) {}
+                }
+                if (syncGlobalState) await syncGlobalState();
+
+                swalClose();
+                swalSuccess("Trip Aborted", `Chauffeur booking #${targetId} has been aborted with logged audit remarks.`);
+
+                // 5. Broadcast to all portals
+                notifyStateChanged(queryClient, ['chauffeurMissions', 'orders', 'deliveries', 'dashboardStats']);
+                window.dispatchEvent(new CustomEvent('app:state-changed', { detail: { source: 'chauffeur-abort', orderId: targetId } }));
+            } catch (err) {
+                queryClient.invalidateQueries({ queryKey: ['chauffeurMissions'] });
+                swalClose();
+                const msg = err.response?.data?.message || err.message || 'Failed to abort trip.';
+                swalError("Error", msg);
+            }
+        }
+    };
+
+    const columns = [
+        {
+            header: "Client",
+            accessor: "clientName",
+            render: (row) => formatClientDisplayName(row, clients, [...(users || []), ...(customerUsers || [])])
+        },
+        { header: "Type", accessor: "serviceType" },
+        {
+            header: "Price",
+            accessor: "chauffeurFee",
+            render: (row) => (
+                <span className="text-xs font-black text-warning">
+                    ${displayFee(row).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                </span>
+            )
+        },
+        { header: "Date", accessor: "dueDate" },
+        { header: "Time", accessor: "pickupTime" },
+        { header: "Pickup", accessor: "pickupLocation" },
+        {
+            header: "Assigned Driver & Vehicle",
+            accessor: "driverName",
+            render: (row) => {
+                const vehicleStr = row.plateNumber || row.vehicleId || row.vehicle || row.vehicleRef || row.metadata?.plateNumber || row.metadata?.vehicleId;
+                return (
+                    <div className="space-y-0.5">
+                        {row.driverName ? (
+                            <span className="text-xs font-bold text-white block">{row.driverName}</span>
+                        ) : (
+                            <span className="text-[10px] font-black text-warning/70 uppercase tracking-widest block">Unassigned Driver</span>
+                        )}
+                        {vehicleStr && (
+                            <span className="text-[10px] font-mono text-accent flex items-center gap-1 font-semibold">
+                                <Car size={11} className="shrink-0" />
+                                <span>{vehicleStr}</span>
+                            </span>
+                        )}
+                    </div>
+                );
+            }
+        },
+        {
+            header: "Status",
+            accessor: "status",
+            render: (row) => <StatusBadge status={row.status} />
+        },
+        {
+            header: "Quick Action",
+            accessor: "id",
+            render: (row) => {
+                const normSt = String(row.status || row.chauffeur_status || '').toLowerCase().replace(/_/g, ' ');
+                const isCompleted = ['completed', 'delivered', 'done'].includes(normSt);
+                const isCancelled = ['cancelled', 'canceled', 'rejected'].includes(normSt);
+                const isArrived = ['arrived'].includes(normSt);
+                const isEnRoute = ['en route', 'in transit', 'on way'].includes(normSt);
+                const isAccepted = ['accepted', 'approved', 'assigned'].includes(normSt);
+
+                if (isCompleted) {
+                    return (
+                        <span className="text-[10px] font-black text-success uppercase tracking-widest px-2.5 py-1 bg-success/10 border border-success/30 rounded-lg">
+                            Completed
+                        </span>
+                    );
+                }
+                if (isCancelled) {
+                    return (
+                        <span className="text-[10px] font-black text-rose-400 uppercase tracking-widest px-2.5 py-1 bg-rose-500/10 border border-rose-500/30 rounded-lg">
+                            Cancelled
+                        </span>
+                    );
+                }
+                if (isArrived) {
+                    return (
+                        <div className="flex items-center gap-1.5">
+                            <span className="text-[10px] font-black text-emerald-400 uppercase tracking-widest px-2.5 py-1 bg-emerald-500/10 border border-emerald-500/30 rounded-lg">
+                                Arrived
+                            </span>
+                            {isAdmin && (
+                                <button
+                                    type="button"
+                                    onClick={() => handleEmergencyAbort(row)}
+                                    className="text-[10px] font-black text-rose-400 uppercase tracking-wider bg-rose-500/10 border border-rose-500/30 hover:bg-rose-500 hover:text-white px-2.5 py-1 rounded-lg transition-all"
+                                    title="Emergency Abort / Exceptional Cancellation (Requires Reason)"
+                                >
+                                    Emergency Abort
+                                </button>
+                            )}
+                        </div>
+                    );
+                }
+                if (isEnRoute) {
+                    return (
+                        <div className="flex items-center gap-1.5">
+                            <span className="text-[10px] font-black text-info uppercase tracking-widest px-2.5 py-1 bg-info/10 border border-info/30 rounded-lg">
+                                En Route
+                            </span>
+                            {isAdmin && (
+                                <button
+                                    type="button"
+                                    onClick={() => handleEmergencyAbort(row)}
+                                    className="text-[10px] font-black text-rose-400 uppercase tracking-wider bg-rose-500/10 border border-rose-500/30 hover:bg-rose-500 hover:text-white px-2.5 py-1 rounded-lg transition-all"
+                                    title="Emergency Abort / Exceptional Cancellation (Requires Reason)"
+                                >
+                                    Emergency Abort
+                                </button>
+                            )}
+                        </div>
+                    );
+                }
+                if (isAccepted) {
+                    return (
+                        <span className="text-[10px] font-black text-success uppercase tracking-widest px-2.5 py-1 bg-success/10 border border-success/30 rounded-lg">
+                            Accepted
+                        </span>
+                    );
+                }
+                return (
+                    <div className="flex items-center gap-1.5">
+                        <button
+                            type="button"
+                            onClick={() => handleAcceptBooking(row)}
+                            className="text-[10px] font-black text-emerald-400 uppercase tracking-wider bg-emerald-500/10 border border-emerald-500/30 hover:bg-emerald-500 hover:text-black px-2.5 py-1 rounded-lg transition-all font-bold shadow-sm"
+                            title="Accept and approve this chauffeur booking"
+                        >
+                            Accept
+                        </button>
+                        <button
+                            type="button"
+                            onClick={() => handleRejectBooking(row)}
+                            className="text-[10px] font-black text-rose-400 uppercase tracking-wider bg-rose-500/10 border border-rose-500/30 hover:bg-rose-500 hover:text-white px-2.5 py-1 rounded-lg transition-all"
+                            title="Reject / Cancel Chauffeur Booking"
+                        >
+                            Reject
+                        </button>
+                    </div>
+                );
+            }
+        }
+    ];
+
+    const handleMarkCompleted = async (row) => {
+        const rawTargetId = row.db_id || row.id;
+        const targetId = !isNaN(Number(rawTargetId)) && Number(rawTargetId) > 0 ? Number(rawTargetId) : rawTargetId;
+        const strId = String(targetId);
+
+        if ((await swalConfirm('Complete Chauffeur Ride', `Mark Chauffeur booking #${targetId} as completed?`)).isConfirmed) {
+            swalLoading("Updating Status", "Setting chauffeur ride to completed...");
+            try {
+                // 1. Immediately update the local cache so UI flips status now
+                setUpdatedChauffeurItem(strId, { status: 'completed', chauffeur_status: 'completed' });
+                queryClient.setQueriesData({ queryKey: ['chauffeurMissions'] }, (old) => {
+                    if (!old || !old.data) return old;
+                    return {
+                        ...old,
+                        data: old.data.map(r =>
+                            (String(r.id) === strId || String(r.db_id) === strId)
+                                ? { ...r, status: 'completed', chauffeur_status: 'completed' }
+                                : r
+                        )
+                    };
+                });
+
+                // 2. Persist to backend
+                try {
+                    await api.put(`/orders/${targetId}/status`, { status: 'completed' });
+                } catch (_) {
+                    try { await api.patch(`/orders/${targetId}/status`, { status: 'completed' }); } catch (_) {}
+                }
+
+                // 3. Update global context
+                if (updateChauffeurRequestCtx) {
+                    try { await updateChauffeurRequestCtx({ ...row, status: 'completed', chauffeur_status: 'completed', id: targetId, db_id: targetId }); } catch (_) {}
+                }
+                if (syncGlobalState) await syncGlobalState();
+
+                swalClose();
+                swalSuccess("Ride Completed", `Chauffeur booking #${targetId} is now marked as Completed!`);
+
+                // 4. Broadcast state change to all open tabs/portals
+                notifyStateChanged(queryClient, ['chauffeurMissions', 'orders', 'deliveries', 'dashboardStats']);
+                window.dispatchEvent(new CustomEvent('app:state-changed', { detail: { source: 'chauffeur-complete', orderId: targetId } }));
+            } catch (err) {
+                // Revert optimistic update on failure
+                queryClient.invalidateQueries({ queryKey: ['chauffeurMissions'] });
+                swalClose();
+                const msg = err.response?.data?.message || err.message || 'Failed to update chauffeur status.';
+                swalError("Error", msg);
+            }
+        }
+    };
+
+    return (
+        <div className="space-y-8 pb-20">
+            {/* Header */}
+            <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+                <div>
+                    <h1 className="text-3xl font-black tracking-tighter text-white italic uppercase">Chauffeur Protocol</h1>
+                    <p className="text-secondary text-xs mt-1 font-black uppercase tracking-[0.2em] opacity-70 italic">
+                        {isSaasAdmin ? 'SaaS Chauffeur Protocol & Fleet Control' : isClientAdmin ? 'Client Chauffeur Protocol & Booking Panel' : (isAdmin ? 'Elite Fleet Management & Logistic Control' : 'Elite transport & chauffeur protocol')}
+                    </p>
+                </div>
+                {(isCustomer || isClientAdmin || isSaasAdmin || hasMenuPermission('Chauffeur', 'can_add')) && (
+                    <button
+                        onClick={() => openModal('create')}
+                        className="btn-primary group flex items-center gap-3 px-8 shadow-xl shadow-accent/20"
+                    >
+                        <Car size={18} className="group-hover:translate-x-1 transition-transform duration-300" />
+                        <span>Book Chauffeur</span>
+                    </button>
+                )}
+            </div>
+
+            {/* Stats/Info Grid */}
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                <div className="glass-card p-6 border-l-4 border-l-accent flex items-center gap-6">
+                    <div className="w-12 h-12 rounded-xl bg-accent/20 flex items-center justify-center text-accent shrink-0 shadow-2xl">
+                        <Info size={24} />
+                    </div>
+                    <div>
+                        <h3 className="text-sm font-black text-white italic uppercase tracking-tight">Protocol Status</h3>
+                        <p className="text-secondary text-xs font-medium opacity-80 uppercase tracking-widest mt-1">
+                            {isSaasAdmin ? 'SaaS Admin Active' : isClientAdmin ? 'Client Portal Active' : (isAdmin ? 'System Active' : 'Elite Access Granted')}
+                        </p>
+                    </div>
+                </div>
+                {isAdmin && (
+                    <>
+                        <div className="glass-card p-6 border-l-4 border-l-info flex items-center gap-6">
+                            <div className="w-12 h-12 rounded-xl bg-info/20 flex items-center justify-center text-info shrink-0 shadow-2xl">
+                                <Car size={24} />
+                            </div>
+                            <div>
+                                <h3 className="text-sm font-black text-white italic uppercase tracking-tight">Active Fleet</h3>
+                                <p className="text-secondary text-xs font-medium opacity-80 uppercase tracking-widest mt-1">
+                                    {chauffeurRequests.filter(r => ['in_transit', 'en_route'].includes(chauffeurStatusKey(r.status))).length} Operations
+                                </p>
+                            </div>
+                        </div>
+                        <div className="glass-card p-6 border-l-4 border-l-warning flex items-center gap-6">
+                            <div className="w-12 h-12 rounded-xl bg-warning/20 flex items-center justify-center text-warning shrink-0 shadow-2xl">
+                                <Clock size={24} />
+                            </div>
+                            <div>
+                                <h3 className="text-sm font-black text-white italic uppercase tracking-tight">Pending Dispatch</h3>
+                                <p className="text-secondary text-xs font-medium opacity-80 uppercase tracking-widest mt-1">
+                                    {chauffeurRequests.filter(r => isAwaitingDriver(r)).length} Manifests
+                                </p>
+                            </div>
+                        </div>
+                    </>
+                )}
+            </div>
+
+            {/* List/Table Section */}
+            <div className="glass-card p-6">
+                <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-6">
+                    <h2 className="text-[10px] font-black text-muted uppercase tracking-[0.3em]">
+                        {isSaasAdmin ? 'My Tenant Chauffeur Bookings' : isClientAdmin ? 'My Chauffeur Bookings' : (isAdmin ? 'Fleet Manifest Intelligence' : 'Chauffeur Bookings')}
+                    </h2>
+                    <div className="relative w-full md:w-64">
+                        <input
+                            type="text"
+                            placeholder="Search manifest ID..."
+                            className="w-full bg-background border border-border rounded-xl h-11 pl-11 pr-4 text-sm leading-none focus:outline-none focus:border-accent font-bold"
+                            value={searchTerm}
+                            onChange={(e) => setSearchTerm(e.target.value)}
+                        />
+                        <div className="absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none">
+                            <Search className="text-muted block" size={16} strokeWidth={2} />
+                        </div>
+                    </div>
+                </div>
+
+                {isAdmin ? (
+                    <>
+                        <Table
+                            columns={columns}
+                            data={filteredRequests}
+                            actions={true}
+                            onView={(row) => openModal('view', row)}
+                            onEdit={(row) => openModal('edit', row)}
+                            onDelete={async (row) => {
+                                if ((await swalConfirm('Delete Chauffeur Protocol', 'Are you sure you want to delete this chauffeur protocol?')).isConfirmed) {
+                                    swalLoading("Deleting Protocol", "Purging chauffeur manifest, please wait...");
+                                    const rawTargetId = row.db_id || row.id;
+                                    const targetId = !isNaN(Number(rawTargetId)) && Number(rawTargetId) > 0 ? Number(rawTargetId) : rawTargetId;
+                                    try {
+                                        await deleteMutation.mutateAsync(targetId);
+                                    } catch (err) {
+                                        console.warn("Delete API warning:", err);
+                                    }
+                                    if (deleteChauffeurRequest) {
+                                        try { await deleteChauffeurRequest(targetId); } catch (_) {}
+                                    }
+                                    if (syncGlobalState) await syncGlobalState();
+                                    swalClose();
+                                    swalSuccess("Protocol Deleted", "Chauffeur booking deleted successfully.");
+                                }
+                            }}
+                            canEdit={hasMenuPermission('Chauffeur', 'can_edit')}
+                            canDelete={(row) => {
+                                const normSt = String(row?.status || row?.chauffeur_status || '').toLowerCase().replace(/_/g, ' ');
+                                const isTripActiveOrDone = ['en route', 'in transit', 'on way', 'arrived', 'completed', 'delivered'].includes(normSt);
+                                return hasMenuPermission('Chauffeur', 'can_delete') && !isTripActiveOrDone;
+                            }}
+                        />
+                        {meta.totalItems > 10 && (
+                            <div className="mt-6 border-t border-white/5 pt-6">
+                                <Pagination
+                                    currentPage={currentPage}
+                                    totalPages={meta.totalPages}
+                                    onPageChange={setCurrentPage}
+                                    totalItems={meta.totalItems}
+                                />
+                            </div>
+                        )}
+                    </>
+                ) : (
+                    <>
+                        {/* Active / History tabs for personal client / customer view */}
+                        <div className="flex bg-background border border-border p-1 rounded-xl w-fit mb-6 gap-1">
+                            <button
+                                type="button"
+                                onClick={() => setBookingTab('active')}
+                                className={`px-5 py-2 rounded-lg text-[10px] font-black uppercase tracking-widest transition-all ${
+                                    bookingTab === 'active' ? 'bg-accent text-black shadow' : 'text-muted hover:text-white'
+                                }`}
+                            >
+                                Active Bookings
+                                {activeBookings.length > 0 && (
+                                    <span className={`ml-2 inline-flex items-center justify-center w-4 h-4 rounded-full text-[9px] font-black ${
+                                        bookingTab === 'active' ? 'bg-black/20 text-black' : 'bg-accent/20 text-accent'
+                                    }`}>{activeBookings.length}</span>
+                                )}
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => setBookingTab('history')}
+                                className={`px-5 py-2 rounded-lg text-[10px] font-black uppercase tracking-widest transition-all ${
+                                    bookingTab === 'history' ? 'bg-white/10 text-white shadow' : 'text-muted hover:text-white'
+                                }`}
+                            >
+                                Order History
+                                {historyBookings.length > 0 && (
+                                    <span className={`ml-2 inline-flex items-center justify-center w-4 h-4 rounded-full text-[9px] font-black ${
+                                        bookingTab === 'history' ? 'bg-white/20 text-white' : 'bg-white/10 text-muted'
+                                    }`}>{historyBookings.length}</span>
+                                )}
+                            </button>
+                        </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                        {tabData.length === 0 ? (
+                            <div className="col-span-2 glass-card p-12 text-center border-dashed border-2 border-white/5">
+                                <Car size={48} className="text-muted mx-auto mb-4 opacity-20" />
+                                <p className="text-secondary font-bold uppercase tracking-widest text-xs italic">
+                                    {bookingTab === 'active' ? 'No active bookings. Completed rides move to Order History.' : 'No completed bookings yet.'}
+                                </p>
+                            </div>
+                        ) : (
+                            tabData.map((req, i) => (
+                                <motion.div
+                                    key={req.id}
+                                    initial={{ opacity: 0, x: -20 }}
+                                    animate={{ opacity: 1, x: 0 }}
+                                    transition={{ delay: i * 0.1 }}
+                                    className="glass-card p-6 border-border hover:border-accent/30 transition-all group relative overflow-hidden"
+                                >
+                                    <div className="absolute top-0 right-0 p-4">
+                                        <StatusBadge status={req.status} />
+                                    </div>
+
+                                    <div className="flex items-center gap-4 mb-4">
+                                        <div className="w-10 h-10 rounded-xl bg-white/5 flex items-center justify-center text-accent">
+                                            <Navigation size={20} />
+                                        </div>
+                                        <div>
+                                            <p className="text-[10px] font-black text-muted uppercase tracking-widest">{req.id}</p>
+                                            <p className="text-sm font-black text-white italic uppercase tracking-tight">{req.serviceType}</p>
+                                        </div>
+                                    </div>
+
+                                    <div className="space-y-3">
+                                        <div className="flex items-center gap-3">
+                                            <MapPin size={14} className="text-accent shrink-0" />
+                                            <div className="min-w-0">
+                                                <p className="text-[8px] font-black text-muted uppercase">Pickup Location</p>
+                                                <p className="text-xs font-bold text-secondary truncate">{req.pickupLocation}</p>
+                                            </div>
+                                        </div>
+
+                                        <div className="flex items-center gap-3">
+                                            <Clock size={14} className="text-muted shrink-0" />
+                                            <div>
+                                                <p className="text-[8px] font-black text-muted uppercase">Pickup Time</p>
+                                                <p className="text-xs font-bold text-secondary">{req.dueDate || req.pickupDate} @ {req.pickupTime}</p>
+                                            </div>
+                                        </div>
+                                        <div className="flex items-center gap-3">
+                                            <Info size={14} className="text-warning shrink-0" />
+                                            <div>
+                                                <p className="text-[8px] font-black text-muted uppercase">Price</p>
+                                                <p className="text-xs font-bold text-warning">
+                                                    ${displayFee(req).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                                                    {!isCustomer && (
+                                                        <span className="text-muted"> {CHAUFFEUR_BILLING_MODE === 'included' ? '(included)' : '(separate billing)'}</span>
+                                                    )}
+                                                </p>
+                                            </div>
+                                        </div>
+
+                                        <div className="p-3 rounded-xl bg-white/[0.03] border border-white/10 space-y-2">
+                                            <p className="text-[8px] font-black text-muted uppercase tracking-widest">Driver & vehicle</p>
+                                            {(() => {
+                                                const vPlate = req.plateNumber || req.vehicleId || req.vehicle || req.vehicleRef || req.metadata?.plateNumber || req.metadata?.vehicleId;
+                                                if (req.driverName) {
+                                                    return (
+                                                        <div className="flex items-center gap-3">
+                                                            {req.driverPhotoUrl ? (
+                                                                <img src={req.driverPhotoUrl} alt="" className="w-11 h-11 rounded-lg object-cover border border-accent/30 shrink-0" />
+                                                            ) : (
+                                                                <div className="w-11 h-11 rounded-lg bg-accent/10 border border-accent/20 flex items-center justify-center text-accent shrink-0">
+                                                                    <Car size={18} />
+                                                                </div>
+                                                            )}
+                                                            <div className="min-w-0 flex-1">
+                                                                <p className="text-xs font-bold text-white truncate">{req.driverName}</p>
+                                                                {vPlate && (
+                                                                    <p className="text-[10px] text-accent font-bold mt-0.5">Vehicle: {vPlate}</p>
+                                                                )}
+                                                                <DriverEtaDisplay pickupLocation={req.pickupLocation} status={req.status} driverName={req.driverName} />
+                                                            </div>
+                                                        </div>
+                                                    );
+                                                }
+                                                if (vPlate) {
+                                                    return (
+                                                        <div className="flex items-center gap-3">
+                                                            <div className="w-11 h-11 rounded-lg bg-accent/10 border border-accent/20 flex items-center justify-center text-accent shrink-0">
+                                                                <Car size={18} />
+                                                            </div>
+                                                            <div className="min-w-0 flex-1">
+                                                                <p className="text-xs font-bold text-white truncate">{vPlate}</p>
+                                                                <p className="text-[10px] text-warning font-bold">Driver assignment in progress</p>
+                                                            </div>
+                                                        </div>
+                                                    );
+                                                }
+                                                return (
+                                                    <p className="text-[10px] text-warning font-bold leading-snug">Awaiting admin approval and driver assignment.</p>
+                                                );
+                                            })()}
+                                        </div>
+
+                                        <div className="flex items-center gap-2 mt-4 pt-4 border-t border-white/5">
+                                            <button type="button" onClick={() => openModal('view', req)} className="flex-1 py-2 rounded-lg text-[9px] font-black uppercase tracking-widest transition-all bg-white/10 text-white hover:bg-white/20">
+                                                View details
+                                            </button>
+                                            {(() => {
+                                                const normReqSt = String(req.status || req.chauffeur_status || '').toLowerCase().replace(/_/g, ' ');
+                                                const isTripUnderway = ['en route', 'in transit', 'on way', 'arrived'].includes(normReqSt);
+                                                const isDoneOrCancelled = ['completed', 'delivered', 'done', 'cancelled', 'canceled', 'rejected'].includes(normReqSt);
+                                                if (isTripUnderway) {
+                                                    return (
+                                                        <span className="py-2 px-3 rounded-lg text-[9px] font-black uppercase tracking-widest bg-info/10 text-info border border-info/20" title="Trip is actively in progress. Contact dispatch for emergency changes.">
+                                                            In Progress
+                                                        </span>
+                                                    );
+                                                }
+                                                return (
+                                                    <button
+                                                        onClick={() => handleCancel(req.id)}
+                                                        disabled={isDoneOrCancelled}
+                                                        className={`py-2 px-4 rounded-lg text-[9px] font-black uppercase tracking-widest transition-all ${isDoneOrCancelled ? 'bg-white/5 text-muted cursor-not-allowed' : 'bg-danger/20 text-danger hover:bg-danger/30'}`}
+                                                    >
+                                                        Cancel
+                                                    </button>
+                                                );
+                                            })()}
+                                        </div>
+                                    </div>
+                                </motion.div>
+                            ))
+                        )}
+                    </div>
+                    </>
+                )}
+            </div>
+
+            {/* Modal */}
+            <AnimatePresence>
+                {showModal && (
+                    <div className="fixed inset-0 z-50 overflow-y-auto overscroll-contain">
+                        <motion.div
+                            initial={{ opacity: 0 }}
+                            animate={{ opacity: 1 }}
+                            exit={{ opacity: 0 }}
+                            className="fixed inset-0 bg-black/90 backdrop-blur-md"
+                            onClick={() => setShowModal(false)}
+                        />
+                        <div className="relative z-10 flex min-h-[100dvh] items-start justify-center p-4 pt-6 pb-10 sm:items-center sm:py-8">
+                            <motion.div
+                                initial={{ scale: 0.96, opacity: 0, y: 16 }}
+                                animate={{ scale: 1, opacity: 1, y: 0 }}
+                                exit={{ scale: 0.96, opacity: 0, y: 16 }}
+                                className="w-full max-w-2xl max-h-[90vh] sm:max-h-[85vh] bg-sidebar border border-border rounded-3xl sm:rounded-[3rem] shadow-2xl flex flex-col overflow-hidden my-auto"
+                            >
+                                <div className="p-5 sm:p-8 pb-4 border-b border-white/5 flex items-center justify-between shrink-0">
+                                    <div>
+                                        <h3 className="text-2xl font-black text-white uppercase italic tracking-tighter">
+                                            {modalType === 'view' ? 'Manifest Details' : editingRequest ? 'Modify Transport Protocol' : 'Initialize Transport Protocol'}
+                                        </h3>
+                                        <p className="text-xs text-secondary italic mt-1 font-black tracking-widest uppercase opacity-70">
+                                            {modalType === 'view' ? 'Institutional Verification' : 'Define transport manifest'}
+                                        </p>
+                                    </div>
+                                    <button type="button" onClick={() => setShowModal(false)} className="p-3 bg-white/5 border border-border rounded-full text-muted hover:text-white transition-all">
+                                        <X size={20} />
+                                    </button>
+                                </div>
+
+                                <form onSubmit={handleSubmit} className="flex flex-col flex-1 min-h-0 overflow-hidden">
+                                    <input type="hidden" name="driverUserId" value={editingRequest?.driver_user_id || editingRequest?.driverId || (users || []).find(u => u.name === editingRequest?.driverName)?.id || ""} />
+                                    <input type="hidden" name="driverName" value={editingRequest?.driverName || ""} />
+                                    <div className="p-5 sm:p-8 space-y-6 flex-1 overflow-y-auto custom-scrollbar">
+                                        {modalType === 'view' ? (
+                                            <div className="space-y-6">
+                                                <div className="p-6 bg-accent/5 rounded-2xl border border-accent/20 flex items-center justify-between">
+                                                    <div className="flex items-center gap-4">
+                                                        <div className="w-12 h-12 bg-accent/20 rounded-xl flex items-center justify-center text-accent">
+                                                            <Car size={24} />
+                                                        </div>
+                                                        <div>
+                                                            <h4 className="font-bold text-lg text-white">{editingRequest?.id}</h4>
+                                                            <p className="text-xs text-secondary uppercase font-black tracking-widest">{editingRequest?.serviceType}</p>
+                                                        </div>
+                                                    </div>
+                                                    <StatusBadge status={editingRequest?.status} />
+                                                </div>
+
+                                                <div className="p-4 bg-white/[0.03] rounded-2xl border border-white/10 space-y-4">
+                                                    <p className="text-[10px] font-black text-muted uppercase tracking-widest">Driver & vehicle</p>
+                                                    {(() => {
+                                                        const rawAssignedVehicle = String(
+                                                            editingRequest?.plateNumber ||
+                                                            editingRequest?.vehicleId ||
+                                                            editingRequest?.vehicle ||
+                                                            editingRequest?.vehicleRef ||
+                                                            editingRequest?.metadata?.plateNumber ||
+                                                            editingRequest?.metadata?.vehicleId ||
+                                                            editingRequest?.metadata?.vehicle ||
+                                                            editingRequest?.metadata?.vehicleRef ||
+                                                            ''
+                                                        ).trim();
+
+                                                        const matchedVehicleInfo = (fleet || []).find(v => {
+                                                            if (!rawAssignedVehicle) return false;
+                                                            const vId = String(v.id || '').trim();
+                                                            const vDbId = String(v.db_id || '').trim();
+                                                            const vModel = String(v.model || '').trim();
+                                                            const vCombo1 = `${vModel} (${vId})`.toLowerCase();
+                                                            const vCombo2 = `${vModel} - ${vId}`.toLowerCase();
+                                                            const rawLower = rawAssignedVehicle.toLowerCase();
+                                                            return (
+                                                                rawLower === vCombo1 ||
+                                                                rawLower === vCombo2 ||
+                                                                rawLower === vId.toLowerCase() ||
+                                                                rawLower === vDbId.toLowerCase() ||
+                                                                rawLower === vModel.toLowerCase() ||
+                                                                rawLower.includes(vId.toLowerCase()) ||
+                                                                (vModel && rawLower.includes(vModel.toLowerCase()))
+                                                            );
+                                                        });
+
+                                                        const vehicleDisplayName = matchedVehicleInfo?.model
+                                                            ? matchedVehicleInfo.model.trim()
+                                                            : (rawAssignedVehicle || null);
+
+                                                        const vehiclePlateDisplay = matchedVehicleInfo?.id
+                                                            ? `#${matchedVehicleInfo.id}`
+                                                            : (rawAssignedVehicle || null);
+
+                                                        return (
+                                                            <div className="space-y-4">
+                                                                {/* Driver Section */}
+                                                                {editingRequest?.driverName ? (
+                                                                    <div className="flex items-center gap-4">
+                                                                        {editingRequest.driverPhotoUrl ? (
+                                                                            <img src={editingRequest.driverPhotoUrl} alt="" className="w-14 h-14 rounded-xl object-cover border border-accent/30 shrink-0" />
+                                                                        ) : (
+                                                                            <div className="w-14 h-14 rounded-xl bg-accent/10 border border-accent/20 flex items-center justify-center text-accent shrink-0">
+                                                                                <Car size={22} />
+                                                                            </div>
+                                                                        )}
+                                                                        <div className="flex-1 min-w-0">
+                                                                            <div className="flex items-center gap-2">
+                                                                                <p className="text-sm font-bold text-white">{editingRequest.driverName}</p>
+                                                                                <span className="text-[8px] font-black uppercase tracking-wider bg-emerald-500/20 text-emerald-400 px-2 py-0.5 rounded-full border border-emerald-500/30">Chauffeur</span>
+                                                                            </div>
+                                                                            <DriverEtaDisplay pickupLocation={editingRequest.pickupLocation} status={editingRequest.status} driverName={editingRequest.driverName} />
+                                                                        </div>
+                                                                    </div>
+                                                                ) : (
+                                                                    <div className="p-3 bg-white/5 rounded-xl border border-white/5">
+                                                                        <p className="text-xs text-warning font-bold leading-relaxed">
+                                                                            {editingRequest?.adminApproved
+                                                                                ? 'Approved — a chauffeur driver will be assigned shortly.'
+                                                                                : 'Awaiting admin approval and driver assignment.'}
+                                                                        </p>
+                                                                    </div>
+                                                                )}
+
+                                                                {/* Vehicle Section */}
+                                                                <div className="pt-3 border-t border-white/5">
+                                                                    <p className="text-[9px] font-black text-muted uppercase tracking-widest mb-2.5">Assigned Vehicle Specification</p>
+                                                                    {vehicleDisplayName ? (
+                                                                        <div className="flex items-start gap-4 p-3.5 bg-accent/[0.04] border border-accent/20 rounded-xl">
+                                                                            <div className="w-12 h-12 rounded-xl bg-accent/10 border border-accent/30 flex items-center justify-center text-accent shrink-0">
+                                                                                <Car size={20} />
+                                                                            </div>
+                                                                            <div className="flex-1 min-w-0 space-y-1">
+                                                                                <div className="flex flex-wrap items-center justify-between gap-2">
+                                                                                    <p className="text-sm font-black text-white uppercase tracking-tight">{vehicleDisplayName}</p>
+                                                                                    <span className="text-[9px] font-black uppercase tracking-wider px-2 py-0.5 bg-emerald-500/20 text-emerald-400 rounded-md border border-emerald-500/30">
+                                                                                        {matchedVehicleInfo?.status || 'Active Fleet'}
+                                                                                    </span>
+                                                                                </div>
+                                                                                <div className="flex flex-wrap items-center gap-2 text-xs">
+                                                                                    {vehiclePlateDisplay && (
+                                                                                        <span className="font-mono text-accent font-bold text-xs">Plate / Unit: {vehiclePlateDisplay}</span>
+                                                                                    )}
+                                                                                    {matchedVehicleInfo?.type && (
+                                                                                        <span className="text-[10px] text-secondary font-medium px-2 py-0.5 bg-white/5 rounded border border-white/10 uppercase">
+                                                                                            {matchedVehicleInfo.type}
+                                                                                        </span>
+                                                                                    )}
+                                                                                    {matchedVehicleInfo?.capacity && (
+                                                                                        <span className="text-[10px] text-muted font-medium px-2 py-0.5 bg-white/5 rounded border border-white/10 uppercase">
+                                                                                            {matchedVehicleInfo.capacity} Seats
+                                                                                        </span>
+                                                                                    )}
+                                                                                </div>
+                                                                            </div>
+                                                                        </div>
+                                                                    ) : (
+                                                                        <div className="p-3 bg-white/5 rounded-xl border border-white/5 flex items-center gap-2 text-muted">
+                                                                            <Car size={14} className="text-muted/60" />
+                                                                            <p className="text-xs font-medium italic">No vehicle assigned to this chauffeur mission yet.</p>
+                                                                        </div>
+                                                                    )}
+                                                                </div>
+                                                            </div>
+                                                        );
+                                                    })()}
+                                                </div>
+
+                                                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                                    <div className="p-4 bg-white/5 rounded-xl border border-border">
+                                                        <p className="text-[10px] text-muted uppercase font-black tracking-widest mb-1">Entity / Client</p>
+                                                        <p className="text-sm font-bold text-white">{editingRequest?.clientName}</p>
+                                                    </div>
+                                                    <div className="p-4 bg-white/5 rounded-xl border border-border">
+                                                        <p className="text-[10px] text-muted uppercase font-black tracking-widest mb-1">Execution Date</p>
+                                                        <p className="text-sm font-bold text-white">{editingRequest?.dueDate} @ {editingRequest?.pickupTime}</p>
+                                                    </div>
+                                                    <div className="p-4 bg-white/5 rounded-xl border border-border col-span-2">
+                                                        <p className="text-[10px] text-muted uppercase font-black tracking-widest mb-1">Pickup Vector</p>
+                                                        <p className="text-sm font-bold text-white italic">{editingRequest?.pickupLocation || editingRequest?.pickup_location || 'N/A'}</p>
+                                                    </div>
+                                                    <div className="p-4 bg-white/5 rounded-xl border border-border col-span-2">
+                                                        <p className="text-[10px] text-muted uppercase font-black tracking-widest mb-1">Destination Vector</p>
+                                                        <p className="text-sm font-bold text-white italic">{editingRequest?.dropLocation || editingRequest?.drop_location || editingRequest?.location || editingRequest?.deliveryAddress || editingRequest?.delivery_address || 'N/A'}</p>
+                                                    </div>
+                                                    <div className="p-4 bg-white/5 rounded-xl border border-border">
+                                                        <p className="text-[10px] text-muted uppercase font-black tracking-widest mb-1">No. of Passengers</p>
+                                                        <p className="text-sm font-bold text-white">
+                                                            {editingRequest?.numberOfPassengers || editingRequest?.passengers || editingRequest?.passengerCount || editingRequest?.passenger_count || editingRequest?.pax || editingRequest?.passengerInfo?.count || editingRequest?.passengerInfo?.passengers || editingRequest?.guestCount || editingRequest?.guest_count || 1} PAX
+                                                            {(editingRequest?.passengerName || editingRequest?.passenger_name || editingRequest?.passengerInfo?.name) ? ` (${editingRequest?.passengerName || editingRequest?.passenger_name || editingRequest?.passengerInfo?.name})` : ''}
+                                                        </p>
+                                                    </div>
+                                                    <div className="p-4 bg-white/5 rounded-xl border border-border">
+                                                        <p className="text-[10px] text-muted uppercase font-black tracking-widest mb-1">Luggage</p>
+                                                        <p className="text-sm font-bold text-white">
+                                                            {editingRequest?.luggage === 'Yes'
+                                                                ? `Yes — ${editingRequest?.bags ?? 0} bag(s)`
+                                                                : (editingRequest?.luggage || 'No')}
+                                                        </p>
+                                                    </div>
+                                                    <div className="p-4 bg-white/5 rounded-xl border border-border col-span-1 sm:col-span-2 overflow-hidden">
+                                                        <div className="flex items-center justify-between mb-1.5">
+                                                            <p className="text-[10px] text-muted uppercase font-black tracking-widest">Extra Stops / Intermediate Waypoints</p>
+                                                            {editingRequest?.stops === 'Yes' && (
+                                                                <span className="text-[9px] font-black uppercase tracking-wider bg-accent/10 text-accent px-2 py-0.5 rounded border border-accent/20">
+                                                                    {editingRequest?.stopLocations ? 'Stops Specified' : 'Requested'}
+                                                                </span>
+                                                            )}
+                                                        </div>
+                                                        {editingRequest?.stops === 'Yes' ? (
+                                                            editingRequest?.stopLocations ? (
+                                                                <div className="space-y-1.5 pt-1">
+                                                                    {String(editingRequest.stopLocations)
+                                                                        .split(/\r?\n/)
+                                                                        .map(s => s.trim())
+                                                                        .filter(Boolean)
+                                                                        .map((loc, idx, arr) => (
+                                                                            <div key={idx} className="flex items-start gap-2 text-sm font-bold text-white">
+                                                                                {arr.length > 1 && (
+                                                                                    <span className="text-[10px] font-mono text-accent shrink-0 mt-0.5">#{idx + 1}</span>
+                                                                                )}
+                                                                                <p className="break-words break-all [overflow-wrap:anywhere] leading-relaxed flex-1 min-w-0">
+                                                                                    {loc}
+                                                                                </p>
+                                                                            </div>
+                                                                        ))}
+                                                                </div>
+                                                            ) : (
+                                                                <p className="text-sm font-bold text-white italic">Yes (no specific waypoint addresses specified)</p>
+                                                            )
+                                                        ) : (
+                                                            <p className="text-sm font-bold text-white">No extra stops requested</p>
+                                                        )}
+                                                    </div>
+                                                    <div className="p-4 bg-warning/10 rounded-xl border border-warning/30 col-span-2">
+                                                        <p className="text-[10px] text-warning uppercase font-black tracking-widest mb-1">
+                                                            Pricing {editingRequest?.serviceType === 'Round Trip' ? '(Round Trip: 2× Rate)' : (editingRequest?.serviceType === 'Daily Service' && (editingRequest?.numberOfDays > 1 || editingRequest?.dailyDays > 1) ? `(Daily Service: ${editingRequest?.numberOfDays || editingRequest?.dailyDays} Days)` : '')}
+                                                        </p>
+                                                        <p className="text-sm font-bold text-white">
+                                                            ${displayFee(editingRequest).toLocaleString(undefined, { minimumFractionDigits: 2 })} USD
+                                                            {editingRequest?.serviceType === 'Round Trip' && (
+                                                                <span className="text-xs text-accent font-semibold ml-2">
+                                                                    (2 × ${(displayFee(editingRequest) / 2).toLocaleString(undefined, { minimumFractionDigits: 2 })} USD)
+                                                                </span>
+                                                            )}
+                                                            {editingRequest?.serviceType === 'Daily Service' && (editingRequest?.numberOfDays > 1 || editingRequest?.dailyDays > 1) && (
+                                                                <span className="text-xs text-accent font-semibold ml-2">
+                                                                    ({editingRequest.numberOfDays || editingRequest.dailyDays} days × ${(displayFee(editingRequest) / (editingRequest.numberOfDays || editingRequest.dailyDays)).toLocaleString(undefined, { minimumFractionDigits: 2 })} USD/day)
+                                                                </span>
+                                                            )}
+                                                            {!isCustomer && (
+                                                                <span className="text-warning"> {CHAUFFEUR_BILLING_MODE === 'included' ? '(included in total)' : '(separate billing)'}</span>
+                                                            )}
+                                                        </p>
+                                                    </div>
+                                                    {Boolean(editingRequest?.amenities) && (
+                                                        <div className="p-4 bg-white/5 rounded-xl border border-border col-span-2">
+                                                            <p className="text-[10px] text-muted uppercase font-black tracking-widest mb-1">Amenities</p>
+                                                            <p className="text-sm font-bold text-white">
+                                                                {Array.isArray(editingRequest.amenities)
+                                                                    ? editingRequest.amenities.join(', ')
+                                                                    : String(editingRequest.amenities)}
+                                                            </p>
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            </div>
+                                        ) : (
+                                            <>
+                                                {/* Service Type Selection */}
+                                                <div className="space-y-4">
+                                                    <label className="text-[10px] font-black text-muted uppercase tracking-[0.2em] pl-1">Select Service Protocol</label>
+                                                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                                                        {['One Way', 'Round Trip', 'Daily Service'].map(type => (
+                                                            <button
+                                                                key={type}
+                                                                type="button"
+                                                                onClick={() => setServiceType(type)}
+                                                                className={`py-4 px-2 rounded-2xl border-2 transition-all text-xs font-black uppercase tracking-tight flex flex-col items-center gap-2 ${serviceType === type
+                                                                    ? 'bg-accent/10 border-accent text-accent shadow-lg shadow-accent/5'
+                                                                    : 'bg-white/[0.02] border-border text-muted hover:border-white/20'
+                                                                    }`}
+                                                            >
+                                                                <div className={`p-2 rounded-lg ${serviceType === type ? 'bg-accent/20' : 'bg-white/5'}`}>
+                                                                    {type === 'One Way' ? <ArrowRight size={16} /> : type === 'Round Trip' ? <Navigation size={16} /> : <Calendar size={16} />}
+                                                                </div>
+                                                                {type}
+                                                            </button>
+                                                        ))}
+                                                    </div>
+                                                </div>
+
+                                                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 sm:gap-6 pt-4">
+                                                    <div className="space-y-2">
+                                                        <label className="text-[10px] font-black text-muted uppercase tracking-widest pl-1">Request Date</label>
+                                                        <input type="text" value={editingRequest ? editingRequest.requestDate : new Date().toISOString().split('T')[0]} disabled className="w-full bg-background/50 border border-border rounded-2xl px-5 py-4 text-sm text-muted focus:outline-none font-bold" />
+                                                    </div>
+                                                    <div className="space-y-2">
+                                                        <label className="text-[10px] font-black text-muted uppercase tracking-widest pl-1">Due Date (Pickup)</label>
+                                                        <input type="date" name="dueDate" defaultValue={editingRequest?.dueDate} required className="w-full bg-background border border-border rounded-2xl px-5 py-4 text-sm text-white focus:outline-none focus:border-accent font-bold" />
+                                                    </div>
+                                                    <div className="space-y-2">
+                                                        <label className="text-[10px] font-black text-muted uppercase tracking-widest pl-1">Pickup Time</label>
+                                                        <div className="relative">
+                                                            <input
+                                                                type="time"
+                                                                name="pickupTime"
+                                                                value={pickupTimeInput}
+                                                                onChange={(e) => setPickupTimeInput(e.target.value)}
+                                                                required
+                                                                className="w-full bg-background border border-border rounded-2xl px-5 py-4 text-sm text-white focus:outline-none focus:border-accent font-bold"
+                                                            />
+                                                            <div className="absolute right-12 top-1/2 -translate-y-1/2 flex items-center pointer-events-none">
+                                                                {pickupTimeInput && (
+                                                                    <span className="text-[10px] font-black uppercase tracking-wider text-accent bg-accent/10 border border-accent/20 px-2 py-0.5 rounded">
+                                                                        {getPeriodFrom24h(pickupTimeInput)}
+                                                                    </span>
+                                                                )}
+                                                            </div>
+                                                        </div>
+                                                    </div>
+                                                    <div className="space-y-2">
+                                                        <label className="text-[10px] font-black text-muted uppercase tracking-widest pl-1">Passengers</label>
+                                                        <input type="number" name="numberOfPassengers" min="1" max="10" defaultValue={editingRequest?.numberOfPassengers || editingRequest?.passengers || editingRequest?.passengerCount || 1} required placeholder="1" className="w-full bg-background border border-border rounded-2xl px-5 py-4 text-sm text-white focus:outline-none focus:border-accent font-bold" />
+                                                    </div>
+                                                    <div className="space-y-2">
+                                                        <label className="text-[10px] font-black text-muted uppercase tracking-widest pl-1">Chauffeur Price (USD)</label>
+                                                        {isFeeLocked ? (
+                                                            <>
+                                                                <div className="w-full bg-background/80 border border-border rounded-2xl px-5 py-4 text-sm text-white font-bold">
+                                                                    ${customerLockedFee.toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                                                                </div>
+                                                                <p className="text-[9px] text-muted font-bold pl-1">
+                                                                    Set by administrator; this amount cannot be changed here.
+                                                                </p>
+                                                            </>
+                                                        ) : (
+                                                            <>
+                                                                <input
+                                                                    type="number"
+                                                                    name="chauffeurFee"
+                                                                    min="0"
+                                                                    step="0.01"
+                                                                    value={chauffeurQuote}
+                                                                    onChange={(e) => setChauffeurQuote(e.target.value)}
+                                                                    className="w-full bg-background border border-warning/40 rounded-2xl px-5 py-4 text-sm text-white focus:outline-none focus:border-warning font-bold"
+                                                                />
+                                                                <p className="text-[9px] text-warning font-black uppercase tracking-widest pl-1">
+                                                                    {CHAUFFEUR_BILLING_MODE === 'included' ? 'Included in checkout total' : 'Charged separately'}
+                                                                </p>
+                                                            </>
+                                                        )}
+                                                    </div>
+                                                </div>
+
+                                                <div className="space-y-2">
+                                                    <label className="text-[10px] font-black text-muted uppercase tracking-[0.2em] pl-1 text-accent">Pickup Location</label>
+                                                    <div className="relative">
+                                                        <MapPin className="absolute left-5 top-1/2 -translate-y-1/2 text-accent" size={18} />
+                                                        <input
+                                                            type="text"
+                                                            name="pickupLocation"
+                                                            defaultValue={editingRequest?.pickupLocation || editingRequest?.pickup_location || ''}
+                                                            required
+                                                            className="w-full bg-background border border-border rounded-2xl py-4 pl-14 pr-5 text-sm text-white focus:outline-none focus:border-accent font-bold"
+                                                        />
+                                                    </div>
+                                                </div>
+
+                                                <div className="space-y-2">
+                                                    <label className="text-[10px] font-black text-muted uppercase tracking-[0.2em] pl-1">Drop Location</label>
+                                                    <div className="relative">
+                                                        <Navigation className="absolute left-5 top-1/2 -translate-y-1/2 text-muted" size={18} />
+                                                        <input
+                                                            type="text"
+                                                            name="dropLocation"
+                                                            defaultValue={editingRequest?.dropLocation || editingRequest?.drop_location || editingRequest?.location || editingRequest?.deliveryAddress || editingRequest?.delivery_address || ''}
+                                                            required
+                                                            className="w-full bg-background border border-border rounded-2xl py-4 pl-14 pr-5 text-sm text-white focus:outline-none focus:border-accent font-bold"
+                                                        />
+                                                    </div>
+                                                </div>
+
+                                                {serviceType === 'Round Trip' && (
+                                                    <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="space-y-4 bg-accent/5 p-6 rounded-3xl border border-accent/20">
+                                                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 sm:gap-6">
+                                                            <div className="space-y-2">
+                                                                <label className="text-[10px] font-black text-accent uppercase tracking-widest pl-1 italic">Return Date</label>
+                                                                <input type="date" name="returnDate" defaultValue={editingRequest?.returnDate} required className="w-full bg-background border border-border rounded-2xl px-5 py-4 text-sm text-white focus:outline-none focus:border-accent font-bold" />
+                                                            </div>
+                                                            <div className="space-y-2">
+                                                                <label className="text-[10px] font-black text-accent uppercase tracking-widest pl-1 italic">Return Time</label>
+                                                                <div className="relative">
+                                                                    <input
+                                                                        type="time"
+                                                                        name="returnTime"
+                                                                        value={returnTimeInput}
+                                                                        onChange={(e) => setReturnTimeInput(e.target.value)}
+                                                                        required
+                                                                        className="w-full bg-background border border-border rounded-2xl px-5 py-4 text-sm text-white focus:outline-none focus:border-accent font-bold"
+                                                                    />
+                                                                    <div className="absolute right-12 top-1/2 -translate-y-1/2 flex items-center pointer-events-none">
+                                                                        {returnTimeInput && (
+                                                                            <span className="text-[10px] font-black uppercase tracking-wider text-accent bg-accent/10 border border-accent/20 px-2 py-0.5 rounded">
+                                                                                {getPeriodFrom24h(returnTimeInput)}
+                                                                            </span>
+                                                                        )}
+                                                                    </div>
+                                                                </div>
+                                                            </div>
+                                                        </div>
+                                                    </motion.div>
+                                                )}
+
+                                                {serviceType === 'Daily Service' && (
+                                                    <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="space-y-2 bg-accent/5 p-4 rounded-3xl border border-accent/20">
+                                                        <label className="text-[10px] font-black text-accent uppercase tracking-widest pl-1 italic">Requested Duration (Days)</label>
+                                                        <input type="number" name="numberOfDays" min="1" defaultValue={editingRequest?.numberOfDays || 1} onChange={(e) => setDaysCountInput(parseInt(e.target.value, 10) || 1)} required placeholder="e.g. 5" className="w-full bg-background border border-border rounded-2xl px-5 py-4 text-sm text-white focus:outline-none focus:border-accent font-bold" />
+                                                    </motion.div>
+                                                )}
+
+                                                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => setHasLuggage(!hasLuggage)}
+                                                        className={`p-4 rounded-2xl border flex items-center justify-between transition-all ${hasLuggage ? 'bg-accent/10 border-accent/40' : 'bg-white/5 border-border'}`}
+                                                    >
+                                                        <div className="flex items-center gap-2">
+                                                            <Luggage size={16} className={hasLuggage ? 'text-accent' : 'text-muted'} />
+                                                            <span className={`text-[10px] font-black uppercase tracking-tight ${hasLuggage ? 'text-white' : 'text-muted'}`}>Luggage</span>
+                                                        </div>
+                                                    </button>
+
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => setHasStops(!hasStops)}
+                                                        className={`p-4 rounded-2xl border flex items-center justify-between transition-all ${hasStops ? 'bg-accent/10 border-accent/40' : 'bg-white/5 border-border'}`}
+                                                    >
+                                                        <div className="flex items-center gap-2">
+                                                            <Clock4 size={16} className={hasStops ? 'text-accent' : 'text-muted'} />
+                                                            <span className={`text-[10px] font-black uppercase tracking-tight ${hasStops ? 'text-white' : 'text-muted'}`}>Extra Stops</span>
+                                                        </div>
+                                                    </button>
+                                                </div>
+
+                                                {hasLuggage && (
+                                                    <div className="space-y-2">
+                                                        <label className="text-[10px] font-black text-muted uppercase tracking-widest pl-1">Number of bags</label>
+                                                        <input
+                                                            type="number"
+                                                            name="bags"
+                                                            min="1"
+                                                            max="99"
+                                                            defaultValue={editingRequest?.bags ?? 1}
+                                                            required
+                                                            className="w-full bg-background border border-border rounded-2xl px-5 py-4 text-sm text-white focus:outline-none focus:border-accent font-bold"
+                                                        />
+                                                    </div>
+                                                )}
+
+                                                {hasStops && (
+                                                    <div className="space-y-2">
+                                                        <label className="text-[10px] font-black text-muted uppercase tracking-widest pl-1">Stop locations</label>
+                                                        <textarea
+                                                            name="stopLocations"
+                                                            rows={3}
+                                                            defaultValue={editingRequest?.stopLocations || ''}
+                                                            required
+                                                            placeholder="List each stop (address or landmark), one per line..."
+                                                            className="w-full bg-background border border-border rounded-2xl px-5 py-4 text-sm text-white focus:outline-none focus:border-accent font-bold resize-y min-h-[88px]"
+                                                        />
+                                                    </div>
+                                                )}
+
+                                                <div className="space-y-4">
+                                                    <label className="text-[10px] font-black text-muted uppercase tracking-[0.2em] pl-1">Extra Amenities Protocol</label>
+                                                    <div className="flex flex-wrap gap-2">
+                                                        {['Baby Car Seat', 'WiFi', 'Refreshments'].map(item => (
+                                                            <button
+                                                                key={item}
+                                                                type="button"
+                                                                onClick={() => toggleAmenity(item)}
+                                                                className={`px-4 py-3 rounded-xl border text-[9px] font-black uppercase tracking-widest transition-all ${amenities.includes(item) ? 'bg-accent/20 border-accent text-accent' : 'bg-white/[0.02] border-white/5 text-muted'}`}
+                                                            >
+                                                                {item}
+                                                            </button>
+                                                        ))}
+                                                    </div>
+                                                </div>
+
+                                                {/* Admin: Client Selection + Driver Assignment */}
+                                                {isStaffAdmin && (
+                                                    <div className="space-y-6 pt-6 mt-6 border-t border-accent/20">
+                                                        <div className="flex items-center gap-3">
+                                                            <div className="w-8 h-8 bg-accent/20 rounded-lg flex items-center justify-center text-accent">
+                                                                <Car size={16} />
+                                                            </div>
+                                                            <label className="text-[10px] font-black text-accent uppercase tracking-[0.2em]">Admin — Assignment Panel</label>
+                                                        </div>
+
+                                                        {/* Select Client */}
+                                                        <div className="space-y-2">
+                                                            <label className="text-[10px] font-black text-muted uppercase tracking-widest pl-1">Book For Client</label>
+                                                            <select name="assignClient" defaultValue={editingRequest?.clientId || ''} className="w-full bg-background border border-border rounded-2xl px-5 py-4 text-sm text-white focus:outline-none focus:border-accent font-bold appearance-none cursor-pointer">
+                                                                <option value="">Current User ({currentUser?.name})</option>
+                                                                {!isClientAdmin && (clients || [])
+                                                                    .filter(c => {
+                                                                        const ct = String(c.client_type || c.clientType || c.type || '').trim().toLowerCase();
+                                                                        const tt = String(c.tenant_type || c.tenantType || '').trim().toLowerCase();
+                                                                        const category = String(c.category || '').trim().toLowerCase();
+                                                                        const role = String(c.role || c.user_role || '').trim().toLowerCase();
+                                                                        if (
+                                                                            ct === 'saas' || ct === 'business' || ct === 'enterprise' ||
+                                                                            tt === 'saas' || tt === 'business' || tt === 'enterprise' ||
+                                                                            category === 'saas' || category === 'business' || category === 'enterprise' ||
+                                                                            role === 'saas' || role === 'business' || role === 'saas_client' || role === 'business_client'
+                                                                        ) {
+                                                                            return false;
+                                                                        }
+                                                                        return true;
+                                                                    })
+                                                                    .map(c => (
+                                                                        <option key={c.id} value={c.id}>{c.fullName || c.name || c.companyName || c.business_name} (Personal)</option>
+                                                                    ))}
+                                                            </select>
+                                                        </div>
+
+                                                        {/* Active Assignment Info Banner */}
+                                                        {(editingRequest?.driverName || editingRequest?.plateNumber || editingRequest?.vehicleId) && (
+                                                            <div className="p-4 bg-emerald-500/10 border border-emerald-500/30 rounded-2xl flex items-center justify-between">
+                                                                <div className="flex items-center gap-3">
+                                                                    <div className="w-9 h-9 rounded-xl bg-emerald-500/20 flex items-center justify-center text-emerald-400">
+                                                                        <Car size={18} />
+                                                                    </div>
+                                                                    <div>
+                                                                        <p className="text-[9px] font-black text-emerald-400 uppercase tracking-widest">Currently Assigned</p>
+                                                                        <p className="text-xs font-bold text-white">
+                                                                            {editingRequest.driverName || 'No Driver Assigned'}
+                                                                            {(editingRequest.plateNumber || editingRequest.vehicleId) ? ` • ${editingRequest.plateNumber || editingRequest.vehicleId}` : ''}
+                                                                        </p>
+                                                                    </div>
+                                                                </div>
+                                                                <span className="text-[8px] font-black text-emerald-400 uppercase tracking-widest bg-emerald-500/20 px-2.5 py-1 rounded-full border border-emerald-500/30">Assigned</span>
+                                                            </div>
+                                                        )}
+
+                                                        <div className="grid grid-cols-1 gap-4">
+                                                            {/* Assign Driver */}
+                                                            <div className="space-y-2">
+                                                                <div className="flex items-center justify-between pl-1">
+                                                                    <label className="text-[10px] font-black text-muted uppercase tracking-widest">
+                                                                        {editingRequest?.driverName ? 'Assigned Chauffeur (Reassign if needed)' : 'Assign Chauffeur'}
+                                                                    </label>
+                                                                    {editingRequest?.driverName && (
+                                                                        <span className="text-[9px] font-mono text-accent">Active: {editingRequest.driverName}</span>
+                                                                    )}
+                                                                </div>
+                                                                <select
+                                                                    name="driverNameSelect"
+                                                                    key={`driver-select-${editingRequest?.id || 'new'}-${editingRequest?.driver_user_id || editingRequest?.driverName || 'none'}`}
+                                                                    defaultValue={editingRequest?.driver_user_id || editingRequest?.driverId || (users || []).find(u => (u.name === editingRequest?.driverName || u.fullName === editingRequest?.driverName))?.id || ""}
+                                                                    onChange={(e) => {
+                                                                        const input = e.target.form?.querySelector('input[name="driverName"]');
+                                                                        const hidden = e.target.form?.querySelector('input[name="driverUserId"]');
+                                                                        const selected = (users || []).find(u => String(u.id) === e.target.value);
+                                                                        if (input && selected) input.value = selected.fullName || selected.name || '';
+                                                                        if (hidden && selected) hidden.value = selected.id;
+                                                                    }}
+                                                                    className="w-full bg-background border border-border rounded-2xl px-5 py-4 text-sm text-white focus:outline-none focus:border-accent font-bold appearance-none cursor-pointer"
+                                                                >
+                                                                    <option value="">{editingRequest?.driverName ? `${editingRequest.driverName} (Keep Assigned)` : 'Select from staff...'}</option>
+                                                                    {/* If current driver is set but not in list, render option */}
+                                                                    {editingRequest?.driver_user_id && !(users || []).some(u => String(u.id) === String(editingRequest.driver_user_id) && ['staff', 'logistics', 'concierge', 'operation', 'operations', 'driver', 'field_staff'].includes(String(u.role?.name || u.role || '').toLowerCase().replace(/\s+/g, '_'))) && (
+                                                                        <option value={editingRequest.driver_user_id}>{editingRequest.driverName || `Assigned Chauffeur (#${editingRequest.driver_user_id})`}</option>
+                                                                    )}
+                                                                    {(users || []).filter((u) => {
+                                                                        const r = String(u.role?.name || u.role || '').toLowerCase().replace(/\s+/g, '_');
+                                                                        const isActive = String(u.status || u.account_status || '').toLowerCase() === 'active';
+                                                                        return isActive && ['staff', 'logistics', 'concierge', 'operation', 'operations', 'driver', 'field_staff'].includes(r);
+                                                                    }).map(u => (
+                                                                        <option key={u.id} value={u.id}>{u.fullName || u.name} {u.employee_id || u.employeeId ? `- ${u.employee_id || u.employeeId}` : ''} ({String(u.role?.name || u.role || '')})</option>
+                                                                    ))}
+                                                                </select>
+                                                            </div>
+                                                        </div>
+
+                                                        {/* Vehicle */}
+                                                        {(() => {
+                                                            const rawPlate = String(
+                                                                editingRequest?.plateNumber ||
+                                                                editingRequest?.vehicleId ||
+                                                                editingRequest?.vehicle ||
+                                                                editingRequest?.vehicleRef ||
+                                                                editingRequest?.metadata?.plateNumber ||
+                                                                editingRequest?.metadata?.vehicleId ||
+                                                                editingRequest?.metadata?.vehicle ||
+                                                                editingRequest?.metadata?.vehicleRef ||
+                                                                ''
+                                                            ).trim();
+
+                                                            const matchedVehicle = (fleet || []).find(v => {
+                                                                if (!rawPlate) return false;
+                                                                const vId = String(v.id || '').trim();
+                                                                const vDbId = String(v.db_id || '').trim();
+                                                                const vModel = String(v.model || '').trim();
+                                                                const vCombo1 = `${vModel} (${vId})`.toLowerCase();
+                                                                const vCombo2 = `${vModel} - ${vId}`.toLowerCase();
+                                                                const rawLower = rawPlate.toLowerCase();
+                                                                return (
+                                                                    rawLower === vCombo1 ||
+                                                                    rawLower === vCombo2 ||
+                                                                    rawLower === vId.toLowerCase() ||
+                                                                    rawLower === vDbId.toLowerCase() ||
+                                                                    rawLower === vModel.toLowerCase() ||
+                                                                    rawLower.includes(vId.toLowerCase()) ||
+                                                                    (vModel && rawLower.includes(vModel.toLowerCase()))
+                                                                );
+                                                            });
+
+                                                            const resolvedDefaultPlate = matchedVehicle
+                                                                ? `${matchedVehicle.model?.trim()} (${matchedVehicle.id})`
+                                                                : rawPlate;
+
+                                                            return (
+                                                                <div className="space-y-2">
+                                                                    <div className="flex items-center justify-between pl-1">
+                                                                        <label className="text-[10px] font-black text-muted uppercase tracking-widest">
+                                                                            {resolvedDefaultPlate ? 'Assigned Vehicle (Change if needed)' : 'Vehicle / Plate Number'}
+                                                                        </label>
+                                                                        {resolvedDefaultPlate && (
+                                                                            <span className="text-[9px] font-mono text-accent">Active: {resolvedDefaultPlate}</span>
+                                                                        )}
+                                                                    </div>
+                                                                    <select
+                                                                        name="plateNumber"
+                                                                        key={`vehicle-select-${editingRequest?.id || 'new'}-${resolvedDefaultPlate || 'none'}`}
+                                                                        defaultValue={resolvedDefaultPlate}
+                                                                        className="w-full bg-background border border-border rounded-2xl px-5 py-4 text-sm text-white focus:outline-none focus:border-accent font-bold appearance-none cursor-pointer"
+                                                                    >
+                                                                        {resolvedDefaultPlate ? (
+                                                                            <option value={resolvedDefaultPlate}>
+                                                                                {resolvedDefaultPlate} (Currently Assigned)
+                                                                            </option>
+                                                                        ) : (
+                                                                            <option value="">Select vehicle...</option>
+                                                                        )}
+                                                                        {resolvedDefaultPlate && (
+                                                                            <option value="">-- Remove / Unassign Vehicle --</option>
+                                                                        )}
+                                                                        {(fleet || []).map(v => {
+                                                                            const val = `${v.model?.trim()} (${v.id})`;
+                                                                            if (val === resolvedDefaultPlate) return null;
+                                                                            return (
+                                                                                <option key={v.id} value={val}>
+                                                                                    {v.model?.trim()} - {v.id} {v.type ? `(${v.type})` : ''}
+                                                                                </option>
+                                                                            );
+                                                                        })}
+                                                                    </select>
+                                                                </div>
+                                                            );
+                                                        })()}
+
+                                                        {/* Booking Status Override */}
+                                                        <div className="space-y-2">
+                                                            <label className="text-[10px] font-black text-muted uppercase tracking-widest pl-1">Booking Status</label>
+                                                            <select
+                                                                name="overrideStatus"
+                                                                defaultValue={editingRequest?.status || 'pending'}
+                                                                className="w-full bg-background border border-border rounded-2xl px-5 py-4 text-sm text-white focus:outline-none focus:border-accent font-bold appearance-none cursor-pointer"
+                                                            >
+                                                                <option value="pending">Pending</option>
+                                                                <option value="accepted">Accepted / Confirmed</option>
+                                                                <option value="assigned">Assigned</option>
+                                                                <option value="in_transit">En Route / In Transit</option>
+                                                                <option value="arrived">Arrived</option>
+                                                                <option value="completed">Completed / Delivered</option>
+                                                                <option value="cancelled">Cancelled</option>
+                                                            </select>
+                                                        </div>
+                                                    </div>
+                                                )}
+                                            </>
+                                        )}
+                                    </div>
+
+                                    <div className="p-5 sm:p-8 border-t border-white/5 flex items-center justify-end gap-4 shrink-0 bg-sidebar z-10 mt-auto">
+                                        <button type="button" disabled={isSubmitting} onClick={() => setShowModal(false)} className="text-muted text-[10px] font-black uppercase tracking-widest hover:text-white transition-all px-4 disabled:opacity-50">Abort</button>
+                                        {modalType !== 'view' && (
+                                            <button type="submit" disabled={isSubmitting} className="btn-primary flex items-center gap-2 sm:gap-3 px-6 sm:px-12 py-4 sm:py-5 shadow-2xl shadow-accent/20 text-xs sm:text-sm disabled:opacity-50 disabled:cursor-not-allowed">
+                                                {isSubmitting ? (
+                                                    <>
+                                                        <div className="w-4 h-4 border-2 border-background border-t-transparent rounded-full animate-spin" />
+                                                        <span>Booking, please wait...</span>
+                                                    </>
+                                                ) : (
+                                                    <>
+                                                        <CheckCircle size={18} className="sm:w-5 sm:h-5" />
+                                                        <span>{editingRequest ? 'Update Protocol' : 'Confirm Protocol'}</span>
+                                                    </>
+                                                )}
+                                            </button>
+                                        )}
+                                    </div>
+                                </form>
+                            </motion.div>
+                        </div>
+                    </div>
+                )}
+            </AnimatePresence>
+        </div>
+    );
+};
+
+export default Chauffeur;
