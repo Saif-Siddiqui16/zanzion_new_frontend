@@ -7,6 +7,7 @@
 
 export const RECOMMENDED_MENU_NAMES_BY_PORTAL = {
   /** DB role: admin — company / institutional admin (what you add from Super Admin) */
+
   admin: [
     'Dashboard',
     'Customers',
