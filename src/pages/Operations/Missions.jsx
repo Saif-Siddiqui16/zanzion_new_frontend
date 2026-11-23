@@ -505,7 +505,17 @@ const Missions = () => {
                   onChange={(e) => setAssignData({ ...assignData, vehicleId: e.target.value })}
                 >
                   <option value="">Choose Vehicle...</option>
-                  {fleet.map(v => (
+                  {fleet.filter(v => {
+                    if (v.db_id === assignData.vehicleId) return true;
+                    const status = String(v.status || '').toLowerCase();
+                    if (status !== 'active') return false;
+                    if (v.registrationExpiry) {
+                      const fullStr = String(v.registrationExpiry).includes('T') ? v.registrationExpiry : `${v.registrationExpiry}T23:59:59.999`;
+                      const exp = new Date(fullStr);
+                      if (!isNaN(exp.getTime()) && exp.getTime() < Date.now()) return false;
+                    }
+                    return true;
+                  }).map(v => (
                     <option key={v.db_id} value={v.db_id}>{v.id} - {v.model}</option>
                   ))}
                 </select>

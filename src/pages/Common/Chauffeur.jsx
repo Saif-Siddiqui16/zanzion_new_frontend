@@ -1951,7 +1951,18 @@ const Chauffeur = () => {
                                                                         {resolvedDefaultPlate && (
                                                                             <option value="">-- Remove / Unassign Vehicle --</option>
                                                                         )}
-                                                                        {(fleet || []).map(v => {
+                                                                        {(fleet || []).filter(v => {
+                                                                            const val = `${v.model?.trim()} (${v.id})`;
+                                                                            if (val === resolvedDefaultPlate) return true;
+                                                                            const status = String(v.status || '').toLowerCase();
+                                                                            if (status !== 'active') return false;
+                                                                            if (v.registrationExpiry) {
+                                                                                const fullStr = String(v.registrationExpiry).includes('T') ? v.registrationExpiry : `${v.registrationExpiry}T23:59:59.999`;
+                                                                                const exp = new Date(fullStr);
+                                                                                if (!isNaN(exp.getTime()) && exp.getTime() < Date.now()) return false;
+                                                                            }
+                                                                            return true;
+                                                                        }).map(v => {
                                                                             const val = `${v.model?.trim()} (${v.id})`;
                                                                             if (val === resolvedDefaultPlate) return null;
                                                                             return (

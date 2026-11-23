@@ -27,18 +27,29 @@ const Fleet = () => {
     String(asset.id).toLowerCase().includes(searchTerm.toLowerCase())
   );
 
+  const isDateExpired = (dateStr) => {
+    if (!dateStr) return false;
+    const fullStr = String(dateStr).includes('T') ? dateStr : `${dateStr}T23:59:59.999`;
+    const exp = new Date(fullStr);
+    return !isNaN(exp.getTime()) && exp.getTime() < Date.now();
+  };
+
   const handleAction = (type, vehicle) => {
     setSelectedVehicle(vehicle);
     setModalType(type);
-    setFormData(vehicle.id ? { ...vehicle } : { id: '', type: 'Luxury Truck', model: '', fuel: '100%', status: 'Active', capacity: '', routeId: '', markUrgent: false });
+    const expired = isDateExpired(vehicle.registrationExpiry);
+    const effectiveStatus = expired ? 'Inactive' : (vehicle.status || 'Active');
+    setFormData(vehicle.id ? { ...vehicle, status: effectiveStatus } : { id: '', type: 'Luxury Truck', model: '', fuel: '100%', status: 'Active', capacity: '', routeId: '', markUrgent: false });
     setIsModalOpen(true);
   };
 
   const handleSave = () => {
+    const expired = isDateExpired(formData.registrationExpiry);
+    const payload = expired ? { ...formData, status: 'Inactive' } : formData;
     if (modalType === 'add') {
-      addFleet(formData);
+      addFleet(payload);
     } else if (modalType === 'edit') {
-      updateFleet({ ...selectedVehicle, ...formData });
+      updateFleet({ ...selectedVehicle, ...payload });
     }
     setIsModalOpen(false);
   };
@@ -65,20 +76,36 @@ const Fleet = () => {
       header: "Reg. Expiry",
       accessor: "registrationExpiry",
       render: (row) => {
-        const expiry = new Date(row.registrationExpiry);
+        const fullStr = String(row.registrationExpiry || '').includes('T') ? row.registrationExpiry : `${row.registrationExpiry}T23:59:59.999`;
+        const expiry = new Date(fullStr);
+        const expired = isDateExpired(row.registrationExpiry);
         const soon = new Date();
         soon.setMonth(soon.getMonth() + 1);
-        const isExpired = expiry < new Date();
-        const isSoon = expiry < soon && !isExpired;
+        const isSoon = !isNaN(expiry.getTime()) && expiry < soon && !expired;
         return (
-          <span className={`font-bold ${isExpired ? 'text-danger' : isSoon ? 'text-warning' : 'text-success'}`}>
+          <span className={`font-bold ${expired ? 'text-danger' : isSoon ? 'text-warning' : 'text-success'}`}>
             {row.registrationExpiry || 'N/A'}
-            {isExpired && " (EXPIRED)"}
+            {expired && " (EXPIRED)"}
           </span>
         );
       }
     },
-    { header: "Status", accessor: "status" },
+    {
+      header: "Status",
+      accessor: "status",
+      render: (row) => {
+        const expired = isDateExpired(row.registrationExpiry);
+        const effectiveStatus = expired ? 'Inactive' : (row.status || 'Active');
+        const isActive = String(effectiveStatus).toLowerCase() === 'active';
+        return (
+          <span className={`px-2 py-0.5 rounded text-[10px] font-black uppercase tracking-wider ${
+            isActive ? 'bg-success/20 text-success' : 'bg-danger/20 text-danger'
+          }`}>
+            {effectiveStatus}
+          </span>
+        );
+      }
+    },
     {
       header: "Health",
       accessor: "diagnosticStatus",

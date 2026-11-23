@@ -1951,20 +1951,26 @@ export const GlobalDataProvider = ({ children }) => {
       const res = await api.get("/vehicles");
       if (res.data && res.data.success) {
         setFleet(
-          res.data.data.map((v) => ({
-            id: v.vehicleId,
-            db_id: v.id,
-            type: v.type,
-            model: v.model,
-            fuel: v.fuel || '100%',
-            status: v.status || 'Active',
-            capacity: v.capacity,
-            location: v.location,
-            insurancePolicy: v.insurancePolicy,
-            registrationExpiry: v.registrationExpiry || '',
-            inspectionDate: v.inspectionDate || '',
-            diagnosticStatus: v.diagnosticStatus,
-          }))
+          res.data.data.map((v) => {
+            const fullStr = String(v.registrationExpiry || '').includes('T') ? v.registrationExpiry : `${v.registrationExpiry}T23:59:59.999`;
+            const exp = new Date(fullStr);
+            const isExpired = Boolean(v.registrationExpiry && !isNaN(exp.getTime()) && exp.getTime() < Date.now());
+            const effectiveStatus = isExpired ? 'Inactive' : (v.status || 'Active');
+            return {
+              id: v.vehicleId,
+              db_id: v.id,
+              type: v.type,
+              model: v.model,
+              fuel: v.fuel || '100%',
+              status: effectiveStatus,
+              capacity: v.capacity,
+              location: v.location,
+              insurancePolicy: v.insurancePolicy,
+              registrationExpiry: v.registrationExpiry || '',
+              inspectionDate: v.inspectionDate || '',
+              diagnosticStatus: v.diagnosticStatus,
+            };
+          })
         );
       }
     } catch (e) {
@@ -7067,12 +7073,17 @@ export const GlobalDataProvider = ({ children }) => {
   // --- FLEET ACTIONS ---
   const addFleet = async (vehicle) => {
     try {
+      const fullStr = String(vehicle.registrationExpiry || '').includes('T') ? vehicle.registrationExpiry : `${vehicle.registrationExpiry}T23:59:59.999`;
+      const exp = new Date(fullStr);
+      const isExpired = Boolean(vehicle.registrationExpiry && !isNaN(exp.getTime()) && exp.getTime() < Date.now());
+      const effectiveStatus = isExpired ? 'Inactive' : (vehicle.status || 'Active');
+
       const reqData = {
         vehicleId: vehicle.id,
         type: vehicle.type || 'Luxury Truck',
         model: vehicle.model,
         fuel: vehicle.fuel || '100%',
-        status: vehicle.status || 'Active',
+        status: effectiveStatus,
         capacity: vehicle.capacity || '',
         location: vehicle.location || '',
         insurancePolicy: vehicle.insurancePolicy || '',
@@ -7083,13 +7094,18 @@ export const GlobalDataProvider = ({ children }) => {
       const res = await api.post("/vehicles", reqData);
       if (res.data?.success) {
         const saved = res.data.data;
+        const savedFullStr = String(saved.registrationExpiry || '').includes('T') ? saved.registrationExpiry : `${saved.registrationExpiry}T23:59:59.999`;
+        const savedExp = new Date(savedFullStr);
+        const savedIsExpired = Boolean(saved.registrationExpiry && !isNaN(savedExp.getTime()) && savedExp.getTime() < Date.now());
+        const finalStatus = savedIsExpired ? 'Inactive' : (saved.status || 'Active');
+
         setFleet((prev) => [{
           id: saved.vehicleId,
           db_id: saved.id,
           type: saved.type,
           model: saved.model,
           fuel: saved.fuel,
-          status: saved.status,
+          status: finalStatus,
           capacity: saved.capacity,
           location: saved.location,
           insurancePolicy: saved.insurancePolicy,
@@ -7107,12 +7123,17 @@ export const GlobalDataProvider = ({ children }) => {
 
   const updateFleet = async (updated) => {
     try {
+      const fullStr = String(updated.registrationExpiry || '').includes('T') ? updated.registrationExpiry : `${updated.registrationExpiry}T23:59:59.999`;
+      const exp = new Date(fullStr);
+      const isExpired = Boolean(updated.registrationExpiry && !isNaN(exp.getTime()) && exp.getTime() < Date.now());
+      const effectiveStatus = isExpired ? 'Inactive' : (updated.status || 'Active');
+
       const reqData = {
         vehicleId: updated.id,
         type: updated.type,
         model: updated.model,
         fuel: updated.fuel,
-        status: updated.status,
+        status: effectiveStatus,
         capacity: updated.capacity,
         location: updated.location,
         insurancePolicy: updated.insurancePolicy,
@@ -7122,7 +7143,7 @@ export const GlobalDataProvider = ({ children }) => {
       };
       const res = await api.put(`/vehicles/${updated.db_id}`, reqData);
       if (res.data?.success) {
-        setFleet((prev) => prev.map((v) => v.db_id === updated.db_id ? { ...v, ...updated } : v));
+        setFleet((prev) => prev.map((v) => v.db_id === updated.db_id ? { ...v, ...updated, status: effectiveStatus } : v));
         addLog({ action: "Asset Recalibration", detail: `Updated telemetry for ${updated.id}.`, type: "system" });
       }
     } catch (error) {

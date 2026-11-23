@@ -71,6 +71,20 @@ export const displayDeliveryStatusLabel = (raw) => {
   return map[s] || s;
 };
 
+const isVehicleActive = (v) => {
+  if (!v) return false;
+  const status = String(v.status || '').toLowerCase();
+  if (status !== 'active') return false;
+  if (v.registrationExpiry) {
+    const fullStr = String(v.registrationExpiry).includes('T') ? v.registrationExpiry : `${v.registrationExpiry}T23:59:59.999`;
+    const exp = new Date(fullStr);
+    if (!isNaN(exp.getTime()) && exp.getTime() < Date.now()) {
+      return false;
+    }
+  }
+  return true;
+};
+
 const Deliveries = () => {
   const { users, fleet, fetchFleet, fetchStaff, hasMenuPermission, warehouses, fetchWarehouses, currentUser, clients = [], fetchClients, customerUsers = [], fetchCustomerUsers, inventory, orders = [], chauffeurRequests = [], fetchOrders, fetchDeliveries, fetchChauffeurRequests } = useData();
   const { data: dbItemsData } = useItems(1, 100);
@@ -1865,9 +1879,13 @@ const Deliveries = () => {
                         disabled={modalType === 'view'}
                       >
                         <option value="">Select Vehicle...</option>
-                        {fleet.map(v => (
-                          <option key={v.id} value={v.id}>{v.id} ({v.model})</option>
-                        ))}
+                        {fleet
+                          .filter(v => isVehicleActive(v) || (formData.vehicle && v.id === formData.vehicle))
+                          .map(v => (
+                            <option key={v.id} value={v.id}>
+                              {v.id} ({v.model}){(!isVehicleActive(v) && formData.vehicle && v.id === formData.vehicle) ? ' (Inactive/Expired)' : ''}
+                            </option>
+                          ))}
                       </select>
                     ) : (
                       <input type="text" value={formData.vehicle || formData.vesselOrFlight} onChange={(e) => setFormData({ ...formData, vehicle: e.target.value })} className="w-full bg-background border border-border rounded-xl px-4 py-3 text-sm focus:border-accent outline-none font-bold text-accent" disabled={modalType === 'view'} placeholder="Enter Vessel/Flight ID" />
