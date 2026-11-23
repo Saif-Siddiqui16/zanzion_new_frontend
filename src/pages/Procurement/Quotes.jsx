@@ -403,13 +403,22 @@ const Quotes = () => {
         String(quote.quote_type === 'vendor_request' || quote.quoteType === 'vendor' ? 'N/A' : `$${lineTotal.toFixed(2)}`),
       ];
     });
+    const resolvedVendor = (() => {
+      const vid = quote.vendorId ?? quote.vendor_id;
+      const linkedVendor = (vendors || []).find((v) => String(v.id) === String(vid));
+      if (linkedVendor) return linkedVendor.name || linkedVendor.companyName || linkedVendor.vendor_name || 'Admin vendor';
+      if (typeof quote.vendor === 'object' && quote.vendor !== null) {
+        return quote.vendor.companyName || quote.vendor.name || quote.vendor.vendor_name || 'Admin vendor';
+      }
+      return quote.vendor_name || quote.vendor || 'Admin vendor';
+    })();
     const total = parseFloat(quote.total_amount || quote.total || 0) || 0;
     const doc = new jsPDF();
     doc.setFontSize(16);
     doc.text('ZaneZion Quote', 14, 16);
     doc.setFontSize(10);
     doc.text(`Quote ID: ${quote.id || '-'}`, 14, 24);
-    doc.text(`Vendor: ${quote.vendor_name || quote.vendor || '-'}`, 14, 30);
+    doc.text(`Vendor: ${resolvedVendor}`, 14, 30);
     doc.text(`Type: ${quote.quote_type === 'vendor_request' || quote.quoteType === 'vendor' ? 'Vendor Quote Request' : 'Client Quote'}`, 14, 36);
     autoTable(doc, {
       startY: 42,
