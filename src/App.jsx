@@ -172,7 +172,7 @@ const DashboardSelector = ({ role }) => {
     case 'logistics': return <LogisticsDashboard />;
     case 'inventory': return <InventoryDashboardRole />;
     case 'concierge': return <ConciergeDashboard />;
-    case 'client': return <Dashboard />;
+    case 'client': return <PersonalClientDashboard />;
     case 'saas_client': return <ClientDashboard />;
     case 'personal_client': return <PersonalClientDashboard />;
     case 'customer': return <PersonalClientDashboard />;

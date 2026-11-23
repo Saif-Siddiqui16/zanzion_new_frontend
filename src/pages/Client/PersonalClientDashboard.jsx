@@ -9,6 +9,7 @@ import { useNavigate } from 'react-router-dom';
 import { useData } from '../../context/GlobalDataContext';
 import { useUpdateOrder, useCreateOrder } from '../../hooks/api/useOrders';
 import { compareOrdersNewestFirst } from '../../utils/apiHelpers';
+import { normalizeRole } from '../../utils/authUtils';
 import {
   ArrowUpRight,
   Car,
@@ -394,8 +395,14 @@ const PersonalClientDashboard = () => {
         {/* Header */}
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
           <div>
-            <h1 className="text-2xl md:text-3xl font-black tracking-tighter text-white italic uppercase">Personal Client Dashboard</h1>
-            <p className="text-secondary text-[10px] md:text-xs mt-1 font-black uppercase tracking-[0.2em] opacity-70">{clientData?.tagline || 'Personal client dashboard.'}</p>
+            <h1 className="text-2xl md:text-3xl font-black tracking-tighter text-white italic uppercase">
+              {clientData?.business_name || clientData?.name
+                ? `${clientData?.business_name || clientData?.name} ${normalizeRole(currentUser?.role) === 'client' ? 'Portal' : 'Dashboard'}`
+                : (normalizeRole(currentUser?.role) === 'client' ? 'Business Client Portal' : 'Personal Client Dashboard')}
+            </h1>
+            <p className="text-secondary text-[10px] md:text-xs mt-1 font-black uppercase tracking-[0.2em] opacity-70">
+              {clientData?.tagline || (normalizeRole(currentUser?.role) === 'client' ? 'Institutional client portal and order tracking.' : 'Personal client dashboard.')}
+            </p>
           </div>
 
         </div>
