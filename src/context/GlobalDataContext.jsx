@@ -1484,10 +1484,11 @@ export const GlobalDataProvider = ({ children }) => {
       ? currentUser.role
       : (currentUser?.role?.name || currentUser?.roleName || '');
     const normRole = rawRole.toLowerCase().replace(/[-\s]/g, '_');
-    const isSaasUser = (currentUser?.tenantId && Number(currentUser.tenantId) !== 1)
+    const isExplicitClient = ['customer', 'client', 'business_client', 'individual_client'].includes(normRole);
+    const isSaasUser = !isExplicitClient && ((currentUser?.tenantId && Number(currentUser.tenantId) !== 1)
       || normRole === 'saas_client'
       || normRole === 'saas_admin'
-      || (currentUser?.company_id && (clients || []).some(c => String(c.id) === String(currentUser.company_id) && (c.clientType === 'SaaS' || c.client_type === 'SaaS')));
+      || (currentUser?.company_id && (clients || []).some(c => String(c.id) === String(currentUser.company_id) && (c.clientType === 'SaaS' || c.client_type === 'SaaS'))));
     if (!isSaasUser) {
       try {
         const autoStores = getAutoSyncedMarketplaceVendors();
@@ -1504,8 +1505,14 @@ export const GlobalDataProvider = ({ children }) => {
   const fetchInventory = React.useCallback(async () => {
     let itemsArr = [];
     try {
+      const rawRole = typeof currentUser?.role === 'string'
+        ? currentUser.role
+        : (currentUser?.role?.name || currentUser?.roleName || '');
+      const normRole = rawRole.toLowerCase().replace(/[-\s]/g, '_');
+      const isSaas = normRole === 'saas_client' || normRole === 'saas_admin';
+
       const params = { limit: 500 };
-      if (currentUser?.tenantId && Number(currentUser.tenantId) !== 1) {
+      if (isSaas && currentUser?.tenantId && Number(currentUser.tenantId) !== 1) {
         params.tenantId = currentUser.tenantId;
       }
       const itemsRes = await api.get("/items", { params });
@@ -1620,10 +1627,11 @@ export const GlobalDataProvider = ({ children }) => {
       ? currentUser.role
       : (currentUser?.role?.name || currentUser?.roleName || '');
     const normRole = rawRole.toLowerCase().replace(/[-\s]/g, '_');
-    const isSaasUser = (currentUser?.tenantId && Number(currentUser.tenantId) !== 1)
+    const isExplicitClient = ['customer', 'client', 'business_client', 'individual_client'].includes(normRole);
+    const isSaasUser = !isExplicitClient && ((currentUser?.tenantId && Number(currentUser.tenantId) !== 1)
       || normRole === 'saas_client'
       || normRole === 'saas_admin'
-      || (currentUser?.company_id && (clients || []).some(c => String(c.id) === String(currentUser.company_id) && (c.clientType === 'SaaS' || c.client_type === 'SaaS')));
+      || (currentUser?.company_id && (clients || []).some(c => String(c.id) === String(currentUser.company_id) && (c.clientType === 'SaaS' || c.client_type === 'SaaS'))));
 
     if (!isSaasUser) {
       try {

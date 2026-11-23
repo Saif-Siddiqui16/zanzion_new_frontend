@@ -253,9 +253,10 @@ const ClientStore = () => {
         setActiveTab('catalog');
     }, [location, isCustomRequestRoute, navigate]);
 
-    const isSaaSCustomerOrTenant = Boolean(
-        (currentUser?.tenantId && Number(currentUser.tenantId) !== 1) ||
-        ['saas_client', 'saas_admin'].includes(String(currentUser?.role?.name || currentUser?.role || '').toLowerCase().replace(/[-\s]/g, '_')) ||
+    const userRoleStr = String(currentUser?.role?.name || currentUser?.role || '').toLowerCase().replace(/[-\s]/g, '_');
+    const isExplicitClientOrCustomer = ['customer', 'client', 'business_client', 'individual_client'].includes(userRoleStr);
+    const isSaaSCustomerOrTenant = !isExplicitClientOrCustomer && Boolean(
+        ['saas_client', 'saas_admin'].includes(userRoleStr) ||
         (currentUser?.company_id && (clients || []).some(c => String(c.id) === String(currentUser.company_id) && (c.clientType === 'SaaS' || c.client_type === 'SaaS')))
     );
 
