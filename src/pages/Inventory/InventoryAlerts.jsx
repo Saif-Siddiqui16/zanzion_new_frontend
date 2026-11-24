@@ -1,13 +1,32 @@
-import React, { useState } from 'react';
-import { AlertTriangle, Bell, Clock, Filter, CheckCircle2 } from 'lucide-react';
+import React, { useState, useEffect, useMemo } from 'react';
+import { AlertTriangle, Bell, Clock, Filter, CheckCircle2, PackageCheck } from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
 import { useData } from '../../context/GlobalDataContext';
 
 const InventoryAlerts = () => {
     const { inventoryAlerts, fetchInventoryAlerts, acknowledgeInventoryAlert } = useData();
+    const navigate = useNavigate();
 
-    React.useEffect(() => {
-        fetchInventoryAlerts();
-    }, []);
+    useEffect(() => {
+        if (fetchInventoryAlerts) fetchInventoryAlerts();
+
+        const interval = setInterval(() => {
+            if (fetchInventoryAlerts) fetchInventoryAlerts();
+        }, 5000);
+
+        const onFocus = () => {
+            if (fetchInventoryAlerts) fetchInventoryAlerts();
+        };
+        window.addEventListener('focus', onFocus);
+        window.addEventListener('app:state-changed', onFocus);
+
+        return () => {
+            clearInterval(interval);
+            window.removeEventListener('focus', onFocus);
+            window.removeEventListener('app:state-changed', onFocus);
+        };
+    }, [fetchInventoryAlerts]);
+
     const [filter, setFilter] = useState('All');
 
     // Use alerts from context
@@ -16,6 +35,24 @@ const InventoryAlerts = () => {
     const filteredAlerts = filter === 'All'
         ? alerts
         : alerts.filter(a => a.status === filter);
+
+    const criticalCount = useMemo(() => alerts.filter(a => a.status === 'Critical').length, [alerts]);
+    const warningCount = useMemo(() => alerts.filter(a => a.status === 'Warning').length, [alerts]);
+
+    // Dynamic distribution of alerts grouped by category
+    const categoryDistribution = useMemo(() => {
+        if (alerts.length === 0) return [];
+        const counts = {};
+        alerts.forEach(a => {
+            const cat = a.category || 'General';
+            counts[cat] = (counts[cat] || 0) + 1;
+        });
+        return Object.entries(counts).map(([name, count]) => ({
+            name,
+            count,
+            percentage: Math.min(100, Math.round((count / alerts.length) * 100))
+        }));
+    }, [alerts]);
 
     return (
         <div className="space-y-8">
@@ -62,13 +99,13 @@ const InventoryAlerts = () => {
                                         <span className="text-xs text-muted">Acknowledge Required</span>
                                     </div>
                                     <h3 className="text-lg font-bold">Stock Depletion: {alert.name}</h3>
-                                    <p className="text-secondary text-sm">Location: {alert.location} • Current Level: {alert.qty}</p>
+                                    <p className="text-secondary text-sm">Location: {alert.location} • Current Level: {alert.qty} (Threshold: {alert.threshold})</p>
                                 </div>
                             </div>
                             <div className="flex items-center gap-4">
                                 <div className="text-right mr-4 hidden md:block">
                                     <p className="text-xs text-muted flex items-center gap-1 justify-end">
-                                        <Clock size={12} /> Detected 12m ago
+                                        <Clock size={12} /> Active Warning
                                     </p>
                                 </div>
                                 <button
@@ -83,12 +120,12 @@ const InventoryAlerts = () => {
                         </div>
                     ))
                 ) : (
-                    <div className="glass-card p-12 flex flex-col items-center justify-center text-center opacity-50">
-                        <div className="w-16 h-16 bg-white/5 rounded-full flex items-center justify-center mb-4">
+                    <div className="glass-card p-12 flex flex-col items-center justify-center text-center opacity-70 border border-success/20 bg-success/5">
+                        <div className="w-16 h-16 bg-success/10 rounded-full flex items-center justify-center mb-4">
                             <CheckCircle2 size={32} className="text-success" />
                         </div>
-                        <h3 className="text-xl font-bold">All Systems Clear</h3>
-                        <p className="text-secondary max-w-xs mx-auto mt-2">No active stock alerts or infrastructure warnings detected at this time.</p>
+                        <h3 className="text-xl font-bold text-white">All Systems Clear</h3>
+                        <p className="text-secondary max-w-xs mx-auto mt-2">All inventory levels are currently above reorder thresholds for your workspace.</p>
                     </div>
                 )}
             </div>
@@ -97,26 +134,37 @@ const InventoryAlerts = () => {
                 <div className="glass-card p-6 border-accent/10">
                     <h3 className="text-lg font-bold mb-4">Alert Distribution</h3>
                     <div className="space-y-4">
-                        <div className="flex items-center justify-between">
-                            <span className="text-sm text-secondary">Fuel Levels</span>
-                            <span className="text-xs font-bold text-danger">1 Active</span>
-                        </div>
-                        <div className="h-1.5 bg-border rounded-full overflow-hidden">
-                            <div className="h-full bg-danger" style={{ width: '80%' }} />
-                        </div>
-                        <div className="flex items-center justify-between">
-                            <span className="text-sm text-secondary">Catering Supplies</span>
-                            <span className="text-xs font-bold text-warning">2 Active</span>
-                        </div>
-                        <div className="h-1.5 bg-border rounded-full overflow-hidden">
-                            <div className="h-full bg-warning" style={{ width: '30%' }} />
-                        </div>
+                        {categoryDistribution.length > 0 ? (
+                            categoryDistribution.map((cat) => (
+                                <div key={cat.name} className="space-y-1">
+                                    <div className="flex items-center justify-between">
+                                        <span className="text-sm text-secondary">{cat.name}</span>
+                                        <span className="text-xs font-bold text-warning">{cat.count} Active</span>
+                                    </div>
+                                    <div className="h-1.5 bg-border rounded-full overflow-hidden">
+                                        <div className="h-full bg-warning" style={{ width: `${cat.percentage}%` }} />
+                                    </div>
+                                </div>
+                            ))
+                        ) : (
+                            <div className="flex items-center gap-3 p-3 bg-white/5 rounded-xl border border-white/5">
+                                <PackageCheck size={20} className="text-success shrink-0" />
+                                <span className="text-xs text-secondary">All categories optimal • 0 active stock warnings</span>
+                            </div>
+                        )}
                     </div>
                 </div>
                 <div className="glass-card p-6 bg-accent/5 border-accent/20">
                     <h3 className="text-lg font-bold mb-2">Automated Provisioning</h3>
-                    <p className="text-sm text-secondary mb-4">Based on current burn rates, the system suggests initializing 3 restock orders.</p>
-                    <button className="btn-primary w-full flex items-center justify-center gap-2">
+                    <p className="text-sm text-secondary mb-4">
+                        {alerts.length > 0
+                            ? `Based on current stock levels, ${criticalCount > 0 ? `${criticalCount} item(s) are depleted` : `${warningCount} item(s) are low`}. You can initiate replenishment requests.`
+                            : `All inventory buffers are healthy. No automated restocking is recommended at this time.`}
+                    </p>
+                    <button
+                        onClick={() => navigate('/dashboard/purchase-requests')}
+                        className="btn-primary w-full flex items-center justify-center gap-2"
+                    >
                         <Bell size={16} /> Reorder Critical Items
                     </button>
                 </div>
