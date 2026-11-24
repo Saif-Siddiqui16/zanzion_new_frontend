@@ -1070,7 +1070,7 @@ const Deliveries = () => {
           swalSuccess("Mission Delivered", "POD submitted and order marked as Delivered successfully.");
         }).catch((err) => {
           swalClose();
-          Swal.fire('Error', 'Failed to submit POD: ' + (err?.response?.data?.message || err.message), 'error');
+          swalError('Submission Failed', 'Failed to submit POD: ' + (err?.response?.data?.message || err.message));
         });
       } else {
         // If driver is assigned in edit modal and status was pending, advance status to Assigned

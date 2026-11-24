@@ -10,7 +10,7 @@ import realApi from '../../services/api/setupAxios';
 import { getAutoSyncedMarketplaceVendors } from '../../utils/data';
 
 const Vendors = () => {
-  const { vendors: mockVendors, addVendor: mockAddVendor, updateVendor: mockUpdateVendor, deleteVendor: mockDeleteVendor, addOrder, fetchVendors, hasMenuPermission, currentUser } = useData();
+  const { vendors: mockVendors, addVendor: mockAddVendor, updateVendor: mockUpdateVendor, deleteVendor: mockDeleteVendor, addOrder, deleteOrder, fetchVendors, hasMenuPermission, currentUser } = useData();
   const [realVendors, setRealVendors] = useState([]);
   const [syncVersion, setSyncVersion] = useState(0);
   const isVendorAdmin = roleCanManageInventoryVendorsWarehouses(currentUser?.role);
@@ -247,6 +247,13 @@ const Vendors = () => {
 
   const handleSaveOrder = (formData) => {
     addOrder(formData);
+    setIsOrderModalOpen(false);
+  };
+
+  const handleDeleteOrder = (orderId) => {
+    if (deleteOrder && orderId) {
+      deleteOrder(orderId);
+    }
     setIsOrderModalOpen(false);
   };
 
@@ -635,7 +642,7 @@ const Vendors = () => {
         modalType={orderModalType}
         initialData={initialOrderData}
         onSave={handleSaveOrder}
-        onDelete={() => { }}
+        onDelete={handleDeleteOrder}
       />
     </div>
   );

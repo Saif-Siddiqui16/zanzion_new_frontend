@@ -225,8 +225,8 @@ const Inventory = () => {
     };
   });
 
-  // Offline Resilience Fallback (only fallback if API is not loaded or has failed)
-  const rawInventory = ((itemsData && !error) ? realInventory : mockInventory).filter(i => !isItemDeleted(i));
+  // Use real inventory items from database; do not mask backend API failures with fake mock items
+  const rawInventory = (!error ? realInventory : []).filter(i => !isItemDeleted(i));
   const inventory = rawInventory.map(item => {
     const owner = clientListForSelect.find((c) => String(c.id) === String(item.clientId));
     let calculatedType = 'Marketplace';

@@ -43,6 +43,7 @@ const OperationsDashboard = () => {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isLogsOpen, setIsLogsOpen] = useState(false);
   const [isTaskModalOpen, setIsTaskModalOpen] = useState(false);
+  const [selectedDate, setSelectedDate] = useState(new Date().toISOString().split('T')[0]);
   const [taskData, setTaskData] = useState({ task: '', location: '', assignee: '', assigneeId: '', priority: 'Normal', requestDate: new Date().toISOString().split('T')[0], dueDate: new Date().toISOString().split('T')[0] });
   const [activeTab, setActiveTab] = useState('command'); // 'command', 'coordination'
 
@@ -93,8 +94,8 @@ const OperationsDashboard = () => {
         <div className="flex flex-col sm:flex-row flex-wrap items-stretch sm:items-center gap-3 w-full lg:w-auto">
           <div className="w-full sm:w-40 shrink-0">
             <CustomDatePicker
-              selectedDate={new Date().toISOString().split('T')[0]}
-              onChange={() => { }}
+              selectedDate={selectedDate}
+              onChange={(val) => setSelectedDate(val)}
             />
           </div>
           <div className="flex gap-2 sm:gap-3 flex-1 sm:flex-none">
