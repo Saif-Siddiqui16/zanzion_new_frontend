@@ -32,7 +32,8 @@ const Dashboard = () => {
     chauffeurRequests = [], fetchChauffeurRequests
   } = useData();
   const isSuperAdmin = ['super_admin', 'superadmin', 'super admin'].includes(normalizeRole(currentUser?.role));
-  const isB2BClient = normalizeRole(currentUser?.role) === 'client';
+  const isTenantScoped = Boolean(currentUser?.tenantId && Number(currentUser.tenantId) !== 1);
+  const isB2BClient = normalizeRole(currentUser?.role) === 'client' || isTenantScoped;
   const hasAccess = isSuperAdmin || isB2BClient;
 
   React.useEffect(() => {
@@ -64,17 +65,22 @@ const Dashboard = () => {
   const [selectedOrder, setSelectedOrder] = useState(null);
 
   const clientData = useMemo(() => {
+    if (isTenantScoped) {
+      const saasClient = (clients || []).find(c => Number(c.tenantId) === Number(currentUser?.tenantId) && (c.clientType === 'SaaS' || c.client_type === 'SaaS')) ||
+        (clients || []).find(c => Number(c.tenantId) === Number(currentUser?.tenantId));
+      if (saasClient) return saasClient;
+    }
     const tenantId = currentUser?.clientId || currentUser?.companyId || currentUser?.company_id;
     return (clients || []).find(c =>
       c.id === tenantId ||
       c.email === currentUser?.email ||
       c.name === currentUser?.name
     ) || currentUser;
-  }, [clients, currentUser]);
+  }, [clients, currentUser, isTenantScoped]);
 
   const clientCompanyName = useMemo(() => {
-    return clientData?.companyName || clientData?.business_name || clientData?.name || 'Client';
-  }, [clientData]);
+    return clientData?.companyName || clientData?.business_name || clientData?.name || currentUser?.tenantCompanyName || currentUser?.companyName || 'Client';
+  }, [clientData, currentUser]);
 
   const handleAction = (type, order) => {
     setSelectedOrder(order);

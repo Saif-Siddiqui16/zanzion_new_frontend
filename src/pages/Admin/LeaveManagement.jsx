@@ -42,7 +42,13 @@ const LeaveManagement = () => {
   }, []);
 
   const isStaffOnly = userRole === 'staff';
-  const myRequests = leaveRequests.filter(r => !isStaffOnly || r.userId === currentUser?.id);
+  const myRequests = leaveRequests.filter(r => {
+    if (isStaffOnly && r.userId !== currentUser?.id) return false;
+    if (currentUser?.tenantId && r.tenantId && Number(r.tenantId) !== Number(currentUser.tenantId)) {
+      return false;
+    }
+    return true;
+  });
 
   const filtered = myRequests.filter(r => {
     const matchesFilter = filter === 'all' || r.status?.toLowerCase() === filter;

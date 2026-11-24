@@ -473,9 +473,6 @@ export const useUpdateChauffeurMission = () => {
           try {
             await api.put(`/orders/${patchId}/status`, { status: normStatus });
           } catch (_) {}
-          try {
-            await api.patch(`/orders/${patchId}/status`, { status: normStatus });
-          } catch (_) {}
         }
         return response.data;
       } catch (err) {

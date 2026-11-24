@@ -500,27 +500,32 @@ const Chauffeur = () => {
             })()
         };
 
-        swalLoading("Booking Chauffeur", "Booking your chauffeur, please wait...");
+        const isEditing = Boolean(editingRequest);
+        swalLoading(
+            isEditing ? "Updating Protocol" : "Booking Chauffeur",
+            isEditing ? "Saving chauffeur protocol, please wait..." : "Booking your chauffeur, please wait..."
+        );
         setIsSubmitting(true);
 
         if (editingRequest) {
             const targetId = editingRequest.db_id || editingRequest.id;
             updateMutation.mutate({ id: targetId, data: { ...editingRequest, ...request } }, {
-                onSuccess: async () => {
+                onSuccess: () => {
                     isSubmittingRef.current = false;
                     const strId = String(targetId);
                     setUpdatedChauffeurItem(strId, { status: request.status, chauffeur_status: request.status });
-                    if (updateChauffeurRequestCtx) {
-                        try { await updateChauffeurRequestCtx({ ...editingRequest, ...request, id: targetId, db_id: targetId }); } catch (_) {}
-                    }
-                    if (syncGlobalState) await syncGlobalState();
-                    notifyStateChanged(queryClient, ['chauffeurMissions', 'orders', 'deliveries', 'dashboardStats']);
-                    window.dispatchEvent(new CustomEvent('app:state-changed', { detail: { source: 'chauffeur-update', orderId: targetId } }));
                     swalClose();
                     setIsSubmitting(false);
                     setShowModal(false);
                     resetForm();
                     swalSuccess("Protocol Updated", "Chauffeur booking details updated successfully.");
+
+                    notifyStateChanged(queryClient, ['chauffeurMissions', 'orders', 'deliveries', 'dashboardStats']);
+                    window.dispatchEvent(new CustomEvent('app:state-changed', { detail: { source: 'chauffeur-update', orderId: targetId } }));
+                    if (updateChauffeurRequestCtx) {
+                        updateChauffeurRequestCtx({ ...editingRequest, ...request, id: targetId, db_id: targetId }).catch(() => {});
+                    }
+                    if (syncGlobalState) syncGlobalState().catch(() => {});
                 },
                 onError: (err) => {
                     isSubmittingRef.current = false;
@@ -532,14 +537,17 @@ const Chauffeur = () => {
             });
         } else {
             createMutation.mutate(request, {
-                onSuccess: async () => {
+                onSuccess: () => {
                     isSubmittingRef.current = false;
-                    if (syncGlobalState) await syncGlobalState();
                     swalClose();
                     setIsSubmitting(false);
                     setShowModal(false);
                     resetForm();
                     swalSuccess("Booking Confirmed", "Your chauffeur service has been booked successfully.");
+
+                    notifyStateChanged(queryClient, ['chauffeurMissions', 'orders', 'deliveries', 'dashboardStats']);
+                    window.dispatchEvent(new CustomEvent('app:state-changed', { detail: { source: 'chauffeur-create' } }));
+                    if (syncGlobalState) syncGlobalState().catch(() => {});
                 },
                 onError: (err) => {
                     isSubmittingRef.current = false;
@@ -626,12 +634,11 @@ const Chauffeur = () => {
             if (request) {
                 try { updateMutation.mutate({ id, data: { ...request, status: 'cancelled' } }); } catch (_) {}
             }
-            if (syncGlobalState) await syncGlobalState();
             swalClose();
             swalSuccess("Booking Cancelled", "Chauffeur booking cancelled successfully.");
             window.dispatchEvent(new CustomEvent('app:state-changed', { detail: { source: 'chauffeur-cancel', orderId: id } }));
-            queryClient.invalidateQueries({ queryKey: ['chauffeurMissions'] });
-            queryClient.invalidateQueries({ queryKey: ['orders'] });
+            notifyStateChanged(queryClient, ['chauffeurMissions', 'orders', 'deliveries', 'dashboardStats']);
+            if (syncGlobalState) syncGlobalState().catch(() => {});
         }
     };
 
@@ -660,16 +667,15 @@ const Chauffeur = () => {
                     try { await api.patch(`/orders/${targetId}/status`, { status: 'cancelled' }); } catch (_) {}
                 }
 
-                // 3. Update global context
+                // 3. Update global context & broadcast immediately
                 if (updateChauffeurRequestCtx) {
                     try { await updateChauffeurRequestCtx({ ...row, status: 'cancelled', chauffeur_status: 'cancelled' }); } catch (_) {}
                 }
-                if (syncGlobalState) await syncGlobalState();
-
                 swalClose();
                 swalSuccess("Booking Rejected", `Chauffeur booking #${targetId} has been rejected and cancelled.`);
                 notifyStateChanged(queryClient, ['chauffeurMissions', 'orders', 'deliveries', 'dashboardStats']);
                 window.dispatchEvent(new CustomEvent('app:state-changed', { detail: { source: 'chauffeur-reject', orderId: targetId } }));
+                if (syncGlobalState) syncGlobalState().catch(() => {});
             } catch (err) {
                 swalClose();
                 const msg = err.response?.data?.message || err.message || 'Failed to reject chauffeur booking.';
@@ -713,14 +719,13 @@ const Chauffeur = () => {
                 if (updateChauffeurRequestCtx) {
                     try { await updateChauffeurRequestCtx({ ...row, status: 'accepted', chauffeur_status: 'accepted', id: targetId, db_id: targetId }); } catch (_) {}
                 }
-                if (syncGlobalState) await syncGlobalState();
-
                 swalClose();
                 swalSuccess("Booking Accepted", `Chauffeur booking #${targetId} is now Accepted!`);
 
                 // 5. Broadcast state change event to sync with Client Portal and other views
                 notifyStateChanged(queryClient, ['chauffeurMissions', 'orders', 'deliveries', 'dashboardStats']);
                 window.dispatchEvent(new CustomEvent('app:state-changed', { detail: { source: 'chauffeur-accept', orderId: targetId, status: 'accepted' } }));
+                if (syncGlobalState) syncGlobalState().catch(() => {});
             } catch (err) {
                 queryClient.invalidateQueries({ queryKey: ['chauffeurMissions'] });
                 swalClose();

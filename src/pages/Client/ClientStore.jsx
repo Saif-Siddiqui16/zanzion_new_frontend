@@ -255,6 +255,17 @@ const ClientStore = () => {
 
     const userRoleStr = String(currentUser?.role?.name || currentUser?.role || '').toLowerCase().replace(/[-\s]/g, '_');
     const isExplicitClientOrCustomer = ['customer', 'client', 'business_client', 'individual_client'].includes(userRoleStr);
+    const isTenantScoped = Boolean(currentUser?.tenantId && Number(currentUser.tenantId) !== 1);
+    const tenantOwnerClient = isTenantScoped
+      ? (
+        (clients || []).find(c => Number(c.tenantId) === Number(currentUser.tenantId) && (c.clientType === 'SaaS' || c.client_type === 'SaaS')) ||
+        (clients || []).find(c => Number(c.tenantId) === Number(currentUser.tenantId)) ||
+        null
+      )
+      : null;
+    const storeBrandName = tenantOwnerClient?.companyName || tenantOwnerClient?.business_name || tenantOwnerClient?.name || currentUser?.tenantCompanyName || currentUser?.companyName || 'ZaneZion';
+    const storeTagline = tenantOwnerClient?.tagline || 'Global Logistics & Bespoke Procurement Network';
+
     const isSaaSCustomerOrTenant = !isExplicitClientOrCustomer && Boolean(
         ['saas_client', 'saas_admin'].includes(userRoleStr) ||
         (currentUser?.company_id && (clients || []).some(c => String(c.id) === String(currentUser.company_id) && (c.clientType === 'SaaS' || c.client_type === 'SaaS')))
@@ -265,7 +276,7 @@ const ClientStore = () => {
             /\b(delivery|chauffeur|custom order|custom item|document pickup)\b/i.test(item.name || '')
         );
         if (isCustomAdHoc) return false;
-        if (isSaaSCustomerOrTenant) {
+        if (isSaaSCustomerOrTenant || isTenantScoped) {
             // For SaaS clients and their customers, all uploaded warehouse items belong to their marketplace catalog
             return true;
         }
@@ -720,9 +731,9 @@ const ClientStore = () => {
                     ) : (
                         <>
                             <h1 className="text-3xl sm:text-5xl font-black tracking-tighter text-white italic uppercase leading-none">
-                                ZaneZion <span className="text-accent underline decoration-white/10 underline-offset-8">Concierge</span> Portal
+                                {storeBrandName} <span className="text-accent underline decoration-white/10 underline-offset-8">Concierge</span> Portal
                             </h1>
-                            <p className="text-secondary text-[10px] sm:text-xs mt-4 font-black uppercase tracking-[0.4em] opacity-80 italic">Global Logistics & Bespoke Procurement Network</p>
+                            <p className="text-secondary text-[10px] sm:text-xs mt-4 font-black uppercase tracking-[0.4em] opacity-80 italic">{storeTagline}</p>
                         </>
                     )}
                 </div>
@@ -1291,7 +1302,7 @@ const ClientStore = () => {
                                         onChange={(e) => setCheckoutVendorId(e.target.value)}
                                         className="w-full bg-background border border-white/10 rounded-2xl px-4 py-3 text-sm text-white focus:border-accent/40 outline-none"
                                     >
-                                        <option value="">ZaneZion assigns best partner</option>
+                                        <option value="">{storeBrandName} assigns best partner</option>
                                         {marketplaceVendors.map((v) => (
                                             <option key={v.id} value={String(v.id)}>
                                                 {(v.name || 'Vendor')} {v.category ? `— ${v.category}` : ''}

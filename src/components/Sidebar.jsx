@@ -315,36 +315,61 @@ const Sidebar = ({ isOpen, toggleSidebar, role }) => {
       return true;
     });
   })();
-  // For SaaS tenant admins and business clients — show their company name as branding
-  const tenantCompanyName = currentUser?.company_name || currentUser?.companyName || null;
+  // For SaaS tenant admins, tenant customers, and staff — show their workspace company branding
+  const tenantCompanyName = currentUser?.tenantCompanyName || currentUser?.company_name || currentUser?.companyName || null;
   const isSaas = userRole === 'saas_client';
+  const isTenantScoped = Boolean(currentUser?.tenantId && Number(currentUser.tenantId) !== 1);
 
-  const myClient = (userRole === 'client' || userRole === 'saas_client')
+  // 1. Locate the SaaS tenant owner client if inside a tenant workspace
+  const tenantClient = isTenantScoped
     ? (
-      (currentUser?.clientId && (clients || []).find(c => String(c.id).replace('CLT-', '') === String(currentUser.clientId).replace('CLT-', ''))) ||
-      (currentUser?.company_id && (clients || []).find(c => String(c.id).replace('CLT-', '') === String(currentUser.company_id).replace('CLT-', ''))) ||
-      (currentUser?.email && (clients || []).find(c => c.email?.toLowerCase() === currentUser.email.toLowerCase())) ||
-      (currentUser?.name && (clients || []).find(c => c.name === currentUser.name || c.contactPerson === currentUser.name)) ||
-      (currentUser?.tenantId && (clients || []).find(c => Number(c.tenantId) === Number(currentUser.tenantId) && (c.clientType === 'SaaS' || c.client_type === 'SaaS'))) ||
-      (currentUser?.tenantId && (clients || []).find(c => Number(c.tenantId) === Number(currentUser.tenantId))) ||
+      (clients || []).find(c => Number(c.tenantId) === Number(currentUser.tenantId) && (c.clientType === 'SaaS' || c.client_type === 'SaaS')) ||
+      (clients || []).find(c => Number(c.tenantId) === Number(currentUser.tenantId)) ||
       null
     )
     : null;
 
-  const customLogo = myClient?.logoUrl || myClient?.logo_url || myClient?.logo || myClient?.branding?.logo || currentUser?.logoUrl || currentUser?.logo || null;
-  const customName = myClient?.companyName || myClient?.business_name || myClient?.name || myClient?.branding?.businessName || currentUser?.companyName || (isSaas ? currentUser?.name : null);
-  const customTagline = myClient?.tagline || myClient?.branding?.tagline || (isSaas ? 'Workspace' : null);
+  // 2. Locate the specific client record for this user if applicable
+  const myClient = (
+    tenantClient ||
+    (currentUser?.clientId && (clients || []).find(c => String(c.id).replace('CLT-', '') === String(currentUser.clientId).replace('CLT-', ''))) ||
+    (currentUser?.company_id && (clients || []).find(c => String(c.id).replace('CLT-', '') === String(currentUser.company_id).replace('CLT-', ''))) ||
+    (currentUser?.email && (clients || []).find(c => c.email?.toLowerCase() === currentUser.email?.toLowerCase())) ||
+    (currentUser?.name && (clients || []).find(c => c.name === currentUser.name || c.contactPerson === currentUser.name)) ||
+    (currentUser?.tenantId && (clients || []).find(c => Number(c.tenantId) === Number(currentUser.tenantId) && (c.clientType === 'SaaS' || c.client_type === 'SaaS'))) ||
+    (currentUser?.tenantId && (clients || []).find(c => Number(c.tenantId) === Number(currentUser.tenantId))) ||
+    null
+  );
+
+  const customLogo = myClient?.logoUrl || myClient?.logo_url || myClient?.logo || myClient?.branding?.logo || currentUser?.tenantLogoUrl || currentUser?.logoUrl || currentUser?.logo || null;
+  const customName = (
+    myClient?.companyName ||
+    myClient?.business_name ||
+    myClient?.name ||
+    myClient?.branding?.businessName ||
+    currentUser?.tenantCompanyName ||
+    currentUser?.companyName ||
+    currentUser?.company_name ||
+    (isSaas ? currentUser?.name : null)
+  );
+  const customTagline = myClient?.tagline || myClient?.branding?.tagline || (
+    isSaas
+      ? 'Workspace'
+      : isTenantScoped
+        ? (userRole === 'customer' ? 'Customer Portal' : userRole === 'staff' ? 'Staff Terminal' : 'Workspace')
+        : (userRole === 'client' ? 'Client Portal' : null)
+  );
 
   // Determine display name and tagline for sidebar header
-  const sidebarBrandName = isSaas
-    ? (customName || 'Workspace')
+  const sidebarBrandName = (isSaas || isTenantScoped)
+    ? (customName || (isSaas ? 'Workspace' : (tenantCompanyName || 'ZANEZION')))
     : (userRole === 'client' && customName ? customName : (tenantCompanyName || 'ZANEZION'));
 
-  const sidebarTagline = isSaas
-    ? (customTagline || 'Workspace')
+  const sidebarTagline = (isSaas || isTenantScoped)
+    ? (customTagline || (userRole === 'customer' ? 'Customer Portal' : userRole === 'staff' ? 'Staff Terminal' : 'Workspace'))
     : (userRole === 'client' ? (customTagline || 'Client Portal') : (userRole === 'concierge' ? 'Concierge Services' : 'Institutional'));
 
-  const sidebarLogo = isSaas
+  const sidebarLogo = (isSaas || isTenantScoped)
     ? customLogo
     : (userRole === 'client' && customLogo ? customLogo : '/logo.png');
 
@@ -377,7 +402,7 @@ const Sidebar = ({ isOpen, toggleSidebar, role }) => {
                   alt={sidebarBrandName}
                   className={`w-full h-full object-contain ${sidebarLogo === '/logo.png' ? 'scale-[2.2]' : ''} transition-all duration-300`}
                 />
-              ) : isSaas ? (
+              ) : (isSaas || isTenantScoped) ? (
                 <div className="w-full h-full rounded-lg bg-accent/20 border border-accent/40 flex items-center justify-center font-black text-accent text-sm uppercase">
                   {sidebarBrandName ? sidebarBrandName.charAt(0).toUpperCase() : 'S'}
                 </div>
