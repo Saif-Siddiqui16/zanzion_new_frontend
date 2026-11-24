@@ -156,17 +156,11 @@ const InventoryAlerts = () => {
                 </div>
                 <div className="glass-card p-6 bg-accent/5 border-accent/20">
                     <h3 className="text-lg font-bold mb-2">Automated Provisioning</h3>
-                    <p className="text-sm text-secondary mb-4">
+                    <p className="text-sm text-secondary">
                         {alerts.length > 0
-                            ? `Based on current stock levels, ${criticalCount > 0 ? `${criticalCount} item(s) are depleted` : `${warningCount} item(s) are low`}. You can initiate replenishment requests.`
+                            ? `Based on current stock levels, ${criticalCount > 0 ? `${criticalCount} item(s) are depleted` : `${warningCount} item(s) are low`}. Stock levels require operational review.`
                             : `All inventory buffers are healthy. No automated restocking is recommended at this time.`}
                     </p>
-                    <button
-                        onClick={() => navigate('/dashboard/purchase-requests')}
-                        className="btn-primary w-full flex items-center justify-center gap-2"
-                    >
-                        <Bell size={16} /> Reorder Critical Items
-                    </button>
                 </div>
             </div>
         </div>

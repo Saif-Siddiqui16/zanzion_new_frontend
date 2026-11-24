@@ -16,13 +16,14 @@ const CLOCK_ROLES = new Set([
 const StaffClockBar = ({ role }) => {
     const { currentUser, clockIn, clockOut, addLog } = useData();
     const r = String(role || currentUser?.role || '').toLowerCase().replace(/\s+/g, '');
-    if (!CLOCK_ROLES.has(r)) return null;
+    const isClockRole = CLOCK_ROLES.has(r);
 
     const storageKey = () => `zz_clock_${currentUser?.id ?? currentUser?.email ?? 'guest'}`;
 
     const [onDuty, setOnDuty] = useState(false);
 
     useEffect(() => {
+        if (!isClockRole) return;
         try {
             const raw = localStorage.getItem(storageKey());
             if (raw) {
@@ -34,7 +35,7 @@ const StaffClockBar = ({ role }) => {
         } catch {
             setOnDuty(false);
         }
-    }, [currentUser?.id, currentUser?.email]);
+    }, [currentUser?.id, currentUser?.email, isClockRole]);
 
     const handleIn = async () => {
         const ref = await clockIn(currentUser?.location || 'HQ');
@@ -51,6 +52,8 @@ const StaffClockBar = ({ role }) => {
             addLog?.({ action: 'Clock Out', detail: `${currentUser?.name || 'User'} (top bar)`, type: 'system' });
         }
     };
+
+    if (!isClockRole) return null;
 
     return (
         <div className="hidden lg:flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/[0.03] p-0.5 shrink-0">

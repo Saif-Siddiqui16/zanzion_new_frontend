@@ -39,21 +39,6 @@ const Reports = () => {
   const [customRangeActive, setCustomRangeActive] = useState(false);
   const [customChartData, setCustomChartData] = useState([]);
 
-  // --- Institutional Permission Guard ---
-  if (!hasPermission('financial_reports')) {
-    return (
-      <div className="flex flex-col items-center justify-center h-[60vh] space-y-4">
-        <div className="p-4 bg-danger/10 border border-danger/20 rounded-full">
-          <ShieldCheck size={48} className="text-danger" />
-        </div>
-        <div className="text-center">
-          <h2 className="text-2xl font-bold">Security Clearance Required</h2>
-          <p className="text-secondary mt-2 max-w-md">Financial intelligence and revenue audits are restricted to Super Admin protocols. Your access attempt has been logged.</p>
-        </div>
-      </div>
-    );
-  }
-
   // --- Real Intelligence Calibration (Multi-temporal) ---
   const { totalRevenue, totalPaid, totalOutstanding, avgOrderValue } = useMemo(() => {
     if (customRangeActive) {
@@ -293,6 +278,21 @@ const Reports = () => {
       setIsExporting(false);
     }
   };
+
+  // --- Institutional Permission Guard ---
+  if (!hasPermission('financial_reports')) {
+    return (
+      <div className="flex flex-col items-center justify-center h-[60vh] space-y-4">
+        <div className="p-4 bg-danger/10 border border-danger/20 rounded-full">
+          <ShieldCheck size={48} className="text-danger" />
+        </div>
+        <div className="text-center">
+          <h2 className="text-2xl font-bold">Security Clearance Required</h2>
+          <p className="text-secondary mt-2 max-w-md">Financial intelligence and revenue audits are restricted to Super Admin protocols. Your access attempt has been logged.</p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-8">
