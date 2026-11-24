@@ -2942,6 +2942,8 @@ export const GlobalDataProvider = ({ children }) => {
             client_id: e.client_id || e.clientId,
             manager_id: e.manager_id || e.managerId,
             status: e.status || "planned",
+            tenantId: e.tenantId ?? e.tenant_id ?? null,
+            tenant_id: e.tenantId ?? e.tenant_id ?? null,
           };
         });
         // Store raw events so the filter-effect can re-apply when user loads
@@ -2988,6 +2990,8 @@ export const GlobalDataProvider = ({ children }) => {
             guest: r.guest || r.guestName || r.client_name || r.room || "VIP Suite",
             priority: capitalizePriority(r.priority),
             status: (r.status || "pending").toLowerCase(),
+            tenantId: r.tenantId ?? r.tenant_id ?? null,
+            tenant_id: r.tenantId ?? r.tenant_id ?? null,
           };
         });
 
@@ -3002,28 +3006,10 @@ export const GlobalDataProvider = ({ children }) => {
 
   const fetchLuxuryItems = React.useCallback(async () => {
     try {
-      // Query both platform vault assets (tenantId=1) and current tenant assets to ensure complete sync
-      const [resAdmin, resClient] = await Promise.allSettled([
-        api.get("/concierge/luxury-items?tenantId=1"),
-        api.get("/concierge/luxury-items")
-      ]);
-
-      const adminItems = resAdmin.status === 'fulfilled' && resAdmin.value.data?.success
-        ? (Array.isArray(resAdmin.value.data.data) ? resAdmin.value.data.data : (Array.isArray(resAdmin.value.data) ? resAdmin.value.data : []))
-        : (resAdmin.status === 'fulfilled' && Array.isArray(resAdmin.value.data) ? resAdmin.value.data : []);
-
-      const clientItems = resClient.status === 'fulfilled' && resClient.value.data?.success
-        ? (Array.isArray(resClient.value.data.data) ? resClient.value.data.data : (Array.isArray(resClient.value.data) ? resClient.value.data : []))
-        : (resClient.status === 'fulfilled' && Array.isArray(resClient.value.data) ? resClient.value.data : []);
-
-      const combined = [...adminItems, ...clientItems];
-      const seen = new Set();
-      const rawData = combined.filter((itm) => {
-        const id = itm.id || itm.itemId;
-        if (!id || seen.has(String(id))) return false;
-        seen.add(String(id));
-        return true;
-      });
+      const res = await api.get("/concierge/luxury-items");
+      const rawData = res.data?.success && Array.isArray(res.data?.data)
+        ? res.data.data
+        : (Array.isArray(res.data) ? res.data : []);
 
       const mapped = (rawData || []).map((item) => {
         const metadata = item.metadata && typeof item.metadata === 'object' ? item.metadata : {};
@@ -3032,6 +3018,7 @@ export const GlobalDataProvider = ({ children }) => {
         return {
           id: item.itemId || item.id,
           itemId: item.itemId || item.id,
+          tenantId: item.tenantId,
           item: item.item_name || item.name || 'Unknown Item',
           name: item.name || item.item_name || 'Unknown Item',
           owner: item.owner_name || item.owner || clientName || 'Unknown Beneficiary',
@@ -3044,8 +3031,8 @@ export const GlobalDataProvider = ({ children }) => {
           client_id: clientId != null ? String(clientId) : null,
           clientName: clientName,
           client_name: clientName,
-          company_id: item.tenantId || 1,
-          companyId: item.tenantId || 1,
+          company_id: item.tenantId,
+          companyId: item.tenantId,
         };
       });
       setLuxuryItems(mapped);
@@ -7519,7 +7506,8 @@ export const GlobalDataProvider = ({ children }) => {
         special_requests: event.specialRequests || "",
         planner_name: event.plannerName || "",
         guest_count: event.guestCount || event.guests || 0,
-        mood_board_url: moodBoard
+        mood_board_url: moodBoard,
+        tenantId: currentUser?.tenantId ? Number(currentUser.tenantId) : undefined
       };
 
       const res = await api.post("/support/events", payload);
@@ -8107,6 +8095,7 @@ export const GlobalDataProvider = ({ children }) => {
         delivery_time: formattedTime,
         priority: (request.priority || "medium").toLowerCase(),
         status: (request.status || "pending").toLowerCase(),
+        tenantId: currentUser?.tenantId ? Number(currentUser.tenantId) : undefined,
       };
       console.log('[GuestRequest] Creating:', payload);
       const res = await api.post("/support/guest-requests", payload);

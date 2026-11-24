@@ -49,8 +49,23 @@ const GuestRequests = () => {
     const isCustomer = ['customer', 'saas_client', 'client'].includes(userRole) && !isBusinessClient;
     const isConciergeOrAdmin = ['concierge', 'admin', 'super_admin', 'superadmin'].includes(userRole);
 
-    // Customer: backend already filters by company_id, show all. Admin/concierge: show all too.
-    const filteredRequests = guestRequests.filter(req =>
+    const scopedRequests = React.useMemo(() => {
+        let list = guestRequests || [];
+        if (currentUser?.tenantId) {
+            const uTenant = Number(currentUser.tenantId);
+            list = list.filter(r => {
+                const itemTenant = r.tenantId != null ? Number(r.tenantId) : null;
+                if (uTenant === 1) {
+                    return itemTenant === 1 || itemTenant === null;
+                }
+                return itemTenant === uTenant;
+            });
+        }
+        return list;
+    }, [guestRequests, currentUser?.tenantId]);
+
+    // Scoped request filter by search
+    const filteredRequests = scopedRequests.filter(req =>
         req.guest?.toLowerCase().includes(searchTerm.toLowerCase()) ||
         req.request?.toLowerCase().includes(searchTerm.toLowerCase()) ||
         String(req.id).toLowerCase().includes(searchTerm.toLowerCase())
@@ -69,7 +84,7 @@ const GuestRequests = () => {
 
     const handleSave = () => {
         if (modalType === 'add') {
-            addGuestRequest(formData);
+            addGuestRequest({ ...formData, tenantId: currentUser?.tenantId ? Number(currentUser.tenantId) : undefined });
         } else if (modalType === 'edit') {
             updateGuestRequest({ ...selectedRequest, ...formData });
         }

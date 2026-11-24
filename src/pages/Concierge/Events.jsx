@@ -56,61 +56,58 @@ const Events = () => {
   // Load the complete client database for Concierge selection (institutional clients + portal users)
   const clientOptions = useMemo(() => {
     const list = [];
-    const seen = new Set();
+    const seenEmails = new Set();
+    const seenIds = new Set();
+    const userTenantId = currentUser?.tenantId ? Number(currentUser.tenantId) : null;
+
+    const staffRoles = new Set([
+      'superadmin', 'super_admin', 'admin', 'concierge', 'staff',
+      'operations', 'logistics', 'procurement', 'inventory', 'driver', 'saas_client'
+    ]);
 
     // 1. Institutional / Corporate Clients
     (clients || []).forEach((c) => {
       if (!c || !c.id) return;
+      if (userTenantId && c.tenantId && Number(c.tenantId) !== userTenantId) return;
+      const email = (c.email || '').toLowerCase().trim();
+      const idStr = String(c.id);
+      if (email && seenEmails.has(email)) return;
+      if (seenIds.has(idStr)) return;
+      if (email) seenEmails.add(email);
+      seenIds.add(idStr);
+
       const name = c.companyName || c.name || c.contactPerson || c.business_name || `Client ${c.id}`;
-      const email = c.email || '';
-      const key = `${c.id}::${(name || email).toLowerCase()}`;
-      if (!seen.has(key)) {
-        seen.add(key);
-        list.push({
-          id: c.id,
-          label: name,
-          email: email
-        });
-      }
+      list.push({
+        id: c.id,
+        label: name,
+        email: c.email || ''
+      });
     });
 
-    // 2. Personal / Portal Users (All 32+ users across all tenants)
+    // 2. Personal / Portal Users (filtered by tenant, excluding internal staff)
     (customerUsers || []).forEach((u) => {
       if (!u || !u.id) return;
+      if (userTenantId && u.tenantId && Number(u.tenantId) !== userTenantId) return;
       const roleStr = String(u.role?.name || u.role || u.role_name || '').toLowerCase();
-      if (['superadmin', 'inventory', 'logistics', 'driver'].includes(roleStr)) {
-        return;
-      }
+      if (staffRoles.has(roleStr)) return;
+
+      const email = (u.email || '').toLowerCase().trim();
+      const idStr = String(u.clientId || u.company_id || u.id);
+      if (email && seenEmails.has(email)) return;
+      if (seenIds.has(idStr)) return;
+      if (email) seenEmails.add(email);
+      seenIds.add(idStr);
+
       const name = u.name || u.full_name || u.companyName || u.contactPerson || `User ${u.id}`;
-      const email = u.email || '';
-      const key = `${u.id}::${(name || email).toLowerCase()}`;
-      if (!seen.has(key)) {
-        seen.add(key);
-        list.push({
-          id: u.clientId || u.company_id || u.id,
-          label: name,
-          email: email
-        });
-      }
+      list.push({
+        id: u.clientId || u.company_id || u.id,
+        label: name,
+        email: u.email || ''
+      });
     });
 
-    // 3. Current User / Organization (Internal)
-    if (currentUser) {
-      const myId = currentUser.clientId || currentUser.company_id || currentUser.id;
-      const myName = currentUser.companyName || currentUser.name || 'Organization Internal';
-      const myKey = `${myId}::${(myName || currentUser.email || '').toLowerCase()}`;
-      if (!seen.has(myKey)) {
-        seen.add(myKey);
-        list.unshift({
-          id: myId,
-          label: `${myName} (Internal)`,
-          email: currentUser.email || ''
-        });
-      }
-    }
-
     return list.sort((a, b) => a.label.localeCompare(b.label));
-  }, [clients, customerUsers]);
+  }, [clients, customerUsers, currentUser?.tenantId]);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [modalType, setModalType] = useState('view');
   const [selectedEvent, setSelectedEvent] = useState(null);
@@ -119,7 +116,21 @@ const Events = () => {
   const [imagePreview, setImagePreview] = useState(null);
   const [formData, setFormData] = useState({ title: '', client: '', client_id: '', date: '', location: '', status: 'Planning', guestCount: 0 });
 
-  const filteredEvents = events.filter(e =>
+  const scopedEvents = useMemo(() => {
+    if (currentUser?.tenantId) {
+      const uTenant = Number(currentUser.tenantId);
+      return (events || []).filter(e => {
+        const itemTenant = e.tenantId != null ? Number(e.tenantId) : null;
+        if (uTenant === 1) {
+          return itemTenant === 1 || itemTenant === null;
+        }
+        return itemTenant === uTenant;
+      });
+    }
+    return events || [];
+  }, [events, currentUser?.tenantId]);
+
+  const filteredEvents = scopedEvents.filter(e =>
     e.title?.toLowerCase().includes(searchTerm.toLowerCase()) ||
     e.client?.toLowerCase().includes(searchTerm.toLowerCase()) ||
     String(e.id).toLowerCase().includes(searchTerm.toLowerCase())
@@ -257,16 +268,16 @@ const Events = () => {
       <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
         <div className="glass-card p-6 border-accent/10">
           <p className="text-xs text-secondary uppercase font-bold mb-1">Total Events</p>
-          <p className="text-3xl font-bold">{events.length} Events</p>
+          <p className="text-3xl font-bold">{scopedEvents.length} Events</p>
         </div>
         <div className="glass-card p-6 border-accent/10">
           <p className="text-xs text-secondary uppercase font-bold mb-1">Total Guests</p>
-          <p className="text-3xl font-bold">{events.reduce((sum, e) => sum + (parseInt(e.guestCount) || 0), 0)} Guests</p>
+          <p className="text-3xl font-bold">{scopedEvents.reduce((sum, e) => sum + (parseInt(e.guestCount) || 0), 0)} Guests</p>
         </div>
         <div className="glass-card p-6 border-accent/10">
           <p className="text-xs text-secondary uppercase font-bold mb-1">Active Events</p>
           <p className="text-3xl font-bold">
-            {events.filter(e => {
+            {scopedEvents.filter(e => {
               const s = String(e.status || '').toLowerCase();
               return s === 'active' || s === 'confirmed' || s === 'in_progress' || s === 'setup';
             }).length} Active

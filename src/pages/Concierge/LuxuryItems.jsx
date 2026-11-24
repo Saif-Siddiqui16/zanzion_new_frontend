@@ -44,11 +44,11 @@ const LuxuryItems = () => {
     }, [fetchLuxuryItems]);
 
     const role = normalizeRole(currentUser?.role);
-    const isAdmin = ['superadmin', 'admin', 'concierge', 'operations'].includes(role);
+    const isAdmin = ['superadmin', 'admin', 'concierge', 'operations', 'saas_client'].includes(role);
     const isClient = !isAdmin;
-    const canAddLuxury = isAdmin && hasMenuPermission('Luxury Items', 'can_add');
-    const canEditLuxury = isAdmin && hasMenuPermission('Luxury Items', 'can_edit');
-    const canDeleteLuxury = isAdmin && hasMenuPermission('Luxury Items', 'can_delete');
+    const canAddLuxury = isAdmin && (role === 'saas_client' || hasMenuPermission('Luxury Items', 'can_add'));
+    const canEditLuxury = isAdmin && (role === 'saas_client' || hasMenuPermission('Luxury Items', 'can_edit'));
+    const canDeleteLuxury = isAdmin && (role === 'saas_client' || hasMenuPermission('Luxury Items', 'can_delete'));
 
     // Resolve client ID and name for the logged-in client user
     const myClientId = currentUser?.clientId || currentUser?.companyId || currentUser?.company_id || currentUser?.id;
@@ -92,13 +92,25 @@ const LuxuryItems = () => {
     // Build unified list of available clients for Admin dropdown
     const availableClients = useMemo(() => {
         const list = [];
+        const seenEmails = new Set();
         const seenIds = new Set();
+        const userTenantId = currentUser?.tenantId ? Number(currentUser.tenantId) : null;
+
+        const staffRoles = new Set([
+            'superadmin', 'super_admin', 'admin', 'concierge', 'staff',
+            'operations', 'logistics', 'procurement', 'inventory', 'driver', 'saas_client'
+        ]);
 
         (clients || []).forEach(c => {
             if (!c || !c.id) return;
+            if (userTenantId && c.tenantId && Number(c.tenantId) !== userTenantId) return;
+            const email = (c.email || '').toLowerCase().trim();
             const idStr = String(c.id);
+            if (email && seenEmails.has(email)) return;
             if (seenIds.has(idStr)) return;
+            if (email) seenEmails.add(email);
             seenIds.add(idStr);
+
             const name = c.companyName || c.name || c.business_name || c.contactPerson || c.contact_person || `Client #${c.id}`;
             const type = c.clientType || c.client_type || 'Client';
             list.push({
@@ -112,9 +124,17 @@ const LuxuryItems = () => {
 
         (customerUsers || []).forEach(u => {
             if (!u || !u.id) return;
-            const idStr = String(u.id);
+            if (userTenantId && u.tenantId && Number(u.tenantId) !== userTenantId) return;
+            const roleStr = String(u.role?.name || u.role || u.role_name || '').toLowerCase();
+            if (staffRoles.has(roleStr)) return;
+
+            const email = (u.email || '').toLowerCase().trim();
+            const idStr = String(u.clientId || u.company_id || u.id);
+            if (email && seenEmails.has(email)) return;
             if (seenIds.has(idStr)) return;
+            if (email) seenEmails.add(email);
             seenIds.add(idStr);
+
             const name = u.name || u.fullName || u.username || `Customer #${u.id}`;
             list.push({
                 id: idStr,
@@ -126,7 +146,7 @@ const LuxuryItems = () => {
         });
 
         return list.sort((a, b) => a.name.localeCompare(b.name));
-    }, [clients, customerUsers]);
+    }, [clients, customerUsers, currentUser?.tenantId]);
 
     const [adminClientFilter, setAdminClientFilter] = useState('all');
     const [isModalOpen, setIsModalOpen] = useState(false);
@@ -146,18 +166,30 @@ const LuxuryItems = () => {
 
     // Client-specific isolation
     const clientScopedItems = useMemo(() => {
+        let items = luxuryItems;
+        if (currentUser?.tenantId) {
+            const uTenant = Number(currentUser.tenantId);
+            items = items.filter(itm => {
+                const itemTenant = itm.tenantId != null ? Number(itm.tenantId) : null;
+                if (uTenant === 1) {
+                    return itemTenant === 1 || itemTenant === null;
+                }
+                return itemTenant === uTenant;
+            });
+        }
+
         if (isAdmin) {
             if (adminClientFilter && adminClientFilter !== 'all') {
-                return luxuryItems.filter(itm =>
+                return items.filter(itm =>
                     String(itm.clientId) === String(adminClientFilter) ||
                     String(itm.client_id) === String(adminClientFilter)
                 );
             }
-            return luxuryItems;
+            return items;
         }
 
         // Client User: STRICT ISOLATION by client's unique database ID
-        return luxuryItems.filter(itm => {
+        return items.filter(itm => {
             const itmCid = itm.clientId ?? itm.client_id;
             if (itmCid != null && myClientIds.has(String(itmCid))) {
                 return true;
@@ -168,7 +200,7 @@ const LuxuryItems = () => {
             }
             return false;
         });
-    }, [isAdmin, adminClientFilter, luxuryItems, myClientIds, myClientName]);
+    }, [isAdmin, adminClientFilter, luxuryItems, myClientIds, myClientName, currentUser?.tenantId]);
 
     const filteredItems = useMemo(() => {
         const q = searchTerm.trim().toLowerCase();
@@ -232,6 +264,7 @@ const LuxuryItems = () => {
 
         const payload = {
             ...formData,
+            tenantId: currentUser?.tenantId ? Number(currentUser.tenantId) : undefined,
             clientId: formData.clientId ? String(formData.clientId) : (clientObj ? clientObj.id : null),
             client_id: formData.clientId ? String(formData.clientId) : (clientObj ? clientObj.id : null),
             clientName: resolvedClientName,
