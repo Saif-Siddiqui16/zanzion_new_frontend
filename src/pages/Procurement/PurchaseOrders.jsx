@@ -112,7 +112,7 @@ const PurchaseOrders = () => {
   const [receivePackingSlip, setReceivePackingSlip] = useState("");
   const [receiveAdminApprove, setReceiveAdminApprove] = useState(false);
   const fileInputRef = useRef(null);
-  const canApproveReceipt = ["admin", "super_admin", "superadmin"].includes(
+  const canApproveReceipt = ["admin", "super_admin", "superadmin", "saas_client", "client", "business_client"].includes(
     userRole,
   );
 
@@ -500,9 +500,16 @@ const PurchaseOrders = () => {
                         className="hover:bg-white/[0.01] group transition-colors"
                       >
                         <td className="p-6">
-                          <span className="text-sm font-black text-accent">
-                            {po.id}
-                          </span>
+                          <div className="flex flex-col">
+                            <span className="text-sm font-black text-accent tracking-wide">
+                              {po.poNumber || `PO-${po.id}`}
+                            </span>
+                            {po.items && po.items.length > 0 && (
+                              <span className="text-[11px] font-bold text-white/90 truncate max-w-[200px]" title={po.items.map(it => `${it.name || 'Item'} (x${it.orderedQty || it.quantity || 1})`).join(', ')}>
+                                {po.items.map(it => `${it.name || 'Item'} (x${it.orderedQty || it.quantity || 1})`).join(', ')}
+                              </span>
+                            )}
+                          </div>
                         </td>
                         <td className="p-6">
                           <div className="flex items-center gap-3">
@@ -589,7 +596,7 @@ const PurchaseOrders = () => {
                                   <ShieldCheck size={16} />
                                 </button>
                               )}
-                            {["superadmin", "super_admin", "admin"].includes(userRole) &&
+                            {["superadmin", "super_admin", "admin", "saas_client", "client", "business_client"].includes(userRole) &&
                               po.status === "Pending Receipt Approval" && (
                                 <button
                                   onClick={async () => {
