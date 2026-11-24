@@ -160,6 +160,7 @@ const Payroll = () => {
             }
 
             await fetchPayroll();
+            window.dispatchEvent(new CustomEvent('app:state-changed'));
             setIsModalOpen(false);
         } catch (err) {
             console.error("Failed to submit payroll:", err);
@@ -173,6 +174,7 @@ const Payroll = () => {
         try {
             await api.delete(`/finance/payroll/${itemToDelete.id}`);
             await fetchPayroll();
+            window.dispatchEvent(new CustomEvent('app:state-changed'));
             if (addLog) addLog({ action: 'Payroll Record Deleted', detail: `Settlement record removed.`, type: 'alert' });
         } catch (error) {
             console.error("Failed to delete payroll record", error);

@@ -130,10 +130,20 @@ const EmployeePortal = () => {
             if (fetchMissions) fetchMissions();
             if (fetchChauffeurRequests) fetchChauffeurRequests();
             if (fetchFleet) fetchFleet();
+            if (fetchPayHistory) fetchPayHistory();
+        };
+        const handleFocus = () => {
+            if (fetchPayHistory) fetchPayHistory();
+            if (fetchLeaveRequests) fetchLeaveRequests();
+            if (fetchDeliveries) fetchDeliveries();
         };
         window.addEventListener('app:state-changed', handleStateChanged);
-        return () => window.removeEventListener('app:state-changed', handleStateChanged);
-    }, [queryClient, fetchDeliveries, fetchMissions, fetchChauffeurRequests, fetchFleet]);
+        window.addEventListener('focus', handleFocus);
+        return () => {
+            window.removeEventListener('app:state-changed', handleStateChanged);
+            window.removeEventListener('focus', handleFocus);
+        };
+    }, [queryClient, fetchDeliveries, fetchMissions, fetchChauffeurRequests, fetchFleet, fetchPayHistory, fetchLeaveRequests]);
 
     useEffect(() => {
         console.log('[StaffPortal] Synchronizing operational data for tab:', activeTab);
@@ -151,12 +161,16 @@ const EmployeePortal = () => {
         if (activeTab === 'leave' && fetchLeaveRequests) {
             interval = setInterval(() => {
                 fetchLeaveRequests();
-            }, 5000);
+            }, 4000);
+        } else if (activeTab === 'pay' && fetchPayHistory) {
+            interval = setInterval(() => {
+                fetchPayHistory();
+            }, 3000);
         }
         return () => {
             if (interval) clearInterval(interval);
         };
-    }, [activeTab]);
+    }, [activeTab, fetchLeaveRequests, fetchPayHistory]);
 
     const [isLeaveModalOpen, setIsLeaveModalOpen] = useState(false);
     const [leaveFormData, setLeaveFormData] = useState({ type: 'Vacation', start: '', end: '', reason: '' });
