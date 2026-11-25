@@ -153,7 +153,6 @@ const EmployeePortal = () => {
         if (fetchFleet) fetchFleet();
         if (fetchPayHistory) fetchPayHistory();
         if (fetchLeaveRequests) fetchLeaveRequests();
-        if (fetchSecurityEvents) fetchSecurityEvents();
     }, [activeTab]);
 
     useEffect(() => {
@@ -176,11 +175,6 @@ const EmployeePortal = () => {
     const [leaveFormData, setLeaveFormData] = useState({ type: 'Vacation', start: '', end: '', reason: '' });
     const [editingLeaveRequest, setEditingLeaveRequest] = useState(null);
     const [searchTerm, setSearchTerm] = useState('');
-
-    // Security States
-    const [isSecurityModalOpen, setIsSecurityModalOpen] = useState(false);
-    const [securityModalType, setSecurityModalType] = useState('panic'); // 'panic' or 'breach'
-    const [breachFormData, setBreachFormData] = useState({ type: 'Unauthorized Access', detail: '', location: currentUser?.location || '' });
 
     // Mission Details States
     const [isMissionModalOpen, setIsMissionModalOpen] = useState(false);
@@ -252,7 +246,12 @@ const EmployeePortal = () => {
         const asgName = String(a.assignee || '').trim().toLowerCase();
         const matchName = asgName && cNames.some(cn => cn === asgName || asgName.includes(cn) || cn.includes(asgName));
 
-        return Boolean(matchId || matchName);
+        const isAssigned = Boolean(matchId || matchName);
+        const normStatus = String(a.status || '').toLowerCase().trim();
+        // Declined or pending tasks are not active assignments for this staff member
+        const isNotPendingOrDeclined = !['pending', 'declined', 'rejected'].includes(normStatus);
+
+        return isAssigned && isNotPendingOrDeclined;
     });
 
     // Add real deliveries assigned to this driver
@@ -417,9 +416,7 @@ const EmployeePortal = () => {
     });
 
     const pendingAssignments = staffAssignments.filter(a => 
-        String(a.status || '').toLowerCase() === 'pending' && 
-        !a.assigneeId && 
-        (!a.assignee || a.assignee === 'System' || a.assignee === 'Unassigned')
+        String(a.status || '').toLowerCase() === 'pending'
     );
 
     const isMatchingUserLeave = React.useCallback((r) => {
@@ -853,9 +850,10 @@ const EmployeePortal = () => {
                 const payload = {
                     id: asg.id,
                     rawId: asg.rawId,
+                    deliveryId: asg.deliveryId || asg.delivery_id,
                     status: finalStatus,
-                    assigneeId: (newStatus === 'in_progress' || newStatus === 'assigned') ? currentUser?.id : asg.assigneeId,
-                    assignee: (newStatus === 'in_progress' || newStatus === 'assigned') ? currentUser?.name : asg.assignee,
+                    assigneeId: (newStatus === 'in_progress' || newStatus === 'assigned') ? currentUser?.id : (newStatus === 'pending' ? null : asg.assigneeId),
+                    assignee: (newStatus === 'in_progress' || newStatus === 'assigned') ? currentUser?.name : (newStatus === 'pending' ? 'Unassigned' : asg.assignee),
                     ...proofData
                 };
                 await updateMission(payload);
@@ -981,8 +979,7 @@ const EmployeePortal = () => {
                     { id: 'assignments', label: 'Operational Queue', icon: ClipboardList },
                     { id: 'map', label: 'Field Map', icon: MapIcon },
                     { id: 'leave', label: 'Leave & Absence', icon: Calendar },
-                    { id: 'pay', label: 'Pay & Records', icon: History },
-                    { id: 'security', label: 'Security Logs', icon: Shield }
+                    { id: 'pay', label: 'Pay & Records', icon: History }
                 ].filter(tab => hasStaffTerminal || ['leave', 'pay'].includes(tab.id))
                 .map((tab) => (
                     <button
@@ -1028,52 +1025,27 @@ const EmployeePortal = () => {
                             ))}
                         </div>
 
-                        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-                            <div className="lg:col-span-2 space-y-6">
-                                <div className="glass-card p-6 border-accent/10">
-                                    <h3 className="text-lg font-black text-white italic uppercase tracking-tighter mb-6 flex items-center gap-2">
-                                        <Navigation size={20} className="text-accent" /> Priority Queue
-                                    </h3>
-                                    <div className="space-y-4">
-                                        {filteredMyAssignments.filter(a => a.status !== 'Completed').map(asg => (
-                                            <TaskCard key={asg.id} asg={asg} onAction={handleStatusChange} />
-                                        ))}
-                                        {filteredMyAssignments.filter(a => a.status !== 'Completed').length === 0 && (
-                                            <div className="p-12 text-center border-2 border-dashed border-border rounded-3xl">
-                                                <CheckCircle size={48} className="text-success mx-auto mb-4 opacity-20" />
-                                                <p className="text-secondary font-bold">{searchTerm ? 'No matches found for your search.' : 'No active assignments. Check the Operational Queue.'}</p>
-                                            </div>
-                                        )}
-                                    </div>
-                                </div>
-                            </div>
-
-                            <div className="space-y-6">
-                                <div className="glass-card p-6">
-                                    <h3 className="text-lg font-black text-white italic uppercase tracking-tighter mb-4 flex items-center gap-2">
-                                        <Shield size={18} className="text-accent" /> Security Protocol
-                                    </h3>
-                                    <div className="space-y-2">
-                                        <button
-                                            onClick={() => {
-                                                setSecurityModalType('panic');
-                                                setIsSecurityModalOpen(true);
-                                                reportSecurityEvent({ eventType: 'PANIC', location: 'GPS Broadcast Active', details: 'Immediate extraction requested.' });
-                                            }}
-                                            className="w-full py-4 bg-danger text-white rounded-xl text-xs font-black uppercase tracking-[0.2em] hover:bg-danger/80 transition-all shadow-lg shadow-danger/20 flex items-center justify-center gap-2"
-                                        >
-                                            <AlertCircle size={18} /> Emergency Panic
-                                        </button>
-                                        <button
-                                            onClick={() => {
-                                                setSecurityModalType('breach');
-                                                setIsSecurityModalOpen(true);
-                                            }}
-                                            className="w-full py-4 bg-white/5 border border-border rounded-xl text-[10px] font-black uppercase tracking-widest hover:text-white transition-all"
-                                        >
-                                            Report Security Breach
-                                        </button>
-                                    </div>
+                        <div className="space-y-6">
+                            <div className="glass-card p-6 border-accent/10">
+                                <h3 className="text-lg font-black text-white italic uppercase tracking-tighter mb-6 flex items-center gap-2">
+                                    <Navigation size={20} className="text-accent" /> Priority Queue
+                                </h3>
+                                <div className="space-y-4">
+                                    {filteredMyAssignments.filter(a => {
+                                        const s = String(a.status || '').toLowerCase().replace(/\s+/g, '_');
+                                        return !['completed', 'delivered', 'pending', 'declined', 'rejected'].includes(s);
+                                    }).map(asg => (
+                                        <TaskCard key={asg.id} asg={asg} onAction={handleStatusChange} />
+                                    ))}
+                                    {filteredMyAssignments.filter(a => {
+                                        const s = String(a.status || '').toLowerCase().replace(/\s+/g, '_');
+                                        return !['completed', 'delivered', 'pending', 'declined', 'rejected'].includes(s);
+                                    }).length === 0 && (
+                                        <div className="p-12 text-center border-2 border-dashed border-border rounded-3xl">
+                                            <CheckCircle size={48} className="text-success mx-auto mb-4 opacity-20" />
+                                            <p className="text-secondary font-bold">{searchTerm ? 'No matches found for your search.' : 'No active assignments. Check the Operational Queue.'}</p>
+                                        </div>
+                                    )}
                                 </div>
                             </div>
                         </div>
@@ -1606,56 +1578,7 @@ const EmployeePortal = () => {
                     </motion.div>
                 )}
 
-                {activeTab === 'security' && (
-                    <motion.div
-                        key="security"
-                        initial={{ opacity: 0, y: 10 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        className="space-y-6"
-                    >
-                        <div className="glass-card p-6">
-                            <h3 className="text-lg font-black text-white italic uppercase tracking-tighter mb-6 flex items-center gap-2">
-                                <Shield className="text-accent" size={24} /> My Security Logs
-                            </h3>
-                            
-                            <div className="space-y-4">
-                                {securityEvents?.length === 0 ? (
-                                    <div className="text-center py-12 bg-white/5 rounded-2xl border border-white/10 border-dashed">
-                                        <Shield className="text-muted mx-auto mb-4" size={48} />
-                                        <p className="text-muted font-black italic uppercase tracking-widest text-sm">No Security Events Logged</p>
-                                        <p className="text-[10px] text-muted/70 mt-2 font-medium">No panic or breach events have been reported.</p>
-                                    </div>
-                                ) : (
-                                    securityEvents?.map(event => (
-                                        <div key={event.id} className="bg-background border border-white/10 rounded-2xl p-5 hover:border-accent/30 transition-all flex items-start justify-between gap-4 group">
-                                            <div>
-                                                <div className="flex items-center gap-3 mb-2">
-                                                    <span className={`px-2 py-0.5 rounded-full text-[9px] font-black uppercase tracking-widest ${
-                                                        event.eventType === 'PANIC' ? 'bg-danger/20 text-danger' : 'bg-warning/20 text-warning'
-                                                    }`}>
-                                                        {event.eventType}
-                                                    </span>
-                                                    <p className="text-[10px] font-bold text-muted uppercase tracking-widest">{new Date(event.createdAt).toLocaleString()}</p>
-                                                </div>
-                                                <h4 className="text-white font-bold mb-1">{event.location || 'Unknown Location'}</h4>
-                                                <p className="text-sm text-secondary">{event.details}</p>
-                                            </div>
-                                            <div className="flex items-center shrink-0">
-                                                <span className={`px-3 py-1.5 rounded-full text-[10px] font-black uppercase tracking-widest border ${
-                                                    event.status === 'Resolved' 
-                                                        ? 'bg-success/10 text-success border-success/20' 
-                                                        : 'bg-danger/10 text-danger border-danger/20 animate-pulse'
-                                                }`}>
-                                                    {event.status}
-                                                </span>
-                                            </div>
-                                        </div>
-                                    ))
-                                )}
-                            </div>
-                        </div>
-                    </motion.div>
-                )}
+
 
                 {activeTab === 'map' && (
                     <motion.div
@@ -2012,114 +1935,7 @@ const EmployeePortal = () => {
                 </div>
             </Modal>
 
-            {/* Security Protocol Modals */}
-            <Modal
-                isOpen={isSecurityModalOpen}
-                onClose={() => setIsSecurityModalOpen(false)}
-                title={securityModalType === 'panic' ? '🚨 EMERGENCY PANIC PROTOCOL' : '🛡️ SECURITY BREACH REPORT'}
-            >
-                {securityModalType === 'panic' ? (
-                    <div className="space-y-6 text-center py-4">
-                        <div className="w-24 h-24 bg-danger/10 border-4 border-danger rounded-full flex items-center justify-center mx-auto animate-pulse">
-                            <AlertCircle size={48} className="text-danger" />
-                        </div>
-                        <div className="space-y-2">
-                            <h3 className="text-2xl font-black text-white italic uppercase tracking-tighter">Signal Sent to HQ</h3>
-                            <p className="text-secondary text-sm font-medium leading-relaxed">
-                                Your current GPS coordinates have been broadcast to all regional units and law enforcement. <br />
-                                <span className="text-danger font-bold">Protocol: Maintain current position and await extraction.</span>
-                            </p>
-                        </div>
-                        <div className="p-4 bg-white/5 border border-white/5 rounded-2xl flex items-center justify-between text-left">
-                            <div>
-                                <p className="text-[10px] font-bold text-muted uppercase tracking-widest leading-tight">Response Time</p>
-                                <p className="text-lg font-black text-white italic tracking-tighter"><Clock size={14} className="inline mr-1" /> ~4.2 Minutes</p>
-                            </div>
-                            <div className="text-right">
-                                <p className="text-[10px] font-bold text-muted uppercase tracking-widest leading-tight">Extraction Unit</p>
-                                <p className="text-lg font-black text-accent italic tracking-tighter">Alpha-6</p>
-                            </div>
-                        </div>
-                        <button
-                            onClick={() => setIsSecurityModalOpen(false)}
-                            className="w-full py-4 bg-white/5 border border-border rounded-2xl text-[10px] font-black uppercase tracking-widest hover:bg-white/10 transition-all"
-                        >
-                            Acknowledge & Close
-                        </button>
-                    </div>
-                ) : (
-                    <div className="space-y-5">
-                        <div className="p-4 bg-warning/10 border border-warning/20 rounded-2xl flex items-center gap-4">
-                            <Shield size={24} className="text-warning shrink-0" />
-                            <p className="text-xs text-warning font-medium leading-tight">Reporting a breach initiates immediate internal audit. Please ensure accuracy in your statement.</p>
-                        </div>
 
-                        <div className="space-y-4">
-                            <div className="space-y-1.5">
-                                <label className="text-[10px] font-bold text-muted uppercase">Incident Type</label>
-                                <select
-                                    className="w-full bg-background border border-white/10 rounded-xl px-4 py-3 text-sm focus:border-accent outline-none"
-                                    value={breachFormData.type}
-                                    onChange={(e) => setBreachFormData({ ...breachFormData, type: e.target.value })}
-                                >
-                                    <option>Unauthorized Person</option>
-                                    <option>Asset Discrepancy</option>
-                                    <option>Digital Intrusion</option>
-                                    <option>Physical Breach</option>
-                                    <option>Bespoke Incident</option>
-                                </select>
-                            </div>
-
-                            <div className="space-y-1.5">
-                                <label className="text-[10px] font-bold text-muted uppercase">Location Coordinates</label>
-                                <div className="relative">
-                                    <MapPin className="absolute left-4 top-1/2 -translate-y-1/2 text-accent" size={16} />
-                                    <input
-                                        type="text"
-                                        className="w-full bg-background border border-white/10 rounded-xl py-3 pl-12 pr-4 text-sm focus:border-accent outline-none"
-                                        value={breachFormData.location}
-                                        onChange={(e) => setBreachFormData({ ...breachFormData, location: e.target.value })}
-                                    />
-                                </div>
-                            </div>
-
-                            <div className="space-y-1.5">
-                                <label className="text-[10px] font-bold text-muted uppercase">Incident Intelligence</label>
-                                <textarea
-                                    rows={4}
-                                    className="w-full bg-background border border-white/10 rounded-xl px-4 py-3 text-sm focus:border-accent outline-none resize-none"
-                                    placeholder="Describe the breach pattern, involved parties, and current status..."
-                                    value={breachFormData.detail}
-                                    onChange={(e) => setBreachFormData({ ...breachFormData, detail: e.target.value })}
-                                />
-                            </div>
-                        </div>
-
-                        <div className="flex gap-3 pt-2">
-                            <button
-                                onClick={() => {
-                                    setBreachFormData({ type: 'Unauthorized Person', location: '', detail: '' });
-                                    setIsSecurityModalOpen(false);
-                                }}
-                                className="flex-1 py-4 bg-white/5 border border-white/10 text-secondary rounded-2xl text-[10px] font-black uppercase tracking-widest hover:bg-white/10 transition-all"
-                            >
-                                Cancel
-                            </button>
-                            <button
-                                onClick={async () => {
-                                    await reportSecurityEvent({ eventType: 'BREACH', location: breachFormData.location, details: `Type: ${breachFormData.type} | Info: ${breachFormData.detail}` });
-                                    setBreachFormData({ type: 'Unauthorized Person', location: '', detail: '' });
-                                    setIsSecurityModalOpen(false);
-                                    swalSuccess('Report Sent', 'Transmitted to Institutional Security. Audit tracking initialized.');
-                                }}
-                                className="flex-1 py-4 bg-accent text-black rounded-2xl text-[10px] font-black uppercase tracking-widest hover:scale-[1.02] active:scale-95 transition-all shadow-xl shadow-accent/20"
-                            >
-                                Submit Report
-                            </button>
-                        </div>
-                    </div>
-                )}
-            </Modal>
 
             {/* Mission Details Modal */}
             <Modal

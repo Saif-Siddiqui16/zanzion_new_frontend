@@ -6006,8 +6006,16 @@ export const GlobalDataProvider = ({ children }) => {
         await api.post(`/missions/${updated.rawId}/pod`, podPayload);
       } else {
         await api.put(`/missions/${updated.rawId}/status`, { status: updated.status });
+        if (updated.status === 'pending' && updated.deliveryId) {
+          try {
+            await api.put(`/deliveries/${updated.deliveryId}`, { status: 'pending', assignedTo: null, driver: null });
+          } catch (_) {}
+        }
       }
 
+      if (typeof fetchMissions === 'function') {
+        await fetchMissions();
+      }
       if (typeof fetchSupportingDocs === 'function') {
         await fetchSupportingDocs();
       }
