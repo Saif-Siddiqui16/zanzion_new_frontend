@@ -90,6 +90,7 @@ const OrderModal = ({ isOpen, onClose, modalType, selectedOrder, onSave, onDelet
     const customerOnlyForDropdown = React.useMemo(() => {
         const list = [];
         const seen = new Set();
+        const seenNameAndEmail = new Set();
 
         // 1. From clients table (Institutional / Corporate Clients)
         (clients || []).forEach((c) => {
@@ -97,8 +98,11 @@ const OrderModal = ({ isOpen, onClose, modalType, selectedOrder, onSave, onDelet
             const name = c.companyName || c.name || c.contactPerson || c.business_name || c.company_name || `Client ${c.id}`;
             const email = c.email || '';
             const key = `client-${c.id}`;
-            if (!seen.has(key)) {
+            const nameEmailKey = `${String(name).trim().toLowerCase()}_&&_${String(email).trim().toLowerCase()}`;
+
+            if (!seen.has(key) && !seenNameAndEmail.has(nameEmailKey)) {
                 seen.add(key);
+                seenNameAndEmail.add(nameEmailKey);
                 list.push({
                     id: `client_${c.id}`,
                     rawId: c.id,
@@ -120,8 +124,12 @@ const OrderModal = ({ isOpen, onClose, modalType, selectedOrder, onSave, onDelet
             const name = u.name || u.fullName || u.email || `User ${u.id}`;
             const email = u.email || '';
             const key = `user-${u.id}`;
-            if (!seen.has(key)) {
+            const nameEmailKey = `${String(name).trim().toLowerCase()}_&&_${String(email).trim().toLowerCase()}`;
+
+            // Must match BOTH name AND email to be considered duplicate
+            if (!seen.has(key) && !seenNameAndEmail.has(nameEmailKey)) {
                 seen.add(key);
+                seenNameAndEmail.add(nameEmailKey);
                 list.push({
                     id: `user_${u.id}`,
                     rawId: u.clientId || u.company_id || u.id,

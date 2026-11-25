@@ -4,7 +4,7 @@ import Table from '../../components/Table';
 import Modal from '../../components/Modal';
 import {
   Plus, Search, Briefcase, Calendar,
-  MapPin, Users, Target, Info, Clock, Rocket, CheckCircle2
+  MapPin, Users, Target, Info, Clock, Rocket, CheckCircle2, Loader2
 } from 'lucide-react';
 import CustomDatePicker from '../../components/CustomDatePicker';
 import Pagination from '../../components/Common/Pagination';
@@ -194,6 +194,8 @@ const Projects = () => {
     }
   };
 
+  const [launchingId, setLaunchingId] = useState(null);
+
   const handleLaunchMission = async (prj) => {
     if (isProjectRouted(prj.id)) {
       swalInfo('Already Routed', 'This project has already been sent to Logistics.');
@@ -201,14 +203,24 @@ const Projects = () => {
     }
     const confirm = await swalConfirm('Launch Mission', `Are you sure you want to initialize a logistics mission for ${prj.name}?`);
     if (confirm) {
-      const missionData = {
-        mission_type: 'Delivery',
-        destination_type: prj.location || 'Client Site',
-        notes: `Logistics deployment for Project ID: ${prj.id}`
-      };
-      await convertProjectToMission(prj.id, missionData);
-      await fetchMissions();
-      swalSuccess('Mission Launched', 'Project has been routed to Logistics/Missions protocol.');
+      setLaunchingId(prj.id);
+      try {
+        const missionData = {
+          mission_type: 'Delivery',
+          destination_type: prj.location || 'Client Site',
+          notes: `Logistics deployment for Project ID: ${prj.id}`
+        };
+        const result = await convertProjectToMission(prj.id, missionData);
+        if (result) {
+          swalSuccess('Mission Launched', 'Project has been routed to Logistics/Missions protocol.');
+        } else {
+          swalError('Failed', 'Failed to convert project to mission.');
+        }
+      } catch (err) {
+        swalError('Error', err.message || 'Error launching mission.');
+      } finally {
+        setLaunchingId(null);
+      }
     }
   };
 
@@ -281,19 +293,23 @@ const Projects = () => {
           canDelete={!isCustomer && hasMenuPermission('Projects', 'can_delete')}
           customAction={(item) => {
             const routed = isProjectRouted(item.id);
+            const isLaunching = launchingId === item.id;
             return (
               <button
+                disabled={isLaunching || routed}
                 onClick={(e) => { e.stopPropagation(); handleLaunchMission(item); }}
                 className={`p-2 rounded-lg transition-colors group relative ${
                   routed
                     ? 'text-success cursor-default'
-                    : 'hover:bg-accent/10 text-accent'
+                    : isLaunching
+                      ? 'opacity-50 cursor-wait text-accent'
+                      : 'hover:bg-accent/10 text-accent'
                 }`}
-                title={routed ? 'Already routed to Logistics' : 'Route to Logistics'}
+                title={routed ? 'Already routed to Logistics' : isLaunching ? 'Routing...' : 'Route to Logistics'}
               >
-                {routed ? <CheckCircle2 size={16} /> : <Rocket size={16} />}
+                {routed ? <CheckCircle2 size={16} /> : isLaunching ? <Loader2 size={16} className="animate-spin" /> : <Rocket size={16} />}
                 <span className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 px-2 py-1 bg-black text-[10px] text-white rounded opacity-0 group-hover:opacity-100 whitespace-nowrap pointer-events-none transition-opacity">
-                  {routed ? '✓ Sent to Logistics' : 'Route to Logistics'}
+                  {routed ? '✓ Sent to Logistics' : isLaunching ? 'Routing to Logistics...' : 'Route to Logistics'}
                 </span>
               </button>
             );

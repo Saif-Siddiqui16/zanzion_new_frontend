@@ -2363,34 +2363,85 @@ export const GlobalDataProvider = ({ children }) => {
 
   const fetchProcurement = React.useCallback(async () => {
     try {
-      const [reqs, quotes, pos] = await Promise.all([
+      const [reqs, quotes, rfqs, pos] = await Promise.all([
         api.get("/purchase-requests").catch((e) => ({ data: [] })),
         api.get("/quotations").catch((e) => ({ data: [] })),
+        api.get("/rfqs").catch((e) => ({ data: [] })),
         api.get("/purchase-orders").catch((e) => ({ data: [] })),
       ]);
       if (reqs.data?.success || Array.isArray(reqs.data?.data) || Array.isArray(reqs.data?.data?.purchaseRequests)) {
         const reqData = Array.isArray(reqs.data?.data) ? reqs.data.data : (reqs.data?.data?.purchaseRequests || []);
         setPurchaseRequests(reqData.map(mapPurchaseRequest));
       }
-      if (quotes.data?.success || Array.isArray(quotes.data?.data) || Array.isArray(quotes.data?.data?.quotations)) {
-        const quoteData = Array.isArray(quotes.data?.data) ? quotes.data.data : (quotes.data?.data?.quotations || []);
-        setQuotes(
-          quoteData.map((q) => {
-            const vName = typeof q.vendor === 'object' && q.vendor !== null
-              ? (q.vendor.companyName || q.vendor.business_name || q.vendor.name || q.vendor.vendor_name || '')
-              : (q.vendor_name || (typeof q.vendorName === 'string' ? q.vendorName : '') || (typeof q.vendor === 'string' ? q.vendor : ''));
-            return {
-              ...q,
-              vendorId: q.vendor_id ?? q.vendorId ?? null,
-              vendor: vName,
-              vendorName: vName,
-              date: q.created_at || q.date,
-              total: parseFloat(q.amount || q.totalAmount || q.total_amount || q.total || 0),
-              validity: q.validity_date || q.validity,
-            };
-          })
-        );
-      }
+      
+      const quoteList = (quotes.data?.success || Array.isArray(quotes.data?.data) || Array.isArray(quotes.data?.data?.quotations))
+        ? (Array.isArray(quotes.data?.data) ? quotes.data.data : (quotes.data?.data?.quotations || []))
+        : [];
+      const rfqList = (rfqs.data?.success || Array.isArray(rfqs.data?.data) || Array.isArray(rfqs.data?.data?.rfqs))
+        ? (Array.isArray(rfqs.data?.data) ? rfqs.data.data : (rfqs.data?.data?.rfqs || []))
+        : [];
+
+      const mappedQuotations = quoteList.map((q) => {
+        const vName = typeof q.vendor === 'object' && q.vendor !== null
+          ? (q.vendor.companyName || q.vendor.business_name || q.vendor.name || q.vendor.vendor_name || '')
+          : (q.vendor_name || (typeof q.vendorName === 'string' ? q.vendorName : '') || (typeof q.vendor === 'string' ? q.vendor : ''));
+        const amountVal = parseFloat(q.amount || q.totalAmount || q.total_amount || q.total || 0);
+        return {
+          ...q,
+          id: q.id,
+          displayId: `QUO-${q.id}`,
+          quote_type: 'client',
+          quoteType: 'client',
+          vendorId: q.vendor_id ?? q.vendorId ?? null,
+          vendor: vName,
+          vendorName: vName,
+          date: q.created_at || q.createdAt || q.date,
+          createdAt: q.created_at || q.createdAt,
+          total: amountVal,
+          totalAmount: amountVal,
+          amount: amountVal,
+          validity: q.validity_date || q.validity,
+          status: q.status || 'Pending',
+        };
+      });
+
+      const mappedRfqs = rfqList.map((r) => {
+        let metaObj = {};
+        if (typeof r.metadata === 'string') {
+          try { metaObj = JSON.parse(r.metadata); } catch (e) {}
+        } else if (r.metadata && typeof r.metadata === 'object') {
+          metaObj = r.metadata;
+        }
+        const items = metaObj.items || [];
+        const computedTotal = items.reduce((acc, it) => acc + (parseFloat(it.price ?? 0) * parseInt(it.qty ?? 1, 10)), 0);
+        const vName = typeof r.vendor === 'object' && r.vendor !== null
+          ? (r.vendor.companyName || r.vendor.business_name || r.vendor.name || '')
+          : (r.vendor_name || (typeof r.vendorName === 'string' ? r.vendorName : '') || (typeof r.vendor === 'string' ? r.vendor : ''));
+        return {
+          ...r,
+          id: r.id,
+          displayId: `RFQ-${r.id}`,
+          rfqNumber: r.rfqNumber || `RFQ-${r.id}`,
+          quote_type: 'vendor_request',
+          quoteType: 'vendor',
+          vendorId: r.vendorId ?? r.vendor_id ?? null,
+          vendor: vName,
+          vendorName: vName,
+          items,
+          metadata: metaObj,
+          total: computedTotal,
+          totalAmount: computedTotal,
+          amount: computedTotal,
+          date: r.created_at || r.createdAt || r.date,
+          createdAt: r.created_at || r.createdAt,
+          validity: metaObj.validity || '',
+          validity_date: metaObj.validity || '',
+          status: r.status || 'Sent',
+        };
+      });
+
+      setQuotes([...mappedQuotations, ...mappedRfqs].sort((a, b) => new Date(b.date || b.createdAt || 0) - new Date(a.date || a.createdAt || 0)));
+
       if (pos.data?.success || Array.isArray(pos.data?.data) || Array.isArray(pos.data?.data?.purchaseOrders)) {
         const poData = Array.isArray(pos.data?.data) ? pos.data.data : (pos.data?.data?.purchaseOrders || []);
         setPurchaseOrders(
@@ -2416,28 +2467,85 @@ export const GlobalDataProvider = ({ children }) => {
 
   const fetchQuotes = React.useCallback(async (params = {}) => {
     try {
-      const res = await api.get("/quotations", { params });
-      if (res.data?.success) {
-        const quoteList = Array.isArray(res.data.data)
-          ? res.data.data
-          : (res.data.data?.quotations || []);
-        setQuotes(
-          quoteList.map((q) => {
-            const vName = typeof q.vendor === 'object' && q.vendor !== null
-              ? (q.vendor.companyName || q.vendor.business_name || q.vendor.name || q.vendor.vendor_name || '')
-              : (q.vendor_name || (typeof q.vendorName === 'string' ? q.vendorName : '') || (typeof q.vendor === 'string' ? q.vendor : ''));
-            return {
-              ...q,
-              vendorId: q.vendor_id ?? q.vendorId ?? null,
-              vendor: vName,
-              vendorName: vName,
-              date: q.created_at || q.createdAt || q.date,
-              total: parseFloat(q.amount || q.total_amount || q.total || 0),
-              validity: q.validity_date || q.validity,
-            };
-          }),
-        );
+      const [quoteRes, rfqRes] = await Promise.all([
+        api.get("/quotations", { params }).catch(() => ({ data: { data: [] } })),
+        api.get("/rfqs", { params }).catch(() => ({ data: { data: [] } })),
+      ]);
+
+      let quoteList = [];
+      if (quoteRes.data?.success || Array.isArray(quoteRes.data?.data) || Array.isArray(quoteRes.data?.data?.quotations)) {
+        quoteList = Array.isArray(quoteRes.data?.data)
+          ? quoteRes.data.data
+          : (quoteRes.data.data?.quotations || []);
       }
+
+      let rfqList = [];
+      if (rfqRes.data?.success || Array.isArray(rfqRes.data?.data) || Array.isArray(rfqRes.data?.data?.rfqs)) {
+        rfqList = Array.isArray(rfqRes.data?.data)
+          ? rfqRes.data.data
+          : (rfqRes.data.data?.rfqs || []);
+      }
+
+      const mappedQuotations = quoteList.map((q) => {
+        const vName = typeof q.vendor === 'object' && q.vendor !== null
+          ? (q.vendor.companyName || q.vendor.business_name || q.vendor.name || q.vendor.vendor_name || '')
+          : (q.vendor_name || (typeof q.vendorName === 'string' ? q.vendorName : '') || (typeof q.vendor === 'string' ? q.vendor : ''));
+        const amountVal = parseFloat(q.amount || q.total_amount || q.total || 0);
+        return {
+          ...q,
+          id: q.id,
+          displayId: `QUO-${q.id}`,
+          quote_type: 'client',
+          quoteType: 'client',
+          vendorId: q.vendor_id ?? q.vendorId ?? null,
+          vendor: vName,
+          vendorName: vName,
+          date: q.created_at || q.createdAt || q.date,
+          createdAt: q.created_at || q.createdAt,
+          total: amountVal,
+          totalAmount: amountVal,
+          amount: amountVal,
+          validity: q.validity_date || q.validity,
+          status: q.status || 'Pending',
+        };
+      });
+
+      const mappedRfqs = rfqList.map((r) => {
+        let metaObj = {};
+        if (typeof r.metadata === 'string') {
+          try { metaObj = JSON.parse(r.metadata); } catch (e) {}
+        } else if (r.metadata && typeof r.metadata === 'object') {
+          metaObj = r.metadata;
+        }
+        const items = metaObj.items || [];
+        const computedTotal = items.reduce((acc, it) => acc + (parseFloat(it.price ?? 0) * parseInt(it.qty ?? 1, 10)), 0);
+        const vName = typeof r.vendor === 'object' && r.vendor !== null
+          ? (r.vendor.companyName || r.vendor.business_name || r.vendor.name || '')
+          : (r.vendor_name || (typeof r.vendorName === 'string' ? r.vendorName : '') || (typeof r.vendor === 'string' ? r.vendor : ''));
+        return {
+          ...r,
+          id: r.id,
+          displayId: `RFQ-${r.id}`,
+          rfqNumber: r.rfqNumber || `RFQ-${r.id}`,
+          quote_type: 'vendor_request',
+          quoteType: 'vendor',
+          vendorId: r.vendorId ?? r.vendor_id ?? null,
+          vendor: vName,
+          vendorName: vName,
+          items,
+          metadata: metaObj,
+          total: computedTotal,
+          totalAmount: computedTotal,
+          amount: computedTotal,
+          date: r.created_at || r.createdAt || r.date,
+          createdAt: r.created_at || r.createdAt,
+          validity: metaObj.validity || '',
+          validity_date: metaObj.validity || '',
+          status: r.status || 'Sent',
+        };
+      });
+
+      setQuotes([...mappedQuotations, ...mappedRfqs].sort((a, b) => new Date(b.date || b.createdAt || 0) - new Date(a.date || a.createdAt || 0)));
     } catch (e) {
       console.error("Fetch quotes failed", e);
     }
@@ -4298,13 +4406,19 @@ export const GlobalDataProvider = ({ children }) => {
       if (res.data?.success) {
         const prj = (projects || []).find(p => String(p.id) === String(projectId));
         const orderRef = prj?.orderRef || prj?.order_ref || prj?.orderId || prj?.order_id;
-        if (orderRef) {
-          try { await api.put(`/orders/${orderRef}/status`, { status: 'logistics' }); } catch (_) { }
-        }
-        await fetchProjects();
-        await fetchMissions();
-        await fetchOrders();
-        window.dispatchEvent(new CustomEvent('app:state-changed'));
+        
+        // Execute background sync in parallel without blocking the response
+        Promise.all([
+          orderRef ? api.put(`/orders/${orderRef}/status`, { status: 'logistics' }).catch(() => {}) : Promise.resolve(),
+          fetchProjects(),
+          fetchMissions(),
+          fetchOrders()
+        ]).then(() => {
+          window.dispatchEvent(new CustomEvent('app:state-changed'));
+        }).catch(err => {
+          console.warn("Background sync warning:", err);
+        });
+
         addLog({
           action: "Mission Launched",
           detail: `Project ${projectId} converted to Mission ${res.data.data.id}.`,

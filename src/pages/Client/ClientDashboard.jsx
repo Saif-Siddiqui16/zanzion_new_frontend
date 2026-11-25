@@ -458,7 +458,9 @@ const ClientDashboard = () => {
                         <Tag size={16} />
                       </div>
                       <div>
-                        <p className="text-sm font-black text-white italic group-hover:text-purple-400 transition-colors">QT-{q.id}</p>
+                        <p className="text-sm font-black text-white italic group-hover:text-purple-400 transition-colors">
+                          {q.displayId || q.rfqNumber || (String(q.id).startsWith('RFQ-') || String(q.id).startsWith('QUO-') || String(q.id).startsWith('QT-') ? q.id : `QT-${q.id}`)}
+                        </p>
                         <p className="text-[10px] text-muted font-black uppercase tracking-widest">{getEntityName(q.vendor) || getEntityName(q.vendorName) || getEntityName(q.client) || 'Quote'} • {q.date || q.createdAt?.slice(0, 10)}</p>
                       </div>
                     </div>
