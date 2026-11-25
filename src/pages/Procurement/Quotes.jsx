@@ -135,7 +135,7 @@ const Quotes = () => {
       id: `QUO-${q.id}`,
       quote_type: 'client',
       vendor_id: q.vendorId,
-      purchaseRequestId: q.rfq?.purchaseRequestId || q.purchaseRequestId,
+      purchaseRequestId: q.rfq?.purchaseRequestId || q.purchaseRequestId || metaObj.purchaseRequestId,
       total_amount: q.amount,
       metadata: metaObj,
       items: resolvedItems,
@@ -367,7 +367,15 @@ const Quotes = () => {
           }
           await updateQuoteMutation.mutateAsync({
             id: parseInt(rawId, 10),
-            data: { status: targetStatus }
+            data: {
+              status: targetStatus,
+              amount: total,
+              remarks: JSON.stringify(items),
+              items: items,
+              leadTime: formData.leadTime,
+              validity: formData.validity,
+              paymentTerms: formData.paymentTerms
+            }
           });
           console.log('[REAL_API_SUCCESS] Quotation Updated');
         }
