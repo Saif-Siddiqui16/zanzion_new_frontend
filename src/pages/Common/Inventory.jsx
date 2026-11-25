@@ -759,19 +759,29 @@ const Inventory = () => {
           await realApi.post('/inventory/loss', apiPayload);
           console.log('[REAL_API_SUCCESS] Strategic Loss Assessment recorded successfully');
 
+          // Close modal immediately and stop saving state so UI never hangs on 'Saving...'
+          setIsModalOpen(false);
+          setIsSaving(false);
+
           // Invalidate queries so that the items inventory list, stock levels, and capacity widgets update automatically
           await queryClient.invalidateQueries({ queryKey: ['items'] });
           await queryClient.invalidateQueries({ queryKey: ['stock'] });
           await queryClient.invalidateQueries({ queryKey: ['movements'] });
+          await queryClient.refetchQueries({ queryKey: ['items'] });
+          if (fetchInventory) await fetchInventory();
 
           // Refresh the Dashboard stats to ensure Requirement 9 is met ("Ensure all inventory dashboard widgets refresh immediately after recording a loss")
           try {
-            await fetchDashboardStats();
-            await fetchStockMovements();
-            await fetchLossAssessments();
+            await Promise.allSettled([
+              fetchDashboardStats(),
+              fetchStockMovements(),
+              fetchLossAssessments()
+            ]);
           } catch (e) {
             console.warn('Dashboard stats refresh failed', e);
           }
+
+          window.dispatchEvent(new CustomEvent('app:state-changed'));
 
           // Show Requirement 8 success notification: "Show a success notification indicating the quantity deducted and the remaining available stock"
           const remainingStock = itemObj.qty - lossQty;
@@ -779,10 +789,9 @@ const Inventory = () => {
             'Asset Loss Recorded',
             `Deducted ${lossQty} unit(s) of "${itemObj.name}". Remaining stock available is now ${remainingStock}.`
           );
-
-          setIsModalOpen(false);
         } catch (e) {
           console.error('[REAL_API_FAILED] Record loss failed', e);
+          setIsSaving(false);
           swalError('Failed to Record Loss', e.response?.data?.message || 'Could not record strategic asset loss.');
         }
       } else if (modalType === 'edit') {
