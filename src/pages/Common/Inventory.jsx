@@ -9,7 +9,7 @@ import { Package, AlertTriangle, ArrowUp, Plus, MapPin, Box, Warehouse, Clipboar
 import CustomDatePicker from '../../components/CustomDatePicker';
 import Pagination from '../../components/Common/Pagination';
 import StatusBadge from '../../components/StatusBadge';
-import { CLIENTS as CLIENTS_SEED, marketplaceCategorySelectOptions, normalizeToMarketplaceCategory, canonicalMarketplaceCategory, DEFAULT_MARKETPLACE_TEST_ITEMS } from '../../utils/data';
+import { marketplaceCategorySelectOptions, normalizeToMarketplaceCategory, canonicalMarketplaceCategory, DEFAULT_MARKETPLACE_TEST_ITEMS } from '../../utils/data';
 import { useLocation } from 'react-router-dom';
 import { toAbsoluteImageUrl } from '../../utils/apiHelpers.js';
 import { normalizeRole, roleCanManageInventoryVendorsWarehouses } from '../../utils/authUtils';
@@ -110,23 +110,12 @@ const Inventory = () => {
   const [page, setPage] = useState(1);
   const [searchTerm, setSearchTerm] = useState('');
 
-  /** API clients + seed clients so "Client owner" dropdown always has options. */
+  /** Only use real workspace clients belonging to this tenant */
   const clientListForSelect = useMemo(() => {
     const fromProps = Array.isArray(clients) && clients.length > 0 ? clients : [];
     const seen = new Set();
     const merged = [];
     for (const c of fromProps) {
-      const id = c.id ?? c.client_id ?? c.clientId;
-      if (id != null && !seen.has(String(id))) {
-        seen.add(String(id));
-        merged.push({
-          ...c,
-          id,
-          companyName: c.companyName || c.business_name || c.name || `Client #${id}`,
-        });
-      }
-    }
-    for (const c of CLIENTS_SEED) {
       const id = c.id ?? c.client_id ?? c.clientId;
       if (id != null && !seen.has(String(id))) {
         seen.add(String(id));
