@@ -899,17 +899,44 @@ const EmployeePortal = () => {
         }
     };
 
-    const completedTodayCount = myAssignments.filter(a => {
-        if (a.status !== 'Completed') return false;
-        const date = new Date(a.updatedAt || a.date);
+    const completedTodayCount = (staffAssignments || []).filter(a => {
+        const cId = String(currentUser?.id || '');
+        const cEmpId = String(currentUser?.employeeId || currentUser?.employee_id || '');
+        const asgId = String(a.assigneeId || '');
+        const asgEmpId = String(a.employeeId || '');
+        const matchId = (asgId && (asgId === cId || asgId === cEmpId)) || (asgEmpId && (asgEmpId === cId || asgEmpId === cEmpId));
+
+        const cNames = [
+            currentUser?.name,
+            currentUser?.fullName,
+            currentUser?.full_name,
+            currentUser?.username,
+            currentUser?.email
+        ].filter(Boolean).map(n => String(n).trim().toLowerCase());
+
+        const asgName = String(a.assignee || '').trim().toLowerCase();
+        const matchName = asgName && cNames.some(cn => cn === asgName || asgName.includes(cn) || cn.includes(asgName));
+
+        if (!matchId && !matchName) return false;
+
+        const st = String(a.status || '').toLowerCase().trim();
+        if (st !== 'completed' && st !== 'delivered') return false;
+
+        const rawDate = a.updatedAt || a.date || a.endDate || a.createdAt;
+        if (!rawDate) return true;
+        const d = new Date(rawDate);
+        if (isNaN(d.getTime())) return true;
         const today = new Date();
-        return date.toDateString() === today.toDateString();
+        return d.toDateString() === today.toDateString();
     }).length;
 
     const dashboardStats = [
         { 
             label: "Remaining Tasks", 
-            value: myAssignments.filter(a => !['Completed', 'Cancelled'].includes(a.status)).length.toString(), 
+            value: myAssignments.filter(a => {
+                const s = String(a.status || '').toLowerCase().trim();
+                return !['completed', 'cancelled', 'delivered', 'pending', 'declined', 'rejected'].includes(s);
+            }).length.toString(), 
             icon: ClipboardList, 
             color: "text-accent" 
         },

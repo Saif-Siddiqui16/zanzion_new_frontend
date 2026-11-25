@@ -2927,7 +2927,9 @@ export const GlobalDataProvider = ({ children }) => {
           assigneeId: m.assignee?.userId || m.assignedEmployeeId,
           employeeId: m.assignedEmployeeId,
           priority: m.metadata?.priority || 'Normal',
-          status: m.status
+          status: m.status,
+          updatedAt: m.updatedAt || m.endDate || m.startDate || m.createdAt,
+          date: m.updatedAt || m.endDate || m.createdAt
         }));
         setStaffAssignments(mapped);
       } else if (Array.isArray(assignments.data)) {
