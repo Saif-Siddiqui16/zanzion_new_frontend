@@ -122,6 +122,7 @@ const Inventory = () => {
         merged.push({
           ...c,
           id,
+          userName: c.contactPerson || c.contact_person || c.name || c.contact || c.companyName || `User #${id}`,
           companyName: c.companyName || c.business_name || c.name || `Client #${id}`,
         });
       }
@@ -461,12 +462,13 @@ const Inventory = () => {
       const wh = warehouses.find(w => w.name === whName);
       const matchedClient = clientListForSelect.find((c) =>
         String(c.id) === String(item?.clientId || item?.client_id || '') ||
+        String(c.contactPerson || c.userName || c.name || '').toLowerCase() === String(item?.client || '').toLowerCase() ||
         String(c.companyName || c.business_name || c.name || '').toLowerCase() === String(item?.client || '').toLowerCase()
       );
       setFormData({
         item: item?.name || '',
         qty: item?.qty || '',
-        client: matchedClient?.companyName || matchedClient?.business_name || matchedClient?.name || item?.client || '',
+        client: matchedClient?.contactPerson || matchedClient?.userName || matchedClient?.name || matchedClient?.companyName || item?.client || '',
         clientId: matchedClient?.id || item?.clientId || item?.client_id || '',
         warehouse: whName,
         warehouseId: wh ? wh.id : (item?.warehouse_id || null),
@@ -2151,14 +2153,14 @@ Artisan Italian Espresso Beans,Maxwell's Supermarket,Pantry,12.50,30,bags,MX-COF
                     setFormData({
                       ...formData,
                       clientId: selectedId,
-                      client: selected ? (selected.companyName || selected.business_name || selected.name || '') : '',
+                      client: selected ? (selected.contactPerson || selected.userName || selected.name || selected.companyName || '') : '',
                     });
                   }}
                   className="w-full bg-background border border-white/10 rounded-lg px-4 py-2 text-sm focus:border-accent outline-none font-bold text-white"
                 >
                   <option value="">Select customer...</option>
                   {clientListForSelect.map((c) => {
-                    const label = c.companyName || c.business_name || c.name;
+                    const label = c.contactPerson || c.userName || c.name || c.contact || c.contact_person || c.companyName || c.business_name || `User #${c.id}`;
                     return <option key={String(c.id)} value={c.id}>{label}</option>;
                   })}
                 </select>
