@@ -918,27 +918,33 @@ const Deliveries = () => {
         deliveryFee: finalData.delivery_fee ? Number(finalData.delivery_fee) : undefined,
         assignedTo: finalData.assigned_driver ? Number(finalData.assigned_driver) : undefined
       })
-        .then(async (res) => {
+        .then((res) => {
+          swalClose();
+          swalSuccess("Mission Dispatched", "Order has been dispatched and mission deployed successfully.");
+
           const createdDel = res?.data || res;
+          const bgTasks = [];
           if (finalData.assigned_driver && createdDel?.id) {
-            try {
-              await createMissionMutation.mutateAsync({
+            bgTasks.push(
+              createMissionMutation.mutateAsync({
                 deliveryId: createdDel.id,
                 assignedEmployeeId: finalData.assigned_driver,
                 vehicleId: 1
-              });
-            } catch (_) {}
+              }).catch(() => {})
+            );
           }
           if (resolvedOrderId) {
             const cleanOrderId = String(resolvedOrderId).replace(/^#|^ORD-/i, '');
-            try {
-              await api.put(`/orders/${cleanOrderId}/status`, { status: finalData.assigned_driver ? 'assigned' : 'logistics' });
-            } catch (_) {}
+            bgTasks.push(
+              api.put(`/orders/${cleanOrderId}/status`, { status: finalData.assigned_driver ? 'assigned' : 'logistics' }).catch(() => {})
+            );
           }
-          if (refetchDeliveries) await refetchDeliveries();
-          notifyStateChanged(queryClient, ['deliveries', 'orders', 'missions', 'dashboardStats']);
-          swalClose();
-          swalSuccess("Mission Dispatched", "Order has been dispatched and mission deployed successfully.");
+          if (refetchDeliveries) {
+            bgTasks.push(refetchDeliveries().catch(() => {}));
+          }
+          Promise.all(bgTasks).finally(() => {
+            notifyStateChanged(queryClient, ['deliveries', 'orders', 'missions', 'dashboardStats']);
+          });
         })
         .catch((err) => {
           swalClose();
@@ -1063,11 +1069,11 @@ const Deliveries = () => {
               remarks: resolvedNotes || ""
             }
           }).catch((err) => { console.error("POD Error", err); throw err; }) : Promise.resolve()
-        ]).then(async () => {
-          if (refetchDeliveries) await refetchDeliveries();
-          notifyStateChanged(queryClient, ['deliveries', 'orders', 'missions', 'chauffeurMissions', 'dashboardStats']);
+        ]).then(() => {
           swalClose();
           swalSuccess("Mission Delivered", "POD submitted and order marked as Delivered successfully.");
+          if (refetchDeliveries) refetchDeliveries().catch(() => {});
+          notifyStateChanged(queryClient, ['deliveries', 'orders', 'missions', 'chauffeurMissions', 'dashboardStats']);
         }).catch((err) => {
           swalClose();
           swalError('Submission Failed', 'Failed to submit POD: ' + (err?.response?.data?.message || err.message));
@@ -1093,21 +1099,27 @@ const Deliveries = () => {
         // Standard update of form fields
         const targetDelId = finalData.db_id || finalData.id;
         updateDeliveryMutation.mutateAsync({ id: targetDelId, data: updatePayload })
-          .then(async () => {
-            // If driver is assigned, create mission
+          .then(() => {
+            swalClose();
+            swalSuccess("Protocol Updated", "Delivery protocol and driver assignment updated successfully.");
+
+            const bgTasks = [];
+            // If driver is assigned, create/sync mission in the background
             if (finalData.assigned_driver) {
-              try {
-                await createMissionMutation.mutateAsync({
+              bgTasks.push(
+                createMissionMutation.mutateAsync({
                   deliveryId: targetDelId,
                   assignedEmployeeId: finalData.assigned_driver,
                   vehicleId: 1
-                });
-              } catch (_) {}
+                }).catch(() => {})
+              );
             }
-            if (refetchDeliveries) await refetchDeliveries();
-            notifyStateChanged(queryClient, ['deliveries', 'orders', 'missions', 'dashboardStats']);
-            swalClose();
-            swalSuccess("Protocol Updated", "Delivery protocol and driver assignment updated successfully.");
+            if (refetchDeliveries) {
+              bgTasks.push(refetchDeliveries().catch(() => {}));
+            }
+            Promise.all(bgTasks).finally(() => {
+              notifyStateChanged(queryClient, ['deliveries', 'orders', 'missions', 'dashboardStats']);
+            });
           })
           .catch((err) => {
             swalClose();
@@ -1120,11 +1132,11 @@ const Deliveries = () => {
       setIsModalOpen(false);
 
       deleteDeliveryMutation.mutateAsync(selectedDelivery.id)
-        .then(async () => {
-          if (refetchDeliveries) await refetchDeliveries();
-          notifyStateChanged(queryClient, ['deliveries', 'orders', 'missions', 'dashboardStats']);
+        .then(() => {
           swalClose();
           swalSuccess("Success", "Delivery deleted successfully.");
+          if (refetchDeliveries) refetchDeliveries().catch(() => {});
+          notifyStateChanged(queryClient, ['deliveries', 'orders', 'missions', 'dashboardStats']);
         })
         .catch((err) => {
           swalClose();

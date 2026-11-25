@@ -108,6 +108,16 @@ const ClientStore = () => {
     const handleAddItemToOrder = (item, group, openDrawer = false) => {
         const itemId = item?.itemId ?? item?.item_id ?? item?.id ?? item?._id;
         if (itemId == null) return;
+        const availableStock = Number(item?.qty ?? item?.quantity ?? 0);
+        if (availableStock <= 0) {
+            swalWarning('Out of Stock', `"${item.name || 'Item'}" is currently out of stock and cannot be added to the order.`);
+            return;
+        }
+        const existingInCart = cart.find(i => String(i.id ?? i.itemId ?? i._id ?? i.item_id) === String(itemId));
+        if (existingInCart && Number(existingInCart.qty || 1) >= availableStock) {
+            swalWarning('Stock Limit Reached', `Only ${availableStock} unit(s) of "${item.name}" available in stock.`);
+            return;
+        }
         const itemPayload = {
             ...item,
             id: itemId,
@@ -564,6 +574,23 @@ const ClientStore = () => {
 
         const isBespoke = activeTab === 'sheet';
 
+        if (!isBespoke) {
+            for (const cartLine of items) {
+                const invMatch = (inventory || []).find(i => String(i.id ?? i.itemId) === String(cartLine.id ?? cartLine.itemId));
+                if (invMatch) {
+                    const avail = Number(invMatch.qty ?? invMatch.quantity ?? 0);
+                    if (avail <= 0) {
+                        swalWarning('Item Out of Stock', `"${cartLine.name}" is currently out of stock. Please remove it from your order before confirming.`);
+                        return;
+                    }
+                    if (Number(cartLine.quantity || 1) > avail) {
+                        swalWarning('Insufficient Stock', `"${cartLine.name}" only has ${avail} unit(s) available in stock.`);
+                        return;
+                    }
+                }
+            }
+        }
+
         if (isBespoke && isRetailPersonal && !customRequestSubtype) {
             swalWarning('Request type', 'Select document or package logistics for your custom request.');
             return;
@@ -880,16 +907,25 @@ const ClientStore = () => {
                                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6 sm:gap-8">
                                     {group.items.map((item) => {
                                         const itmId = item?.id ?? item?.itemId ?? item?._id ?? item?.item_id;
+                                        const availableStock = Number(item?.qty ?? item?.quantity ?? 0);
+                                        const isOutOfStock = availableStock <= 0;
                                         const cartItem = cart.find(i =>
                                             String(i.id ?? i.itemId ?? i._id ?? i.item_id) === String(itmId)
                                         );
                                         return (
                                             <div
                                                 key={itmId}
-                                                className={`bg-white/[0.02] border ${cartItem ? 'border-accent/40 bg-accent/[0.02]' : 'border-white/5'} rounded-[2.5rem] overflow-hidden group hover:border-accent/30 transition-all duration-500 shadow-2xl flex flex-col`}
+                                                className={`bg-white/[0.02] border ${cartItem ? 'border-accent/40 bg-accent/[0.02]' : isOutOfStock ? 'border-red-500/20 opacity-80' : 'border-white/5'} rounded-[2.5rem] overflow-hidden group hover:border-accent/30 transition-all duration-500 shadow-2xl flex flex-col relative`}
                                             >
                                                 <div className="aspect-square bg-white/5 border-b border-white/5 flex items-center justify-center relative overflow-hidden">
-                                                    <ProductImage src={item.image || item.image_url || item.imageUrl} alt={item.name} iconSize={64} className="w-full h-full object-cover group-hover:scale-110 transition-all duration-700" />
+                                                    <ProductImage src={item.image || item.image_url || item.imageUrl} alt={item.name} iconSize={64} className={`w-full h-full object-cover group-hover:scale-110 transition-all duration-700 ${isOutOfStock ? 'grayscale contrast-125' : ''}`} />
+                                                    {isOutOfStock && (
+                                                        <div className="absolute inset-0 bg-black/60 backdrop-blur-[2px] flex items-center justify-center z-20">
+                                                            <span className="px-4 py-1.5 bg-red-600/90 text-white border border-red-500/50 rounded-xl text-[10px] font-black uppercase tracking-widest shadow-2xl">
+                                                                Out of Stock
+                                                            </span>
+                                                        </div>
+                                                    )}
                                                     <div className="absolute top-6 right-6 px-4 py-2 bg-background/90 backdrop-blur-md border border-accent/20 rounded-2xl text-sm font-black text-accent shadow-2xl z-10">
                                                         ${parseFloat(item.price).toLocaleString()}
                                                     </div>
@@ -944,7 +980,15 @@ const ClientStore = () => {
                                                         )}
                                                     </div>
 
-                                                    {cartItem ? (
+                                                    {isOutOfStock ? (
+                                                        <button
+                                                            type="button"
+                                                            disabled
+                                                            className="w-full mt-6 py-4 rounded-2xl text-[10px] font-black uppercase tracking-[0.25em] bg-red-500/10 border border-red-500/20 text-red-400 cursor-not-allowed opacity-60 flex items-center justify-center gap-2"
+                                                        >
+                                                            <X size={14} /> Out of Stock
+                                                        </button>
+                                                    ) : cartItem ? (
                                                         <div className="w-full mt-6 flex items-center justify-between bg-accent/15 border border-accent/40 rounded-2xl p-1 shadow-lg shadow-black/20">
                                                             <button
                                                                 type="button"

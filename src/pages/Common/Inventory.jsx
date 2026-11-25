@@ -199,15 +199,23 @@ const Inventory = () => {
   const realInventory = combinedItems.map(i => {
     let totalQty = 0;
     let mainLoc = '';
+    let physicalQty = 0;
+    let reservedQty = 0;
     if (i.inventoryStock && Array.isArray(i.inventoryStock) && i.inventoryStock.length > 0) {
-      totalQty = i.inventoryStock.reduce((sum, stock) => sum + (stock.quantity || 0), 0);
+      physicalQty = i.inventoryStock.reduce((sum, stock) => sum + (stock.quantity || 0), 0);
+      reservedQty = i.inventoryStock.reduce((sum, stock) => sum + (stock.reservedQuantity || 0), 0);
+      totalQty = Math.max(0, physicalQty - reservedQty);
       mainLoc = i.inventoryStock[0].warehouseId;
     } else {
       totalQty = i.qty ?? i.quantity ?? i.total_quantity ?? 0;
+      physicalQty = totalQty;
     }
     return {
       ...i,
       qty: totalQty,
+      quantity: totalQty,
+      physicalQty,
+      reservedQty,
       price: i.price ?? i.unit_price ?? i.unitPrice ?? 0,
       location: (warehouses.find(w => String(w.id) === String(mainLoc))?.name) || mainLoc || i.warehouse_name || i.warehouseId || i.location || 'General Storage',
       inventoryType: i.clientId ? 'Client' : 'Marketplace',

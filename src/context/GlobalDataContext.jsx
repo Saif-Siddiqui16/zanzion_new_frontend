@@ -10,7 +10,7 @@ import {
   vendorVisibleInSharedLists,
   menuPathGrantsAccess,
 } from "../utils/authUtils";
-import { swalInfo, swalSuccess, swalError } from "../utils/swal";
+import { swalInfo, swalSuccess, swalError, swalWarning } from "../utils/swal";
 import {
   isoDateSlice,
   localDateISO,
@@ -1310,12 +1310,24 @@ export const GlobalDataProvider = ({ children }) => {
     const itemId = item.id ?? item.itemId ?? item._id ?? item.item_id;
     if (itemId == null) return;
     const idStr = String(itemId);
+    const invMatch = (inventory || []).find(
+      (i) => String(i.id ?? i.itemId ?? i._id ?? i.item_id) === idStr
+    );
+    const availableStock = invMatch ? Number(invMatch.qty ?? invMatch.quantity ?? 0) : Number(item.qty ?? item.quantity ?? 9999);
+    if (availableStock <= 0) {
+      swalWarning('Out of Stock', `"${item.name || 'Item'}" is currently out of stock.`);
+      return;
+    }
     setCart((prev) => {
       const existing = prev.find(
         (i) =>
           String(i.id ?? i.itemId ?? i._id ?? i.item_id) === idStr,
       );
       if (existing) {
+        if (Number(existing.qty || 1) >= availableStock) {
+          swalWarning('Stock Limit Reached', `Only ${availableStock} unit(s) of "${item.name || 'this item'}" available in stock.`);
+          return prev;
+        }
         return prev.map((i) =>
           String(i.id ?? i.itemId ?? i._id ?? i.item_id) === idStr
             ? { ...i, qty: Number(i.qty || 1) + 1 }
@@ -1536,8 +1548,12 @@ export const GlobalDataProvider = ({ children }) => {
     if (itemsArr.length > 0) {
       inventoryData = itemsArr.map((i) => {
         let totalQty = i.qty ?? i.quantity ?? 0;
+        let physicalQty = totalQty;
+        let reservedQty = 0;
         if (i.inventoryStock && Array.isArray(i.inventoryStock) && i.inventoryStock.length > 0) {
-          totalQty = i.inventoryStock.reduce((sum, stock) => sum + (stock.quantity || 0), 0);
+          physicalQty = i.inventoryStock.reduce((sum, stock) => sum + (stock.quantity || 0), 0);
+          reservedQty = i.inventoryStock.reduce((sum, stock) => sum + (stock.reservedQuantity || 0), 0);
+          totalQty = Math.max(0, physicalQty - reservedQty);
         }
         return {
           ...i,
@@ -1546,6 +1562,8 @@ export const GlobalDataProvider = ({ children }) => {
           image: inventoryImageFromApiRow(i) || "",
           qty: totalQty,
           quantity: totalQty,
+          physicalQty,
+          reservedQty,
           location: i.location || i.warehouse_name || (i.inventoryStock?.[0]?.warehouseId ? `Warehouse ${i.inventoryStock[0].warehouseId}` : "General Storage"),
           inventoryType: i.inventoryType === 'MARKETPLACE' ? 'Marketplace' : (i.inventoryType || (i.clientId ? "Client" : "Marketplace")),
           clientId: i.clientId || i.client_id || null,
