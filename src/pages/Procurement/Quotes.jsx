@@ -151,12 +151,6 @@ const Quotes = () => {
 
   const combinedQuotes = [...mergedRfqs, ...mergedQuotations].sort((a, b) => new Date(b.date || b.created_at || 0) - new Date(a.date || a.created_at || 0));
 
-  const quotes = combinedQuotes;
-  const isLoading = isLoadingQuotes || isLoadingRfqs;
-  const error = errorQuotes;
-
-  const meta = quotesData?.meta || { totalPages: 1, totalItems: combinedQuotes.length };
-
   const portalRole = normalizeRole(currentUser?.role);
   const rawRoleStr = typeof currentUser?.role === 'object' ? (currentUser?.role?.name || '') : String(currentUser?.role || '');
   const normalizeId = (id) => id ? String(id).replace('CLT-', '') : '';
@@ -165,10 +159,31 @@ const Quotes = () => {
     const uId = normalizeId(currentUser?.clientId || currentUser?.companyId || currentUser?.company_id);
     return cId && uId && cId === uId;
   });
-  const isBusinessClient = portalRole === 'client' || portalRole === 'saas_client';
+  const isSaaSAdmin = portalRole === 'saas_client' || rawRoleStr.toLowerCase().includes('saas');
+  const isHQAdmin = ['superadmin', 'admin', 'operations', 'procurement', 'logistics', 'inventory', 'concierge'].includes(portalRole);
+  const isEndClient = ['client', 'customer'].includes(portalRole) && !isSaaSAdmin && !isHQAdmin;
+  const isBusinessClient = portalRole === 'client';
 
   const userRole = String(currentUser?.role?.name || currentUser?.role || '').toLowerCase().replace(/\s+/g, '_');
-  const isCustomer = ['customer', 'saas_client', 'client'].includes(userRole) && !isBusinessClient;
+  const isCustomer = ['customer', 'client'].includes(userRole) && !isBusinessClient && !isSaaSAdmin;
+
+  const quotes = React.useMemo(() => {
+    if (!isEndClient) return combinedQuotes;
+    const myClientId = normalizeId(currentClient?.id || currentUser?.clientId || currentUser?.companyId || currentUser?.company_id);
+    const myUserId = String(currentUser?.id || '');
+    return combinedQuotes.filter(q => {
+      const qClientId = normalizeId(q.clientId || q.metadata?.clientId);
+      const qUserId = String(q.userId || q.metadata?.userId || '');
+      if (myClientId && qClientId && myClientId === qClientId) return true;
+      if (myUserId && qUserId && myUserId === qUserId) return true;
+      return false;
+    });
+  }, [combinedQuotes, isEndClient, currentClient, currentUser]);
+
+  const isLoading = isLoadingQuotes || isLoadingRfqs;
+  const error = errorQuotes;
+
+  const meta = quotesData?.meta || { totalPages: 1, totalItems: quotes.length };
 
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [modalType, setModalType] = useState('view');
@@ -297,6 +312,8 @@ const Quotes = () => {
 
     try {
       if (modalType === 'add') {
+        const resolvedClientId = currentClient?.id || currentUser?.clientId || currentUser?.companyId || currentUser?.company_id || undefined;
+        const resolvedClientName = currentClient?.companyName || currentUser?.name || undefined;
         if (isRfq) {
           // Send to API
           await createRfqMutation.mutateAsync({
@@ -306,7 +323,9 @@ const Quotes = () => {
               items: items,
               leadTime: formData.leadTime,
               validity: formData.validity,
-              paymentTerms: formData.paymentTerms
+              paymentTerms: formData.paymentTerms,
+              clientId: resolvedClientId,
+              clientName: resolvedClientName,
             }
           });
           console.log('[REAL_API_SUCCESS] RFQ Created');
@@ -319,7 +338,9 @@ const Quotes = () => {
             leadTime: formData.leadTime,
             validity: formData.validity,
             paymentTerms: formData.paymentTerms,
-            items: items
+            items: items,
+            clientId: resolvedClientId,
+            clientName: resolvedClientName,
           });
           console.log('[REAL_API_SUCCESS] Quotation Created');
         }
