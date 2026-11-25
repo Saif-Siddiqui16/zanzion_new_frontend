@@ -17,6 +17,7 @@ import { useNavigate } from 'react-router-dom';
 import { useData } from '../../context/GlobalDataContext';
 import { useUpdateOrder, useCreateOrder } from '../../hooks/api/useOrders';
 import { compareOrdersNewestFirst } from '../../utils/apiHelpers';
+import { normalizeRole } from '../../utils/authUtils';
 
 const StatCard = ({ label, value, icon: Icon, color = 'text-accent', bg = 'bg-accent/10', onClick }) => (
   <motion.div
@@ -173,11 +174,24 @@ const ClientDashboard = () => {
     return false;
   };
 
-  const clientOrders = (orders || []).filter(isMyOrder).sort(compareOrdersNewestFirst);
-  const clientInvoices = (invoices || []).filter(inv =>
-    inv.clientId === clientData.id || inv.company_id === clientData.id || inv.client === clientData.name ||
-    (inv.userId && String(inv.userId) === String(currentUser?.id))
-  );
+  const portalRole = normalizeRole(currentUser?.role);
+  const isSaaSClient = portalRole === 'saas_client' || String(currentUser?.role || '').toLowerCase().includes('saas');
+
+  const clientOrders = (isSaaSClient
+    ? (orders || []).filter(o => {
+        if (!o) return false;
+        const typeStr = String(o.orderType || o.type || '').toUpperCase();
+        return typeStr !== 'PROJECT' && typeStr !== 'CHAUFFEUR' && !typeStr.includes('CHAUFFEUR');
+      })
+    : (orders || []).filter(isMyOrder)
+  ).sort(compareOrdersNewestFirst);
+
+  const clientInvoices = isSaaSClient
+    ? (invoices || [])
+    : (invoices || []).filter(inv =>
+        inv.clientId === clientData.id || inv.company_id === clientData.id || inv.client === clientData.name ||
+        (inv.userId && String(inv.userId) === String(currentUser?.id))
+      );
   const clientChauffeurRequests = (chauffeurRequests || []).filter(req => {
     if (!req) return false;
 
@@ -219,7 +233,10 @@ const ClientDashboard = () => {
   const isDoneOrder = (s) => DONE_STATUSES.includes(String(s || '').toLowerCase().replace(/\s+/g, '_'));
 
   const activeOrders = (clientOrders || []).filter(o => !isDoneOrder(o.status));
-  const activeDeliveries = (deliveries || []).filter(d => !isDoneOrder(d.status) && clientOrders.some(o => String(o.id) === String(d.orderId) || String(o.id) === String(d.order_id_raw)));
+  const activeDeliveries = (deliveries || []).filter(d => 
+    !isDoneOrder(d.status) && 
+    (isSaaSClient || clientOrders.some(o => String(o.id) === String(d.orderId) || String(o.id) === String(d.order_id_raw)))
+  );
   const unpaidInvoices = clientInvoices.filter(inv => String(inv.status || '').toLowerCase() !== 'paid');
 
   const clientGuestRequests = (guestRequests || []).filter(req =>
@@ -229,12 +246,22 @@ const ClientDashboard = () => {
     req.guest === clientData.name
   );
 
-  // Personal Assets (Luxury items stored for this client)
+  // Personal Assets (Luxury items stored for this client, or warehouse ledger inventory for SaaS/business clients)
   const personalAssets = (luxuryItems || []).filter(item =>
     String(item.client_id) === String(clientData.id) ||
     String(item.clientId) === String(clientData.id) ||
     item.owner === clientData.name || item.owner === clientData.business_name
   );
+  const assetReserveCount = (isSaaSClient || personalAssets.length === 0)
+    ? (inventory || []).length
+    : personalAssets.length;
+  const assetReserveItems = (isSaaSClient || personalAssets.length === 0)
+    ? (inventory || []).map(it => ({
+        ...it,
+        name: it.name,
+        qty: it.inventoryStock?.[0]?.quantity ?? it.quantity ?? 1
+      }))
+    : personalAssets;
 
   // Marketplace Highlights
   const marketplaceAssets = (inventory || []).filter(item =>
@@ -321,7 +348,7 @@ const ClientDashboard = () => {
             <StatCard label="Unpaid Invoices" value={unpaidInvoices.length} icon={CreditCard} color="text-danger" bg="bg-danger/10" onClick={() => navigate('/dashboard/invoices')} />
           </div>
           <div className="col-span-2 md:col-span-2 lg:col-span-2">
-            <StatCard label="Asset Reserve" value={personalAssets.length} icon={Package} color="text-success" bg="bg-success/10" onClick={() => navigate('/dashboard/inventory')} />
+            <StatCard label="Asset Reserve" value={assetReserveCount} icon={Package} color="text-success" bg="bg-success/10" onClick={() => navigate('/dashboard/inventory')} />
           </div>
         </div>
 
@@ -483,11 +510,11 @@ const ClientDashboard = () => {
                   <p className="text-[9px] text-muted uppercase font-black tracking-widest">In Transit</p>
                 </div>
                 <div className="p-3 bg-success/5 border border-success/10 rounded-xl text-center">
-                  <p className="text-lg font-black text-success">{deliveries.filter(d => d.status === 'Delivered' && clientOrders.some(o => o.id === d.orderId)).length}</p>
+                  <p className="text-lg font-black text-success">{deliveries.filter(d => d.status === 'Delivered' && (isSaaSClient || clientOrders.some(o => o.id === d.orderId))).length}</p>
                   <p className="text-[9px] text-muted uppercase font-black tracking-widest">Delivered</p>
                 </div>
                 <div className="p-3 bg-white/[0.02] border border-white/5 rounded-xl text-center">
-                  <p className="text-lg font-black text-white">{deliveries.filter(d => clientOrders.some(o => o.id === d.orderId)).length}</p>
+                  <p className="text-lg font-black text-white">{deliveries.filter(d => isSaaSClient || clientOrders.some(o => o.id === d.orderId)).length}</p>
                   <p className="text-[9px] text-muted uppercase font-black tracking-widest">Total</p>
                 </div>
               </div>
@@ -643,7 +670,7 @@ const ClientDashboard = () => {
                 <Package size={18} className="text-accent" /> Private Asset Reserve
               </h3>
               <div className="space-y-3 mb-6">
-                {personalAssets.slice(0, 4).map((item, i) => (
+                {assetReserveItems.slice(0, 4).map((item, i) => (
                   <div key={i} className="flex items-center justify-between p-3.5 bg-white/[0.02] border border-white/5 rounded-2xl group hover:border-accent/40 transition-all">
                     <div className="flex items-center gap-3">
                       <div className="w-8 h-8 rounded-lg bg-accent/10 flex items-center justify-center text-accent">
@@ -654,7 +681,7 @@ const ClientDashboard = () => {
                     <span className="text-[10px] font-black text-accent">x{item.qty}</span>
                   </div>
                 ))}
-                {personalAssets.length === 0 && <EmptyState text="No personal assets issued." />}
+                {assetReserveItems.length === 0 && <EmptyState text="No personal assets issued." />}
               </div>
               <button onClick={() => navigate('/dashboard/inventory')}
                 className="w-full py-3 bg-accent text-black rounded-xl text-[9px] font-black uppercase tracking-[0.2em] shadow-lg shadow-accent/10 hover:scale-[1.02] transition-all">
