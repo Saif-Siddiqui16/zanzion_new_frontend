@@ -673,11 +673,21 @@ const Inventory = () => {
           });
           console.log('[REAL_API_SUCCESS] Stock issued via real API');
 
-          // Always update mock state for UI consistency since fetchInventory uses mock DB
-          await issueStock(formData);
-          swalSuccess('Success', 'Stock successfully issued.');
+          // Close modal immediately and stop saving state so UI reflects completion instantly
+          setIsModalOpen(false);
+          setIsSaving(false);
 
-          // Refresh the Dashboard stats to ensure it shows up immediately!
+          // Invalidate and refetch real items, stock, and movements instantly
+          await queryClient.invalidateQueries({ queryKey: ['items'] });
+          await queryClient.invalidateQueries({ queryKey: ['stock'] });
+          await queryClient.invalidateQueries({ queryKey: ['movements'] });
+          await queryClient.refetchQueries({ queryKey: ['items'] });
+          if (fetchInventory) await fetchInventory();
+
+          // Always update state for UI consistency
+          await issueStock(formData);
+
+          // Refresh the Dashboard stats to ensure it shows up immediately
           try {
             await fetchDashboardStats();
             await fetchStockMovements();
@@ -692,9 +702,11 @@ const Inventory = () => {
             }
           }
 
-          setIsModalOpen(false);
+          window.dispatchEvent(new CustomEvent('app:state-changed'));
+          swalSuccess('Success', 'Stock successfully issued.');
         } catch (e) {
           console.error('[REAL_API_FAILED] Stock issue failed', e);
+          setIsSaving(false);
           swalError('Failed to Issue Stock', e.response?.data?.message || 'Could not perform outbound stock issue.');
         }
       } else if (modalType === 'loss') {
