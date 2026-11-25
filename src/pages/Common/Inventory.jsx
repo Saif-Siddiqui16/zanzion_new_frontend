@@ -233,7 +233,7 @@ const Inventory = () => {
       ...item,
       type: calculatedType,
       inventoryType: item.clientId ? 'Client' : 'Marketplace',
-      clientName: owner ? (owner.companyName || owner.business_name || owner.name) : (item.clientName || '—')
+      clientName: owner ? (owner.contactPerson || owner.userName || owner.name || owner.companyName || owner.business_name) : (item.clientName || '—')
     };
   });
   const meta = itemsData?.meta || { totalPages: itemsData?.totalPages || 1, totalItems: itemsData?.total || inventory.length };
@@ -502,6 +502,10 @@ const Inventory = () => {
         unit: typeof item?.unit === 'object' && item?.unit !== null ? item.unit.name : (item?.unit || ''),
         warehouse: whName,
         warehouseId: wh ? wh.id : (item?.warehouse_id || null),
+        vendor: item?.vendorName || item?.store || item?.vendor || '',
+        vendorName: item?.vendorName || item?.store || item?.vendor || '',
+        vendorId: item?.vendorId || item?.vendor_id || null,
+        vendor_id: item?.vendorId || item?.vendor_id || null,
         size: item?.size || '',
         color: item?.color || '',
         material: item?.material || '',
@@ -1943,9 +1947,10 @@ Artisan Italian Espresso Beans,Maxwell's Supermarket,Pantry,12.50,30,bags,MX-COF
                         className="w-full bg-background border border-accent/20 rounded-lg px-4 py-2 text-sm focus:border-accent outline-none font-bold text-white shadow-lg shadow-accent/5"
                       >
                         <option value="">Select Client...</option>
-                        {(formData.inventorySegment === 'SaaS' ? saasClientsForInventorySelect : businessClientsForInventorySelect).map(c => (
-                          <option key={String(c.id)} value={c.id}>{c.companyName || c.business_name || c.name}</option>
-                        ))}
+                        {(formData.inventorySegment === 'SaaS' ? saasClientsForInventorySelect : businessClientsForInventorySelect).map(c => {
+                          const label = c.contactPerson || c.userName || c.name || c.contact || c.contact_person || c.companyName || c.business_name || `Client #${c.id}`;
+                          return <option key={String(c.id)} value={c.id}>{label}</option>;
+                        })}
                       </select>
                     </div>
                   )}
@@ -2382,9 +2387,10 @@ Artisan Italian Espresso Beans,Maxwell's Supermarket,Pantry,12.50,30,bags,MX-COF
                       disabled={modalType === 'view'}
                     >
                       <option value="">Select Client...</option>
-                      {businessClientsForInventorySelect.map(c => (
-                        <option key={String(c.id)} value={c.id}>{c.companyName || c.business_name || c.name}</option>
-                      ))}
+                      {businessClientsForInventorySelect.map(c => {
+                        const label = c.contactPerson || c.userName || c.name || c.contact || c.contact_person || c.companyName || c.business_name || `Client #${c.id}`;
+                        return <option key={String(c.id)} value={c.id}>{label}</option>;
+                      })}
                     </select>
                   </div>
                 )}
