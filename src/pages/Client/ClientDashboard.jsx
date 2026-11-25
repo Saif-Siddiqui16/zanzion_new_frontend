@@ -594,7 +594,7 @@ const ClientDashboard = () => {
           <div className="xl:col-span-4 space-y-6 sm:space-y-8">
 
             {/* Concierge Active Requests */}
-            <SectionCard title="Concierge Active Requests" viewAllPath="/dashboard/client-events" navigate={navigate}>
+            <SectionCard title="Concierge Active Requests" viewAllPath={isSaaSClient ? "/dashboard/events" : "/dashboard/client-events"} navigate={navigate}>
               <div className="space-y-3">
                 {(isSaaSClient ? events : events.filter(e => e.clientId === clientData.id || e.client === clientData.name)).slice(0, 3).map((event, i) => (
                   <div key={i} className="p-4 bg-white/5 border border-border rounded-xl">
@@ -606,9 +606,9 @@ const ClientDashboard = () => {
                   <EmptyState text="No active concierge logs found." />
                 )}
               </div>
-              <button onClick={() => navigate('/dashboard/client-events')}
+              <button onClick={() => navigate(isSaaSClient ? '/dashboard/events' : '/dashboard/client-events')}
                 className="w-full mt-6 py-2.5 bg-white/5 border border-border text-white rounded-xl text-[10px] font-bold uppercase tracking-widest hover:bg-white/10 transition-all">
-                Initiate Request
+                {isSaaSClient ? "Schedule & Manage Events" : "Initiate Request"}
               </button>
             </SectionCard>
 
