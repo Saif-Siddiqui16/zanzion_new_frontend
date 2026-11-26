@@ -184,8 +184,12 @@ function normalizeUserForUi(user) {
   let finalBalance = !isCorruptVal(rawBalance) ? Number(rawBalance) : vacationQuota;
   if (finalBalance === undefined || isNaN(finalBalance)) finalBalance = vacationQuota || 0;
 
+  const resolvedEmployeeId = user.employee?.id ?? user.employeeId ?? user.employee_id ?? null;
+
   return {
     ...user,
+    employeeId: resolvedEmployeeId,
+    employee_id: resolvedEmployeeId,
     bank_name: bankName,
     bankName,
     account_number: accountNumber,
@@ -2029,6 +2033,20 @@ export const GlobalDataProvider = ({ children }) => {
             }));
           } else if (d.package_details) {
             try { items = JSON.parse(d.package_details); } catch { items = []; }
+          }
+          if ((!items || items.length === 0) && d.remarks && typeof d.remarks === "string" && d.remarks.trim().startsWith("{")) {
+            try {
+              const remObj = JSON.parse(d.remarks);
+              const remItems = remObj.manifestItems || remObj.items;
+              if (Array.isArray(remItems) && remItems.length > 0) {
+                items = remItems.map((ri) => ({
+                  name: ri.name || ri.item?.name || "Item",
+                  qty: ri.qty ?? ri.quantity ?? 1,
+                  quantity: ri.qty ?? ri.quantity ?? 1,
+                  itemId: ri.itemId || ri.id,
+                }));
+              }
+            } catch (_) {}
           }
           if (!Array.isArray(items)) items = [];
 
@@ -5205,8 +5223,10 @@ export const GlobalDataProvider = ({ children }) => {
         const delSt = String(updated.status || '').toLowerCase();
         if (['delivered', 'completed'].includes(delSt)) {
           newOrderStatus = 'completed';
-        } else if (['assigned', 'en_route', 'in_transit', 'dispatched', 'shipped', 'picked_up', 'accepted'].includes(delSt)) {
-          newOrderStatus = 'logistics';
+        } else if (['assigned', 'accepted'].includes(delSt)) {
+          newOrderStatus = 'assigned';
+        } else if (['en_route', 'in_transit', 'dispatched', 'shipped', 'picked_up'].includes(delSt)) {
+          newOrderStatus = 'in_transit';
         }
 
         if (newOrderStatus) {

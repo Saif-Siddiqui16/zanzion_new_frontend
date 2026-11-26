@@ -183,12 +183,19 @@ const EmployeePortal = () => {
     const [showDeliveryPodModal, setShowDeliveryPodModal] = useState(false);
     const [deliveryPodData, setDeliveryPodData] = useState({ receiverName: '', photo: null, notes: '' });
     const [isSubmittingDeliveryPod, setIsSubmittingDeliveryPod] = useState(false);
-
+    const [dismissedOpenMissions, setDismissedOpenMissions] = useState(() => {
+        try {
+            const saved = sessionStorage.getItem(`dismissed_open_missions_${currentUser?.id}`);
+            return saved ? JSON.parse(saved) : [];
+        } catch {
+            return [];
+        }
+    });
 
     const isUserDriverMatch = (d) => {
         if (!currentUser || !d) return false;
         const currentUserId = String(currentUser.id || '');
-        const currentEmpId = String(currentUser.employeeId || currentUser.employee_id || currentUser.id || '');
+        const currentEmpId = String(currentUser.employeeId || currentUser.employee_id || currentUser.employee?.id || currentUser.id || '');
         const currentNames = [
             currentUser.name,
             currentUser.fullName,
@@ -203,7 +210,7 @@ const EmployeePortal = () => {
         const nestedDriverId = String(d.customItems?.[0]?.driver_user_id || d.customItems?.[0]?.driverId || d.items?.[0]?.driver_user_id || d.items?.[0]?.driverId || '');
 
         const targetIds = [targetAssignedTo, targetAssignedDriver, targetDriverId, nestedDriverId].filter(Boolean);
-        const matchId = targetIds.some(id => id === currentUserId || id === currentEmpId);
+        const matchId = targetIds.some(id => id === currentUserId || id === currentEmpId || (currentUser.employee?.id && String(id) === String(currentUser.employee.id)));
 
         const dDriverName = String(
             d.driver || 
@@ -412,6 +419,18 @@ const EmployeePortal = () => {
             if (dTenantId != null && Number(dTenantId) !== Number(currentTenantId)) return false;
         }
 
+        // Dismissed by this driver in current session
+        const rawKey = String(d.id || '');
+        const dbKey = String(d.db_id || '');
+        const orderKey = String(d.orderId || '');
+        if (
+            (rawKey && dismissedOpenMissions.includes(rawKey)) ||
+            (dbKey && dismissedOpenMissions.includes(dbKey)) ||
+            (orderKey && dismissedOpenMissions.includes(orderKey))
+        ) {
+            return false;
+        }
+
         return isLogisticsMission && isOpenStatus && !hasAssignedDriver && !isAssignedOrFinished;
     });
 
@@ -538,6 +557,8 @@ const EmployeePortal = () => {
                     await updateChauffeurRequest({ ...del, id: targetId, db_id: targetId, status: 'assigned', chauffeur_status: 'assigned' }).catch(() => {});
                 }
             } else {
+                const targetKey = String(del.id || targetId || del.orderId);
+                setDismissedOpenMissions(prev => prev.filter(k => k !== targetKey && k !== String(targetId) && k !== String(del.id)));
                 await updateDelivery({
                     ...del,
                     status: 'assigned',
@@ -572,6 +593,14 @@ const EmployeePortal = () => {
                     await updateChauffeurRequest({ ...del, id: targetId, db_id: targetId, status: 'pending', chauffeur_status: 'pending', driverName: null, driver_user_id: null, driverId: null }).catch(() => {});
                 }
             } else {
+                const missionKeys = [String(del.id), String(targetId), String(del.orderId), String(del.db_id)].filter(Boolean);
+                setDismissedOpenMissions(prev => {
+                    const next = Array.from(new Set([...prev, ...missionKeys]));
+                    try {
+                        sessionStorage.setItem(`dismissed_open_missions_${currentUser?.id}`, JSON.stringify(next));
+                    } catch {}
+                    return next;
+                });
                 await updateDelivery({
                     ...del,
                     status: 'pending',
@@ -1407,6 +1436,16 @@ const EmployeePortal = () => {
                                                     <p className="text-[9px] font-black text-muted uppercase tracking-widest">Package Intelligence</p>
                                                     <p className="text-xs text-secondary italic leading-relaxed">
                                                         {(() => {
+                                                            let itemsList = del.items;
+                                                            if ((!itemsList || itemsList.length === 0) && del.remarks) {
+                                                                try {
+                                                                    const r = typeof del.remarks === 'string' ? JSON.parse(del.remarks) : del.remarks;
+                                                                    itemsList = r?.manifestItems || r?.items;
+                                                                } catch(e) {}
+                                                            }
+                                                            if (Array.isArray(itemsList) && itemsList.length > 0) {
+                                                                return itemsList.map(p => `${p.name || 'Item'} (x${p.qty || p.quantity || 1})`).join(', ');
+                                                            }
                                                             const raw = del.package_details || del.item || 'Standard Logistic Unit';
                                                             if (typeof raw === 'string' && raw.startsWith('[')) {
                                                                 try {
@@ -2321,11 +2360,18 @@ const EmployeePortal = () => {
                                                 itemsToRender = selectedMission.package_details;
                                             }
                                         }
+                                        if ((!itemsToRender || itemsToRender.length === 0) && selectedMission.remarks) {
+                                            try {
+                                                const remObj = typeof selectedMission.remarks === 'string' ? JSON.parse(selectedMission.remarks) : selectedMission.remarks;
+                                                const remItems = remObj?.manifestItems || remObj?.items;
+                                                if (Array.isArray(remItems) && remItems.length > 0) itemsToRender = remItems;
+                                            } catch(e) {}
+                                        }
                                         if (Array.isArray(itemsToRender) && itemsToRender.length > 0) {
                                             return itemsToRender.map((item, idx) => (
                                                 <div key={idx} className="flex justify-between items-center py-2 border-b border-white/5 last:border-0">
                                                     <p className="text-xs font-bold text-white">{item.name || 'Item'}</p>
-                                                    <p className="text-[10px] font-black text-secondary">x{item.qty || 1}</p>
+                                                    <p className="text-[10px] font-black text-secondary">x{item.qty || item.quantity || 1}</p>
                                                 </div>
                                             ));
                                         }
