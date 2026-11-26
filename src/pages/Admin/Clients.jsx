@@ -603,26 +603,37 @@ const Clients = () => {
   };
 
   const handleExport = () => {
-    const headers = ['Name', 'Email', 'Phone', 'Status', 'Plan', 'Location', 'Source'].join(',');
+    if (!filteredClients || filteredClients.length === 0) {
+      swalWarning('No Records', 'There are no clients available to export.');
+      return;
+    }
+    const headers = ['Name', 'Email', 'Phone', 'Status', 'Plan / Tier', 'Location', 'Source', 'Registration Date'];
+    const escapeCsv = (val) => {
+      const s = String(val ?? '').replace(/"/g, '""');
+      return `"${s}"`;
+    };
     const rows = filteredClients.map(c => [
-      `"${c.companyName || c.name || c.business_name || ''}"`,
-      `"${c.email || ''}"`,
-      `"${c.phone || ''}"`,
-      `"${c.status || ''}"`,
-      `"${c.plan || ''}"`,
-      `"${c.location || ''}"`,
-      `"${c.source || ''}"`
+      escapeCsv(c.companyName || c.name || c.business_name || ''),
+      escapeCsv(c.email || ''),
+      escapeCsv(c.phone || ''),
+      escapeCsv(getStatusLabel(c.status)),
+      escapeCsv(c.plan || c.clientType || c.client_type || 'Standard'),
+      escapeCsv(c.location || ''),
+      escapeCsv(c.source || ''),
+      escapeCsv(c.created_at || c.createdAt ? new Date(c.created_at || c.createdAt).toISOString().split('T')[0] : '')
     ].join(','));
-    const csvContent = [headers, ...rows].join('\n');
+    const csvContent = '\uFEFF' + [headers.map(escapeCsv).join(','), ...rows].join('\r\n');
     const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
-    link.setAttribute('href', url);
-    link.setAttribute('download', `saas_clients_${new Date().toISOString().split('T')[0]}.csv`);
+    link.href = url;
+    const prefix = (clientTypeFilter || 'clients').toLowerCase().replace(/\s+/g, '_');
+    link.download = `${prefix}_registry_${new Date().toISOString().split('T')[0]}.csv`;
     link.style.visibility = 'hidden';
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+    URL.revokeObjectURL(url);
   };
 
   const getStatusColor = (status) => {
@@ -660,8 +671,8 @@ const Clients = () => {
           <div className="mr-4">
             <span className="text-[12px] text-muted">Role: {roleNormalized || '—'}</span>
           </div>
-          <button onClick={handleExport} className="px-6 py-2.5 bg-white/5 border border-white/10 text-white rounded-xl text-[10px] font-black uppercase tracking-widest hover:bg-white/10 transition-all flex items-center gap-2">
-            <Download size={14} /> Export CSV
+          <button onClick={handleExport} className="px-6 py-2.5 bg-white/5 border border-white/10 text-white rounded-xl text-[10px] font-black uppercase tracking-widest hover:bg-white/10 transition-all flex items-center gap-2" title="Export Client Ledger as Excel/CSV">
+            <Download size={14} /> Export XLS / CSV
           </button>
           {!isAdminRole && clientTypeFilter !== 'Website' && (
             <button onClick={handleAdd} className="btn-primary group flex items-center gap-3 px-8 shadow-xl shadow-accent/20">

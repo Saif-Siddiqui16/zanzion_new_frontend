@@ -707,6 +707,44 @@ const Users = () => {
     },
   ];
 
+  const handleExportTimeLogs = () => {
+    if (!payHistory || payHistory.length === 0) {
+      swalWarning('No Records', 'There are no time registry records available to export.');
+      return;
+    }
+    const headers = [
+      'Employee Identifier',
+      'Protocol Window (Start - End)',
+      'Date Registry',
+      'Fiscal Hours',
+      'Valuation',
+      'Verification Status'
+    ];
+    const escapeCsv = (val) => {
+      const s = String(val ?? '').replace(/"/g, '""');
+      return `"${s}"`;
+    };
+    const rows = payHistory.map(session => [
+      escapeCsv(session.userName || 'Unknown'),
+      escapeCsv(session.period || ''),
+      escapeCsv(session.date || ''),
+      escapeCsv(session.hours ? `${session.hours} hrs` : 'Variable'),
+      escapeCsv(session.total || '$0'),
+      escapeCsv(session.status || 'Verified')
+    ].join(','));
+    const csvContent = '\uFEFF' + [headers.map(escapeCsv).join(','), ...rows].join('\r\n');
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `time_registry_audit_${new Date().toISOString().split('T')[0]}.csv`;
+    link.style.visibility = 'hidden';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  };
+
   return (
     <div className="space-y-8 pb-12">
       <div className="flex flex-col gap-6">
@@ -1362,7 +1400,11 @@ const Users = () => {
               </div>
             </div>
             <div className="flex items-center gap-3">
-              <button className="px-6 py-2 bg-white/5 border border-white/10 text-white rounded-xl text-[10px] font-black uppercase tracking-widest hover:bg-white/10 transition-all flex items-center gap-2">
+              <button
+                onClick={handleExportTimeLogs}
+                className="px-6 py-2 bg-white/5 border border-white/10 text-white rounded-xl text-[10px] font-black uppercase tracking-widest hover:bg-white/10 transition-all flex items-center gap-2"
+                title="Export Time Logs as Excel/CSV"
+              >
                 <FileText size={14} /> Export XLS
               </button>
             </div>
