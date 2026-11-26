@@ -5,6 +5,7 @@ import Table from '../../components/Table';
 import Modal from '../../components/Modal';
 import { useData } from '../../context/GlobalDataContext';
 import { useUsers, useCreateUser, useUpdateUser, useDeleteUser } from '../../hooks/api/useCRM';
+import { useQueryClient } from '@tanstack/react-query';
 import { Search, Plus, Shield, ShieldCheck, Calendar, Check, X as CloseIcon, Radio, Clock, CheckCircle2, XCircle, Briefcase, Truck, MapPin, Car, FileText, Eye, EyeOff, Edit, Trash2 } from 'lucide-react';
 import { swalConfirm, swalSuccess, swalWarning, swalInfo } from '../../utils/swal';
 import Pagination from '../../components/Common/Pagination';
@@ -15,6 +16,7 @@ import Swal from 'sweetalert2';
 import { ageFromBirthday, getMaxBirthdayDate } from '../../utils/dateEst';
 
 const Users = () => {
+  const queryClient = useQueryClient();
   const [showPassword, setShowPassword] = useState(false);
   const [uploadingDocs, setUploadingDocs] = useState({});
   const [viewingDoc, setViewingDoc] = useState(null);
@@ -75,16 +77,65 @@ const Users = () => {
 
       if (res.data?.success) {
         swalSuccess('Success', 'Document uploaded successfully.');
-        const fieldMap = { passport: 'hasPassport', license: 'hasLicense', nib: 'hasNIB', resume: 'hasResume' };
-        const urlMap = { passport: 'passportUrl', license: 'licenseUrl', nib: 'nibUrl', resume: 'resumeUrl' };
+        const fieldMap = {
+          passport: 'hasPassport',
+          license: 'hasLicense',
+          nib: 'hasNIB',
+          resume: 'hasResume',
+          profilePic: 'hasProfilePic',
+          certs: 'hasCerts'
+        };
+        const urlMap = {
+          passport: 'passportUrl',
+          license: 'licenseUrl',
+          nib: 'nibUrl',
+          resume: 'resumeUrl',
+          profilePic: 'avatar',
+          certs: 'certsUrl'
+        };
+
+        const docKey = fieldMap[docType] || `has_${docType}`;
+        const docUrlKey = urlMap[docType] || `${docType}Url`;
+        const uploadedUrl = res.data.data?.[docUrlKey] || res.data.data?.url || res.data.data?.secure_url || '';
+
+        // Immediate optimistic cache update for instant UI feedback in Vault
+        queryClient.setQueriesData({ queryKey: ['users'] }, (oldData) => {
+          if (!oldData) return oldData;
+          const patchUser = (u) => {
+            if (String(u.id) === String(targetId)) {
+              return {
+                ...u,
+                [docKey]: true,
+                [docUrlKey]: uploadedUrl || u[docUrlKey]
+              };
+            }
+            return u;
+          };
+
+          if (Array.isArray(oldData)) return oldData.map(patchUser);
+          if (oldData?.data) {
+            if (Array.isArray(oldData.data)) {
+              return { ...oldData, data: oldData.data.map(patchUser) };
+            }
+            if (Array.isArray(oldData.data.users)) {
+              return { ...oldData, data: { ...oldData.data, users: oldData.data.users.map(patchUser) } };
+            }
+          }
+          return oldData;
+        });
+
         if (fieldMap[docType]) {
           setFormData(prev => ({
             ...prev,
             [fieldMap[docType]]: true,
-            [urlMap[docType]]: res.data.data?.[urlMap[docType]] || res.data.data?.url
+            [urlMap[docType]]: uploadedUrl
           }));
         }
+
+        // Re-synchronize queries in the background
+        queryClient.invalidateQueries({ queryKey: ['users'] });
         if (fetchStaff) await fetchStaff();
+        if (fetchSupportingDocs) fetchSupportingDocs();
       } else {
         swalWarning('Error', res.data?.message || 'Failed to upload document.');
       }
