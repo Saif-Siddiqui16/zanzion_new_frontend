@@ -22,10 +22,10 @@ const Reports = () => {
 
   React.useEffect(() => {
     fetchFinance();
-    fetchDashboardStats();
+    fetchDashboardStats(revenueFilter);
     if (fetchLossAssessments) fetchLossAssessments();
     if (fetchFleet) fetchFleet();
-  }, [fetchFinance, fetchDashboardStats, fetchLossAssessments, fetchFleet]);
+  }, [fetchFinance, fetchDashboardStats, revenueFilter, fetchLossAssessments, fetchFleet]);
   const [isExporting, setIsExporting] = useState(false);
   const todayStr = useMemo(() => new Date().toISOString().slice(0, 10), []);
   const thirtyDaysAgoStr = useMemo(() => {
@@ -40,7 +40,7 @@ const Reports = () => {
   const [customChartData, setCustomChartData] = useState([]);
 
   // --- Real Intelligence Calibration (Multi-temporal) ---
-  const { totalRevenue, totalPaid, totalOutstanding, avgOrderValue } = useMemo(() => {
+  const { totalRevenue, totalPaid, totalOutstanding, avgOrderValue, revTrend, outTrend, setRateTrend, avgTrend } = useMemo(() => {
     if (customRangeActive) {
       const start = new Date(startDate);
       const end = new Date(endDate + 'T23:59:59');
@@ -54,25 +54,18 @@ const Reports = () => {
       const total = filteredInvoices.reduce((acc, inv) => acc + parseFloat(inv.totalAmount || inv.amount || 0), 0);
       const outstanding = Math.max(0, total - paid);
       const avg = filteredInvoices.length > 0 ? total / filteredInvoices.length : 0;
-      return { totalRevenue: total, totalPaid: paid, totalOutstanding: outstanding, avgOrderValue: avg };
-    }
-
-    // Priority 1: Use aggregate dashboard stats if available
-    if (dashboardStats.relevantRevenue !== undefined) {
-      const relevant = Number(dashboardStats.relevantRevenue) || 0;
-      const totalRev = Number(dashboardStats.totalRevenue) || relevant;
-      const outstanding = dashboardStats.outstandingRevenue !== undefined 
-        ? Number(dashboardStats.outstandingRevenue) 
-        : Math.max(0, totalRev - relevant);
-      return {
-        totalRevenue: relevant + outstanding,
-        totalPaid: relevant,
-        totalOutstanding: outstanding,
-        avgOrderValue: dashboardStats.completedOrders ? (relevant / dashboardStats.completedOrders) : (relevant || 0)
+      return { 
+        totalRevenue: total, 
+        totalPaid: paid, 
+        totalOutstanding: outstanding, 
+        avgOrderValue: avg,
+        revTrend: '+0.0%',
+        outTrend: '-0.0%',
+        setRateTrend: '+0.0%',
+        avgTrend: '+0.0%'
       };
     }
 
-    const now = new Date();
     const filterDays = {
       'Daily': 1,
       'Weekly': 7,
@@ -80,9 +73,34 @@ const Reports = () => {
       'Quarterly': 90,
       'Annual': 365
     };
-
     const days = filterDays[revenueFilter] || 30;
+    const now = new Date();
     const thresholdDate = new Date(now.getTime() - (days * 24 * 60 * 60 * 1000));
+
+    // When backend dashboardStats has period-specific revenue, use it
+    if (dashboardStats && dashboardStats.relevantRevenue !== undefined) {
+      const paid = Number(dashboardStats.relevantRevenue) || 0;
+      const outstanding = dashboardStats.outstandingRevenue !== undefined
+        ? Number(dashboardStats.outstandingRevenue)
+        : (invoices || [])
+            .filter(inv => {
+              const d = new Date(inv.invoiceDate || inv.createdAt || inv.date);
+              return d >= thresholdDate && String(inv.status || '').toLowerCase() !== 'paid';
+            })
+            .reduce((acc, inv) => acc + parseFloat(inv.totalAmount || inv.amount || 0), 0);
+      const total = paid + outstanding;
+      const avg = dashboardStats.completedOrders ? (paid / dashboardStats.completedOrders) : (total > 0 ? total : 0);
+      return {
+        totalRevenue: total,
+        totalPaid: paid,
+        totalOutstanding: outstanding,
+        avgOrderValue: avg,
+        revTrend: dashboardStats.revenueTrend || '+0.0%',
+        outTrend: dashboardStats.outstandingTrend || '-0.0%',
+        setRateTrend: dashboardStats.ordersTrend || '+0.0%',
+        avgTrend: dashboardStats.revenueTrend || '+0.0%'
+      };
+    }
 
     const filteredInvoices = (invoices || []).filter(inv => {
       const invDate = new Date(inv.invoiceDate || inv.createdAt || inv.date);
@@ -100,7 +118,11 @@ const Reports = () => {
       totalRevenue: total,
       totalPaid: paid,
       totalOutstanding: outstanding,
-      avgOrderValue: avg
+      avgOrderValue: avg,
+      revTrend: '+0.0%',
+      outTrend: '-0.0%',
+      setRateTrend: '+0.0%',
+      avgTrend: '+0.0%'
     };
   }, [customRangeActive, startDate, endDate, invoices, revenueFilter, dashboardStats]);
 
@@ -307,8 +329,10 @@ const Reports = () => {
             <select
               value={revenueFilter}
               onChange={(e) => {
-                setRevenueFilter(e.target.value);
+                const val = e.target.value;
+                setRevenueFilter(val);
                 handleResetFilter();
+                if (fetchDashboardStats) fetchDashboardStats(val);
               }}
               className="bg-transparent text-xs font-bold py-2 focus:outline-none cursor-pointer"
             >
@@ -373,10 +397,34 @@ const Reports = () => {
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
         {[
-          { label: "Total Asset Revenue", val: `$${totalRevenue.toLocaleString()}`, change: "+14.2%", up: true, icon: DollarSign },
-          { label: "Accounts Receivable", val: `$${totalOutstanding.toLocaleString()}`, change: "-5.4%", up: false, icon: Activity },
-          { label: "Settlement Rate", val: `${totalRevenue > 0 ? ((totalPaid / totalRevenue) * 100).toFixed(1) : '100.0'}%`, change: "+2.1%", up: true, icon: CheckCircle2 },
-          { label: "Avg. Transaction", val: `$${avgOrderValue.toFixed(0)}`, change: "+4.8%", up: true, icon: Zap },
+          { 
+            label: "Total Asset Revenue", 
+            val: `$${totalRevenue.toLocaleString()}`, 
+            change: revTrend, 
+            up: !String(revTrend).startsWith('-'), 
+            icon: DollarSign 
+          },
+          { 
+            label: "Accounts Receivable", 
+            val: `$${totalOutstanding.toLocaleString()}`, 
+            change: outTrend, 
+            up: String(outTrend).startsWith('-'), 
+            icon: Activity 
+          },
+          { 
+            label: "Settlement Rate", 
+            val: `${totalRevenue > 0 ? ((totalPaid / totalRevenue) * 100).toFixed(1) : '100.0'}%`, 
+            change: setRateTrend, 
+            up: !String(setRateTrend).startsWith('-'), 
+            icon: CheckCircle2 
+          },
+          { 
+            label: "Avg. Transaction", 
+            val: `$${avgOrderValue.toFixed(0)}`, 
+            change: avgTrend, 
+            up: !String(avgTrend).startsWith('-'), 
+            icon: Zap 
+          },
         ].map((item, i) => (
           <div key={i} className="glass-card p-4 relative overflow-hidden group">
             <div className="absolute top-2 right-2 p-2 bg-accent/5 rounded-lg text-accent">
